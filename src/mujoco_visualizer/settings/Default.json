@@ -1,0 +1,17 @@
+{
+  "colors": {},
+  "geom_colors": {},
+  "alpha": 1.0,
+  "vis_flags": {
+    "contact_points": false,
+    "contact_forces": false,
+    "actuators": false,
+    "joints": false,
+    "transparent": false,
+    "shadows": true,
+    "wireframe": false
+  },
+  "geom_groups": [true, true, true, false, false, false],
+  "site_groups": [false, false, false, false, false, false],
+  "skybox": {"show": true, "sky_top": "#669acc", "sky_bot": "#000000"}
+}

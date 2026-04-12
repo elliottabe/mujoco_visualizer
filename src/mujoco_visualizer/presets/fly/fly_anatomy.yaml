@@ -1,0 +1,66 @@
+root_body: thorax
+cameras:
+  - track1
+  - track2
+  - track3
+  - side
+  - side2
+  - back
+  - bottom
+  - bottom2
+  - hero
+  - front_left
+  - front_right
+  - tgt_left
+  - tgt_right
+  - eye_left
+  - eye_right
+categories:
+  # eye_red must precede `head` so the `head_red` eye geom is bucketed here
+  - name: eye_red
+    match: {geom_substring: [red]}
+  - name: thorax
+    match: {body_substring: [thorax]}
+  - name: head
+    match: {body_substring: [head]}
+  - name: abdomen
+    match: {body_substring: [abdomen]}
+  - name: antenna_left
+    match: {body_substring: [antenna, left], all: true}
+  - name: antenna_right
+    match: {body_substring: [antenna, right], all: true}
+  - name: haltere_left
+    match: {body_substring: [haltere, left], all: true}
+  - name: haltere_right
+    match: {body_substring: [haltere, right], all: true}
+  - name: proboscis
+    match: {body_substring: [proboscis, rostrum, labrum, labell]}
+  - name: wing_left
+    match: {body_substring: [wing_left]}
+  - name: wing_right
+    match: {body_substring: [wing_right]}
+  - name: T1_left
+    match: {body_substring: [t1, left], all: true}
+  - name: T1_right
+    match: {body_substring: [t1, right], all: true}
+  - name: T2_left
+    match: {body_substring: [t2, left], all: true}
+  - name: T2_right
+    match: {body_substring: [t2, right], all: true}
+  - name: T3_left
+    match: {body_substring: [t3, left], all: true}
+  - name: T3_right
+    match: {body_substring: [t3, right], all: true}
+pose_groups:
+  - label: Front legs (T1)
+    joint_substrings: [t1]
+    side_filters: [left, right]
+  - label: Mid legs (T2)
+    joint_substrings: [t2]
+    side_filters: [left, right]
+  - label: Hind legs (T3)
+    joint_substrings: [t3]
+    side_filters: [left, right]
+  - label: Wings
+    joint_substrings: [wing]
+    side_filters: [left, right]

@@ -1,0 +1,1207 @@
+"""visualizer.py — Generic offscreen Visualizer for any MuJoCo model.
+
+Wraps ``mujoco.Renderer`` with visual state (per-category geom colors,
+lighting, floor, skybox, named cameras, presets) so callers can render
+single frames, videos, and smooth multi-keyframe camera pans without any
+notebook environment.
+
+Quick-start::
+
+    from mujoco_visualizer import Visualizer, load_config
+
+    anatomy = load_config('humanoid.yaml')          # or None for auto
+    viz = Visualizer('humanoid.xml', anatomy=anatomy)
+    frame = viz.render_frame(viz.model.qpos0, camera='side')
+    viz.render_video(qposes, camera='side', output_path='out.mp4')
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+from typing import Callable, List, Optional, Sequence, Tuple, Union
+
+import mujoco
+import numpy as np
+
+from mujoco_visualizer.config import AnatomyConfig, load_config
+from mujoco_visualizer.categories import build_geom_categories, _auto_anatomy
+
+# Camera type mapping: free_type str → (mjtCamera, needs_trackbody, needs_fixedcam)
+_FREE_TYPE_MAP = {
+    'free':     (mujoco.mjtCamera.mjCAMERA_FREE,     False, False),
+    'fixed':    (mujoco.mjtCamera.mjCAMERA_FIXED,    False, True),
+    'track':    (mujoco.mjtCamera.mjCAMERA_TRACKING, True,  False),
+    'trackcom': (mujoco.mjtCamera.mjCAMERA_TRACKING, True,  False),
+}
+
+# ---------------------------------------------------------------------------
+# Module-level pure helper functions
+# ---------------------------------------------------------------------------
+
+def _dir_to_az_el(d: Sequence[float]) -> Tuple[float, float]:
+    d = np.asarray(d, dtype=float)
+    norm = np.linalg.norm(d)
+    if norm < 1e-9:
+        return 0.0, -45.0
+    d = d / norm
+    el = float(np.degrees(np.arcsin(np.clip(d[2], -1.0, 1.0))))
+    az = float(np.degrees(np.arctan2(d[0], d[1])) % 360)
+    return az, el
+
+
+def _az_el_to_dir(az_deg: float, el_deg: float) -> np.ndarray:
+    az = np.radians(az_deg)
+    el = np.radians(el_deg)
+    return np.array([np.cos(el) * np.sin(az), np.cos(el) * np.cos(az), np.sin(el)])
+
+
+def _hex_to_rgb(hex_str: str) -> List[float]:
+    h = hex_str.lstrip('#')
+    return [int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)]
+
+
+def _rgb_to_hex(rgb: Sequence[float]) -> str:
+    return '#{:02x}{:02x}{:02x}'.format(
+        *[int(np.clip(v, 0, 1) * 255) for v in rgb]
+    )
+
+
+def _make_sky_pixels(
+    model: mujoco.MjModel,
+    skybox_tex_id: int,
+    top_rgb: Sequence[float],
+    bot_rgb: Sequence[float],
+) -> Optional[np.ndarray]:
+    """Build cube-map gradient pixel data for the skybox texture."""
+    if skybox_tex_id < 0:
+        return None
+    total_h = int(model.tex_height[skybox_tex_id])
+    w = int(model.tex_width[skybox_tex_id])
+    face_h = max(1, total_h // 6)
+    top = np.array(top_rgb, dtype=np.float64)
+    bot = np.array(bot_rgb, dtype=np.float64)
+    face_axes = [
+        (np.array([1., 0., 0.]),  np.array([0., 0., -1.]), np.array([0., -1., 0.])),
+        (np.array([-1., 0., 0.]), np.array([0., 0., 1.]),  np.array([0., -1., 0.])),
+        (np.array([0., 1., 0.]),  np.array([1., 0., 0.]),  np.array([0., 0., 1.])),
+        (np.array([0., -1., 0.]), np.array([1., 0., 0.]),  np.array([0., 0., -1.])),
+        (np.array([0., 0., 1.]),  np.array([1., 0., 0.]),  np.array([0., -1., 0.])),
+        (np.array([0., 0., -1.]), np.array([-1., 0., 0.]), np.array([0., -1., 0.])),
+    ]
+    pixels = np.zeros((total_h * w, 3), dtype=np.uint8)
+    rows = np.arange(face_h)
+    cols = np.arange(w)
+    v_arr = 1.0 - 2.0 * (rows + 0.5) / face_h
+    u_arr = -1.0 + 2.0 * (cols + 0.5) / w
+    V, U = np.meshgrid(v_arr, u_arr, indexing='ij')
+    for fi, (norm, right, up) in enumerate(face_axes):
+        d = norm + U[:, :, None] * right + V[:, :, None] * up
+        d /= np.linalg.norm(d, axis=2, keepdims=True)
+        t = np.clip(0.5 + 0.5 * d[:, :, 1], 0.0, 1.0)
+        color = (1.0 - t[:, :, None]) * bot + t[:, :, None] * top
+        pixels[fi * face_h * w:(fi + 1) * face_h * w] = (
+            np.clip(color * 255, 0, 255).astype(np.uint8).reshape(-1, 3)
+        )
+    return pixels
+
+
+# Scene modifier functions (applied after update_scene)
+def dual_lighting(scene: mujoco.MjvScene, geom_xpos: Optional[np.ndarray] = None,
+                  **kwargs) -> None:
+    if geom_xpos is None:
+        return
+    body_pos = geom_xpos[1]
+    if scene.nlight > 2:
+        scene.lights[0].pos[:] = body_pos + np.array([0.6, 0.6, 0.0])
+        scene.lights[0].dir[:] = body_pos - scene.lights[2].pos
+    scene.lights[0].diffuse[:] = [1.4, 1.3, 1.0]
+    scene.lights[0].specular[:] = [1.4, 1.4, 1.4]
+    scene.lights[0].cutoff = 20.0
+    scene.lights[0].exponent = 3.0
+    scene.lights[0].attenuation[:] = [1, 0.0, 0.0]
+
+
+def add_arrow_to_scene(
+    scene: mujoco.MjvScene,
+    from_: Sequence[float],
+    to: Sequence[float],
+    radius: float = 0.003,
+    rgba: Sequence[float] = (0.2, 0.2, 0.6, 1.0),
+) -> None:
+    """Append an arrow geom to ``scene``."""
+    if scene.ngeom >= scene.maxgeom:
+        return
+    g = scene.geoms[scene.ngeom]
+    g.category = mujoco.mjtCatBit.mjCAT_STATIC
+    mujoco.mjv_initGeom(
+        geom=g,
+        type=mujoco.mjtGeom.mjGEOM_ARROW,
+        size=np.zeros(3),
+        pos=np.zeros(3),
+        mat=np.zeros(9),
+        rgba=np.asarray(rgba, dtype=np.float32),
+    )
+    mujoco.mjv_connector(
+        geom=g,
+        type=mujoco.mjtGeom.mjGEOM_ARROW,
+        width=radius,
+        from_=np.asarray(from_, dtype=float),
+        to=np.asarray(to, dtype=float),
+    )
+    scene.ngeom += 1
+
+
+def get_wing_fluid_idxs(model: mujoco.MjModel) -> List[int]:
+    """Return geom ids of the wing fluid geoms (left, right) in *model*."""
+    out = []
+    for name in ('wing_left_fluid', 'wing_right_fluid'):
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        if gid >= 0:
+            out.append(gid)
+    return out
+
+
+def add_aero_force_arrows_to_scene(
+    scene: mujoco.MjvScene,
+    aero_forces: np.ndarray,
+    wing_fluid_idxs: Sequence[int],
+    geom_xpos: np.ndarray,
+    radius: float = 0.003,
+    rgba: Sequence[Sequence[float]] = (
+        (139 / 255, 107 / 255, 127 / 255, 1.0),
+        (149 / 255, 184 / 255, 114 / 255, 1.0),
+        (200 / 255,  98 / 255,  77 / 255, 1.0),
+    ),
+    scale_vectors: float = 0.1,
+) -> None:
+    """Draw per-wing aerodynamic force arrows for one frame.
+
+    Args:
+        aero_forces:     (n_forces, n_wings, 3) array for the current frame.
+        wing_fluid_idxs: Geom ids of the wing fluid geoms (one per wing).
+        geom_xpos:       ``data.geom_xpos`` for the current frame.
+        rgba:            One color per force component (length >= n_forces-1).
+                         Mirrors fly_logging.add_arrows which skips the last entry.
+    """
+    aero_forces = np.asarray(aero_forces)
+    for wing_idx, gid in enumerate(wing_fluid_idxs):
+        wing_xpos = np.asarray(geom_xpos[gid])
+        for m in range(len(aero_forces) - 1):
+            f = np.asarray(aero_forces[m, wing_idx])
+            add_arrow_to_scene(
+                scene,
+                from_=wing_xpos,
+                to=wing_xpos + scale_vectors * f,
+                radius=radius,
+                rgba=rgba[m],
+            )
+
+
+def add_trajectory_points_to_scene(
+    scene: mujoco.MjvScene,
+    points: np.ndarray,
+    radius: float = 0.005,
+    rgba: Sequence[float] = (0.0, 1.0, 1.0, 0.5),
+    skip: int = 1,
+) -> None:
+    """Append a sphere geom for each trajectory point in *points* (N,3)."""
+    pts = np.asarray(points, dtype=float).reshape(-1, 3)
+    mat = np.eye(3).flatten()
+    for i in range(0, len(pts), max(1, skip)):
+        if scene.ngeom >= scene.maxgeom:
+            return
+        g = scene.geoms[scene.ngeom]
+        g.category = mujoco.mjtCatBit.mjCAT_STATIC
+        mujoco.mjv_initGeom(
+            geom=g,
+            type=mujoco.mjtGeom.mjGEOM_SPHERE,
+            size=np.array([radius, radius, radius], dtype=float),
+            pos=pts[i],
+            mat=mat,
+            rgba=np.asarray(rgba, dtype=np.float32),
+        )
+        scene.ngeom += 1
+
+
+def scale_lights(scene: mujoco.MjvScene, scale: float = 1.25, **kwargs) -> None:
+    for i in range(scene.nlight):
+        scene.lights[i].diffuse[:] *= scale
+        scene.lights[i].ambient[:] *= scale
+        scene.lights[i].specular[:] = 0
+
+
+# Camera pan helpers
+def _lerp_angle(a: float, b: float, t: float) -> float:
+    diff = ((b - a + 180.0) % 360.0) - 180.0
+    return a + diff * t
+
+
+def _cosine_ease(t: float) -> float:
+    return 0.5 * (1.0 - np.cos(np.pi * t))
+
+
+def _resolve_preset(cam_cfg: dict) -> dict:
+    return {
+        'azimuth':    float(cam_cfg.get('azimuth',    180.0)),
+        'elevation':  float(cam_cfg.get('elevation',  -20.0)),
+        'distance':   float(cam_cfg.get('distance',    0.5)),
+        'lookat':     [float(v) for v in cam_cfg.get('lookat', [0.0, 0.0, 0.0])],
+        'free_type':  cam_cfg.get('free_type',  'free'),
+        'trackbody':  cam_cfg.get('trackbody',  ''),
+        'fixedcamid': cam_cfg.get('fixedcamid', ''),
+    }
+
+
+def _build_pan_camera(
+    model: mujoco.MjModel,
+    A: dict,
+    B: dict,
+    t: float,
+) -> mujoco.MjvCamera:
+    kf = A if t < 0.5 else B
+    free_type = kf['free_type']
+    mj_type, needs_body, needs_fixedcam = _FREE_TYPE_MAP.get(free_type, _FREE_TYPE_MAP['free'])
+
+    cam = mujoco.MjvCamera()
+    cam.type = mj_type
+    cam.azimuth   = _lerp_angle(A['azimuth'],   B['azimuth'],   t)
+    cam.elevation = A['elevation'] + (B['elevation'] - A['elevation']) * t
+    cam.distance  = A['distance']  + (B['distance']  - A['distance'])  * t
+    cam.lookat[:] = [A['lookat'][i] + (B['lookat'][i] - A['lookat'][i]) * t for i in range(3)]
+
+    if needs_fixedcam:
+        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, kf.get('fixedcamid', ''))
+        cam.fixedcamid = max(cam_id, 0)
+    if needs_body:
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, kf.get('trackbody', ''))
+        cam.trackbodyid = max(body_id, 0)
+
+    return cam
+
+
+def _save_video(frames: np.ndarray, output_path: str, fps: int) -> None:
+    """Write video frames to a file using mediapy or imageio."""
+    try:
+        import mediapy
+        mediapy.write_video(output_path, frames, fps=fps)
+    except ImportError:
+        try:
+            import imageio
+            imageio.mimwrite(output_path, frames, fps=fps)
+        except ImportError:
+            raise ImportError(
+                "Install 'mediapy' or 'imageio' to save videos: pip install mediapy"
+            )
+
+
+def _save_image(frame: np.ndarray, output_path: str) -> None:
+    """Save a single frame as an image file."""
+    try:
+        from PIL import Image
+        Image.fromarray(frame).save(output_path)
+    except ImportError:
+        try:
+            import imageio
+            imageio.imwrite(output_path, frame)
+        except ImportError:
+            raise ImportError(
+                "Install 'Pillow' or 'imageio' to save images: pip install Pillow"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
+class Visualizer:
+    """Self-contained generic visualizer for any MuJoCo model.
+
+    Wraps a MjModel with visual state (colors, lighting, floor, skybox, camera)
+    and provides methods to render frames, videos, and camera pans.  All
+    rendering is done with the standard ``mujoco.Renderer`` (CPU offscreen);
+    no GPU, JAX, or notebook environment required.
+
+    Args:
+        xml_path:       Path to a MuJoCo XML model file.  Mutually exclusive
+                        with *model*.
+        model:          Pre-loaded ``mujoco.MjModel``.  Mutually exclusive with
+                        *xml_path*.
+        settings_json:  Optional path to a pose_tuner JSON settings file to
+                        load immediately.
+        joint_names:    Optional list of joint names to keep (calls
+                        ``filter_model_to_config_joints`` before compiling).
+        amputate:       Passed to ``filter_model_to_config_joints`` when
+                        *joint_names* is provided.  See that function's docs.
+    """
+
+    def __init__(
+        self,
+        xml_path: Optional[str] = None,
+        model: Optional[mujoco.MjModel] = None,
+        *,
+        spec: Optional[mujoco.MjSpec] = None,
+        anatomy: Optional[Union[AnatomyConfig, str, dict]] = None,
+        settings_json: Optional[str] = None,
+        joint_names: Optional[List[str]] = None,
+        amputate: Union[bool, str, List[str]] = False,
+        floor_xml: Optional[str] = None,
+        attach_body: Optional[str] = None,
+        suffix: str = '',
+        model_transform: Optional[Callable] = None,
+    ):
+        """
+        Args:
+            xml_path:        Path to a MuJoCo XML file. Mutually exclusive with *model*.
+            model:           Pre-loaded MjModel.
+            anatomy:         AnatomyConfig, or path/dict for ``load_config``.
+                             ``None`` => one category per top-level body.
+            settings_json:   Optional settings JSON to apply immediately.
+            joint_names:     If given, ``filter_model_to_config_joints`` is run
+                             on the spec before compile.
+            amputate:        Forwarded to ``filter_model_to_config_joints``.
+            floor_xml:       Optional XML file containing a floor scene; the
+                             loaded model is attached to this scene at
+                             ``attach_body`` (or anatomy.root_body).
+            attach_body:     Body name on the loaded model to attach to floor.
+            suffix:          Name suffix passed through to attach.
+            model_transform: Optional callable ``MjSpec -> MjSpec`` applied
+                             before compile. Use for domain-specific tweaks
+                             (e.g. fly flight setup).
+        """
+        if sum(x is not None for x in (xml_path, model, spec)) > 1:
+            raise ValueError("Provide only one of xml_path, model, or spec.")
+
+        if not isinstance(anatomy, AnatomyConfig):
+            anatomy = load_config(anatomy)
+        self.anatomy: AnatomyConfig = anatomy
+
+        # --- Build the spec / model ---
+        if joint_names is not None:
+            if xml_path is None:
+                raise ValueError("joint_names filtering requires xml_path.")
+            from mujoco_visualizer.model_utils import filter_model_to_config_joints
+            spec = mujoco.MjSpec.from_file(xml_path)
+            spec = filter_model_to_config_joints(joint_names, spec=spec, amputate=amputate)
+        elif xml_path is not None and (floor_xml is not None or model_transform is not None):
+            spec = mujoco.MjSpec.from_file(xml_path)
+
+        if spec is not None and floor_xml is not None:
+            child_spec = spec
+            target_spec = mujoco.MjSpec.from_file(floor_xml)
+            spawn_frame = target_spec.worldbody.add_frame(
+                pos=[0, 0, -0.005], quat=[1, 0, 0, 0])
+            root = attach_body or self.anatomy.root_body
+            if root is None:
+                raise ValueError(
+                    "floor_xml requires attach_body= or anatomy.root_body."
+                )
+            spawn_frame.attach_body(child_spec.body(root), "", suffix)
+            spec = target_spec
+
+        if spec is not None and model_transform is not None:
+            spec = model_transform(spec)
+
+        if spec is not None:
+            self.model = spec.compile()
+        elif xml_path is not None:
+            self.model = mujoco.MjModel.from_xml_path(xml_path)
+        else:
+            self.model = model
+
+        self.data = mujoco.MjData(self.model)
+
+        # If anatomy was empty, auto-derive one from the loaded model.
+        if not self.anatomy.categories:
+            self.anatomy = _auto_anatomy(self.model)
+
+        # Save originals for reset / color baking
+        self._orig_geom_rgba = self.model.geom_rgba.copy()
+        self._orig_mat_rgba  = self.model.mat_rgba.copy()
+
+        # Build body-segment → geom_id categorization
+        self._geom_categories = build_geom_categories(self.model, self.anatomy)
+
+        # Bake material rgba into geom_rgba for all categorized geoms so they
+        # can be independently recolored via geom_rgba alone.
+        _cat_geom_ids = {i for idxs in self._geom_categories.values() for i in idxs}
+        _DEFAULT_GEOM_RGBA = np.array([0.5, 0.5, 0.5, 1.0])
+        for gi in _cat_geom_ids:
+            mid = int(self.model.geom_matid[gi])
+            if mid >= 0:
+                if np.allclose(self._orig_geom_rgba[gi], _DEFAULT_GEOM_RGBA):
+                    # Geom has no explicit rgba override; use material rgba directly.
+                    self.model.geom_rgba[gi] = self._orig_mat_rgba[mid]
+                else:
+                    # Geom has an explicit rgba; modulate material rgba by it.
+                    self.model.geom_rgba[gi] = np.clip(
+                        self._orig_mat_rgba[mid] * self._orig_geom_rgba[gi], 0.0, 1.0
+                    )
+                self.model.geom_matid[gi] = -1
+        # Hide *_inertial helper geoms (e.g. wing_left_inertial bounding box).
+        # Substring check catches MjSpec.attach_body(..., suffix=...) renames
+        # such as wing_left_inertial_fly1.
+        for gid in range(self.model.ngeom):
+            gname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ''
+            if '_inertial' in gname:
+                self.model.geom_rgba[gid, 3] = 0.0
+
+        # Refresh originals after baking
+        self._orig_geom_rgba = self.model.geom_rgba.copy()
+
+        # Detect floor geom and material
+        self._floor_geom_id: Optional[int] = next(
+            (i for i in range(self.model.ngeom)
+             if self.model.geom_type[i] == mujoco.mjtGeom.mjGEOM_PLANE),
+            None
+        )
+        self._floor_mat_id: Optional[int] = (
+            int(self.model.geom_matid[self._floor_geom_id])
+            if self._floor_geom_id is not None
+               and int(self.model.geom_matid[self._floor_geom_id]) >= 0
+            else None
+        )
+
+        # Detect skybox texture
+        self._skybox_tex_id: int = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_TEXTURE, 'skybox'
+        )
+
+        # Default hex colors per category (from baked geom_rgba)
+        self._cat_default_hex: dict = {}
+        for cat in self.anatomy.category_names:
+            for gid in self._geom_categories.get(cat, []):
+                r = self._orig_geom_rgba[gid]
+                if r[3] > 0.01:
+                    self._cat_default_hex[cat] = _rgb_to_hex(r[:3])
+                    break
+            if cat not in self._cat_default_hex:
+                self._cat_default_hex[cat] = '#888888'
+
+        # Floor initial state
+        _floor_rgb = (
+            list(self._orig_geom_rgba[self._floor_geom_id, :3])
+            if self._floor_geom_id is not None else [0.5, 0.5, 0.5]
+        )
+        _floor_alpha = (
+            float(self._orig_geom_rgba[self._floor_geom_id, 3])
+            if self._floor_geom_id is not None else 1.0
+        )
+        _floor_mat_props = {'texrepeat': [1.0, 1.0], 'reflectance': 0.2,
+                            'shininess': 0.5, 'emission': 0.0}
+        if self._floor_mat_id is not None:
+            _floor_mat_props['texrepeat'] = list(
+                map(float, self.model.mat_texrepeat[self._floor_mat_id])
+            )
+            _floor_mat_props['reflectance'] = float(
+                self.model.mat_reflectance[self._floor_mat_id]
+            )
+            _floor_mat_props['shininess'] = float(
+                self.model.mat_shininess[self._floor_mat_id]
+            )
+            _floor_mat_props['emission'] = float(
+                self.model.mat_emission[self._floor_mat_id]
+            )
+
+        # Light initial state
+        _init_lights = []
+        for li in range(min(self.model.nlight, 3)):
+            az, el = _dir_to_az_el(self.model.light_dir[li])
+            _init_lights.append({
+                'active':   bool(self.model.light_active[li]),
+                'ambient':  list(map(float, self.model.light_ambient[li])),
+                'diffuse':  list(map(float, self.model.light_diffuse[li])),
+                'specular': list(map(float, self.model.light_specular[li])),
+                'dir_az': az, 'dir_el': el,
+            })
+
+        # Initialize vis_state (mirrors notebook vis_state)
+        self.vis_state: dict = {
+            'colors':      {cat: self._cat_default_hex.get(cat, '#888888')
+                            for cat in self.anatomy.category_names},
+            'geom_colors': {},   # {geom_id (int): hex str} per-geom overrides
+            'alpha': 1.0,
+            'vis_flags': {
+                'contact_points': False, 'contact_forces': False,
+                'actuators': False, 'joints': False, 'transparent': False,
+                'shadows': True, 'wireframe': False,
+            },
+            'geom_groups': [True, True, True, True, False, False],
+            'site_groups':  [True, True, True, True, True,  False],
+            'camera': {
+                'mode': 'free', 'named': '',
+                'azimuth': 180.0, 'elevation': -30.0, 'distance': 0.3,
+                'lookat': [0.0, 0.0, 0.0],
+                'free_type': 'free', 'trackbody': '', 'fixedcamid': '',
+            },
+            'lighting': {
+                'lights': _init_lights,
+                'use_dual_lighting':   False,
+                'use_scale_lights':    False,
+                'scale_lights_factor': 1.25,
+                'headlight': {
+                    'active':   bool(self.model.vis.headlight.active),
+                    'ambient':  list(map(float, self.model.vis.headlight.ambient)),
+                    'diffuse':  list(map(float, self.model.vis.headlight.diffuse)),
+                    'specular': list(map(float, self.model.vis.headlight.specular)),
+                },
+            },
+            'floor': {
+                'color':       _rgb_to_hex(_floor_rgb),
+                'alpha':       _floor_alpha,
+                'texrepeat_x': _floor_mat_props['texrepeat'][0],
+                'texrepeat_y': _floor_mat_props['texrepeat'][1],
+                'reflectance': _floor_mat_props['reflectance'],
+                'shininess':   _floor_mat_props['shininess'],
+                'emission':    _floor_mat_props['emission'],
+            },
+            'skybox': {
+                'show':    True,
+                'sky_top': _rgb_to_hex([0.4, 0.6, 0.8]),
+                'sky_bot': _rgb_to_hex([0.0, 0.0, 0.0]),
+            },
+            'camera_presets': {},
+        }
+
+        if settings_json is not None:
+            self.load_settings(settings_json)
+
+    # ── Settings I/O ─────────────────────────────────────────────────────────
+
+    def load_settings(self, json_path_or_dict: Union[str, dict]) -> None:
+        """Load visual settings from a pose_tuner JSON file or dict.
+
+        Updates vis_state and immediately applies all settings to the model.
+        """
+        if isinstance(json_path_or_dict, str):
+            from mujoco_visualizer.render_settings import _resolve_settings_path
+            try:
+                path = _resolve_settings_path(json_path_or_dict)
+            except FileNotFoundError:
+                path = Path(json_path_or_dict)
+            with open(path) as f:
+                settings = json.load(f)
+        else:
+            settings = json_path_or_dict
+
+        # NOTE: geom_render_state intentionally not applied — it's a raw
+        # gid->rgba cache baked against a specific model topology and will
+        # clobber unrelated geoms (e.g. floor) when applied to a composed
+        # model. The name-based colors/geom_colors path below is correct.
+
+        # Merge settings into vis_state
+        for key in ('colors', 'geom_colors', 'alpha', 'vis_flags',
+                    'geom_groups', 'site_groups', 'camera', 'lighting',
+                    'floor', 'skybox'):
+            if key in settings:
+                if isinstance(settings[key], dict) and isinstance(self.vis_state.get(key), dict):
+                    self.vis_state[key] = {**self.vis_state[key], **settings[key]}
+                else:
+                    self.vis_state[key] = copy.deepcopy(settings[key])
+
+        # Convert geom_colors string keys to int
+        if 'geom_colors' in settings:
+            self.vis_state['geom_colors'] = {
+                int(k): v for k, v in settings['geom_colors'].items()
+            }
+
+        # Camera presets
+        if 'camera_presets' in settings:
+            self.vis_state['camera_presets'].update(settings['camera_presets'])
+
+        self._apply_all()
+
+    def save_settings(self, json_path: str) -> None:
+        """Save current vis_state to a JSON file.
+
+        Bare names (e.g. ``'MyPreset'`` or ``'MyPreset.json'``) are written
+        into the package's ``settings/`` directory so they show up under
+        ``list_available_settings()``. Pass an absolute path or a name
+        containing a path separator to save elsewhere.
+        """
+        from mujoco_visualizer.render_settings import _SETTINGS_DIR
+        p = Path(json_path)
+        if not p.is_absolute() and p.parent == Path('.'):
+            if p.suffix != '.json':
+                p = p.with_suffix('.json')
+            p = _SETTINGS_DIR / p.name
+            p.parent.mkdir(parents=True, exist_ok=True)
+        json_path = str(p)
+        self._apply_geom_colors()
+        _all_cat_ids = sorted({i for idxs in self._geom_categories.values() for i in idxs})
+        geom_render_state = {
+            str(i): list(map(float, self.model.geom_rgba[i])) for i in _all_cat_ids
+        }
+        geom_colors_str = {str(k): v for k, v in self.vis_state['geom_colors'].items()}
+        data = {
+            'colors':            self.vis_state['colors'],
+            'geom_colors':       geom_colors_str,
+            'alpha':             self.vis_state['alpha'],
+            'vis_flags':         dict(self.vis_state['vis_flags']),
+            'geom_groups':       self.vis_state['geom_groups'][:],
+            'site_groups':       self.vis_state['site_groups'][:],
+            'camera':            copy.deepcopy(self.vis_state['camera']),
+            'lighting':          copy.deepcopy(self.vis_state['lighting']),
+            'floor':             copy.deepcopy(self.vis_state['floor']),
+            'skybox':            copy.deepcopy(self.vis_state['skybox']),
+            'geom_render_state': geom_render_state,
+            'camera_presets':    self.vis_state.get('camera_presets', {}),
+        }
+        with open(json_path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+    # ── Apply helpers (mirror notebook apply_* functions) ─────────────────────
+
+    def _apply_geom_colors(self) -> None:
+        alpha = self.vis_state['alpha']
+        geom_overrides = self.vis_state['geom_colors']
+        for cat, idxs in self._geom_categories.items():
+            cat_rgb = _hex_to_rgb(self.vis_state['colors'].get(cat, '#888888'))
+            for i in idxs:
+                if self._orig_geom_rgba[i, 3] < 0.01:
+                    continue
+                rgb = _hex_to_rgb(geom_overrides[i]) if i in geom_overrides else cat_rgb
+                self.model.geom_rgba[i, :3] = rgb
+                self.model.geom_rgba[i,  3] = self._orig_geom_rgba[i, 3] * alpha
+
+    def _apply_lighting(self) -> None:
+        for i, ld in enumerate(self.vis_state['lighting']['lights']):
+            if i >= self.model.nlight:
+                break
+            self.model.light_active[i]   = int(ld['active'])
+            self.model.light_ambient[i]  = ld['ambient']
+            self.model.light_diffuse[i]  = ld['diffuse']
+            self.model.light_specular[i] = ld['specular']
+            self.model.light_dir[i]      = _az_el_to_dir(ld['dir_az'], ld['dir_el'])
+        hl = self.vis_state['lighting']['headlight']
+        self.model.vis.headlight.active      = int(hl['active'])
+        self.model.vis.headlight.ambient[:]  = hl['ambient']
+        self.model.vis.headlight.diffuse[:]  = hl['diffuse']
+        self.model.vis.headlight.specular[:] = hl['specular']
+
+    def _apply_floor_props(self) -> None:
+        if self._floor_geom_id is None:
+            return
+        fld = self.vis_state['floor']
+        rgb = _hex_to_rgb(fld['color'])
+        self.model.geom_rgba[self._floor_geom_id] = [*rgb, fld['alpha']]
+        if self._floor_mat_id is not None:
+            self.model.mat_rgba[self._floor_mat_id]        = [*rgb, fld['alpha']]
+            self.model.mat_texrepeat[self._floor_mat_id]   = [fld['texrepeat_x'],
+                                                               fld['texrepeat_y']]
+            self.model.mat_reflectance[self._floor_mat_id] = fld['reflectance']
+            self.model.mat_shininess[self._floor_mat_id]   = fld['shininess']
+            self.model.mat_emission[self._floor_mat_id]    = fld['emission']
+
+    def _apply_sky_props(self) -> None:
+        if self._skybox_tex_id < 0:
+            return
+        sky = self.vis_state['skybox']
+        pixels = _make_sky_pixels(
+            self.model, self._skybox_tex_id,
+            _hex_to_rgb(sky['sky_top']), _hex_to_rgb(sky['sky_bot'])
+        )
+        if pixels is None:
+            return
+        h = int(self.model.tex_height[self._skybox_tex_id])
+        w = int(self.model.tex_width[self._skybox_tex_id])
+        adr = int(self.model.tex_adr[self._skybox_tex_id])
+        nchan = int(self.model.tex_nchannel[self._skybox_tex_id]) if hasattr(
+            self.model, 'tex_nchannel') else 3
+        if nchan == 4:
+            rgba = np.ones((len(pixels), 4), dtype=np.uint8) * 255
+            rgba[:, :3] = pixels
+            flat = rgba.flatten()
+        else:
+            flat = pixels.flatten()
+        tex_buf = getattr(self.model, 'tex_data', None)
+        if tex_buf is None:
+            tex_buf = getattr(self.model, 'tex_rgb', None)
+        if tex_buf is not None:
+            tex_buf[adr:adr + len(flat)] = flat
+
+    def _apply_all(self) -> None:
+        """Apply all vis_state properties to the model."""
+        self._apply_geom_colors()
+        self._apply_lighting()
+        self._apply_floor_props()
+        self._apply_sky_props()
+
+    def _build_scene_option(self) -> mujoco.MjvOption:
+        opt = mujoco.MjvOption()
+        f = self.vis_state['vis_flags']
+        opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = f.get('contact_points', False)
+        opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = f.get('contact_forces',  False)
+        opt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR]     = f.get('actuators',       False)
+        opt.flags[mujoco.mjtVisFlag.mjVIS_JOINT]        = f.get('joints',          False)
+        opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT]  = f.get('transparent',     False)
+        gg = self.vis_state['geom_groups']
+        sg = self.vis_state['site_groups']
+        for k in range(min(6, len(opt.geomgroup))):
+            opt.geomgroup[k] = int(gg[k])
+        for k in range(min(6, len(opt.sitegroup))):
+            opt.sitegroup[k] = int(sg[k])
+        return opt
+
+    def _build_scene_modifiers(self) -> list:
+        mods = []
+        if self.vis_state['lighting'].get('use_dual_lighting', False):
+            mods.append((dual_lighting, {}))
+        if self.vis_state['lighting'].get('use_scale_lights', False):
+            mods.append((scale_lights,
+                         {'scale': self.vis_state['lighting'].get('scale_lights_factor', 1.25)}))
+        return mods
+
+    def get_camera(
+        self, override: Optional[Union[str, mujoco.MjvCamera]] = None
+    ) -> Union[str, mujoco.MjvCamera]:
+        """Return camera from vis_state, or *override* if provided.
+
+        *override* can be a named XML camera string, an MjvCamera, or the
+        name of a camera preset from the loaded settings.
+        """
+        if override is not None:
+            if isinstance(override, str):
+                # Check XML cameras first
+                if mujoco.mj_name2id(
+                    self.model, mujoco.mjtObj.mjOBJ_CAMERA, override
+                ) != -1:
+                    return override
+                # Fall back to settings presets
+                presets = self.vis_state.get('camera_presets', {})
+                if override in presets:
+                    cfg = _resolve_preset(presets[override])
+                    return self._cfg_to_mjvcamera(cfg)
+            return override
+        c = self.vis_state['camera']
+        if c.get('mode', 'free') == 'named':
+            named = c.get('named', '')
+            if named and mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_CAMERA, named
+            ) != -1:
+                return named
+            # fall through to free camera if named camera missing
+        return self._cfg_to_mjvcamera(c)
+
+    def _cfg_to_mjvcamera(self, c: dict) -> mujoco.MjvCamera:
+        """Build an MjvCamera from a camera config dict."""
+        free_type = c.get('free_type', 'free')
+        mj_type, needs_body, needs_fixedcam = _FREE_TYPE_MAP.get(
+            free_type, _FREE_TYPE_MAP['free']
+        )
+        cam = mujoco.MjvCamera()
+        cam.type      = mj_type
+        cam.azimuth   = c['azimuth']
+        cam.elevation = c['elevation']
+        cam.distance  = c['distance']
+        cam.lookat[:] = c['lookat']
+        if needs_fixedcam:
+            cam_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_CAMERA, c.get('fixedcamid', '')
+            )
+            cam.fixedcamid = max(cam_id, 0)
+        if needs_body:
+            body_id = mujoco.mj_name2id(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, c.get('trackbody', '')
+            )
+            cam.trackbodyid = max(body_id, 0)
+        return cam
+
+    def list_cameras(self) -> List[str]:
+        """Return list of named cameras (from anatomy config, else from model)."""
+        if self.anatomy.cameras:
+            return list(self.anatomy.cameras)
+        return [
+            mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_CAMERA, i) or f"cam{i}"
+            for i in range(self.model.ncam)
+        ]
+
+    def list_presets(self) -> List[str]:
+        """Return list of saved camera preset names."""
+        return list(self.vis_state.get('camera_presets', {}).keys())
+
+    # ── Rendering ─────────────────────────────────────────────────────────────
+
+    def render_frame(
+        self,
+        qpos: np.ndarray,
+        camera: Optional[Union[str, mujoco.MjvCamera]] = None,
+        height: int = 480,
+        width: int = 640,
+        apply_settings: bool = True,
+        modify_scene_fns: Optional[Sequence[Callable]] = None,
+    ) -> np.ndarray:
+        """Render a single frame.
+
+        Args:
+            qpos:            Joint positions array (nq,).
+            camera:          Named camera str, MjvCamera, or None (use vis_state).
+            height, width:   Output resolution in pixels.
+            apply_settings:  If True, apply vis_state to model before rendering.
+
+        Returns:
+            np.ndarray of shape (height, width, 3) uint8.
+        """
+        if apply_settings:
+            self._apply_all()
+
+        self.data.qpos[:] = qpos
+        mujoco.mj_forward(self.model, self.data)
+
+        cam = self.get_camera(camera)
+        opt = self._build_scene_option()
+        scene_mods = self._build_scene_modifiers()
+        vf = self.vis_state['vis_flags']
+        show_shadows   = vf.get('shadows',   True)
+        show_wireframe = vf.get('wireframe', False)
+        show_skybox    = self.vis_state.get('skybox', {}).get('show', True)
+
+        with mujoco.Renderer(self.model, height=height, width=width) as renderer:
+            renderer.update_scene(self.data, camera=cam, scene_option=opt)
+            if not show_shadows:
+                renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
+            if show_wireframe:
+                renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
+            if not show_skybox:
+                renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
+            for fn, kw in scene_mods:
+                fn(renderer.scene, geom_xpos=self.data.geom_xpos, **kw)
+            if modify_scene_fns:
+                for fn in modify_scene_fns:
+                    fn(renderer.scene, data=self.data, frame_idx=0)
+            return renderer.render().copy()
+
+    def save_frame(
+        self,
+        qpos: np.ndarray,
+        output_path: str,
+        camera: Optional[Union[str, mujoco.MjvCamera]] = None,
+        height: int = 2160,
+        width: int = 3840,
+    ) -> np.ndarray:
+        """Render and save a high-quality single frame.
+
+        Args:
+            qpos:         Joint positions array (nq,).
+            output_path:  Output file path (.png, .jpg, etc.).
+            camera:       Camera override; defaults to vis_state camera.
+            height, width: Output resolution (default 4K: 2160×3840).
+
+        Returns:
+            np.ndarray of the rendered frame.
+        """
+        frame = self.render_frame(qpos, camera=camera, height=height, width=width)
+        _save_image(frame, output_path)
+        return frame
+
+    def render_video(
+        self,
+        qposes: np.ndarray,
+        camera: Optional[Union[str, mujoco.MjvCamera]] = None,
+        height: int = 480,
+        width: int = 640,
+        fps: int = 30,
+        output_path: Optional[str] = None,
+        show: bool = False,
+        modify_scene_fns: Optional[Sequence[Callable]] = None,
+    ) -> np.ndarray:
+        """Render a video from a qpos trajectory.
+
+        Args:
+            qposes:      (T, nq) array of joint positions.
+            camera:      Camera override; defaults to vis_state camera.
+            height, width: Frame resolution.
+            fps:         Playback frame rate (used when saving/displaying).
+            output_path: If provided, save the video to this path (.mp4).
+            show:        If True, display inline (requires mediapy).
+
+        Returns:
+            np.ndarray of shape (T, height, width, 3) uint8.
+        """
+        self._apply_all()
+        cam = self.get_camera(camera)
+        opt = self._build_scene_option()
+        scene_mods = self._build_scene_modifiers()
+        vf = self.vis_state['vis_flags']
+        show_shadows   = vf.get('shadows',   True)
+        show_wireframe = vf.get('wireframe', False)
+        show_skybox    = self.vis_state.get('skybox', {}).get('show', True)
+
+        frames = []
+        with mujoco.Renderer(self.model, height=height, width=width) as renderer:
+            for i, qpos in enumerate(qposes):
+                self.data.qpos[:] = qpos
+                mujoco.mj_forward(self.model, self.data)
+                renderer.update_scene(self.data, camera=cam, scene_option=opt)
+                if not show_shadows:
+                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
+                if show_wireframe:
+                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
+                if not show_skybox:
+                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
+                for fn, kw in scene_mods:
+                    fn(renderer.scene, geom_xpos=self.data.geom_xpos, **kw)
+                if modify_scene_fns:
+                    for fn in modify_scene_fns:
+                        fn(renderer.scene, data=self.data, frame_idx=i)
+                frames.append(renderer.render().copy())
+
+        video = np.stack(frames)
+        if output_path is not None:
+            _save_video(video, output_path, fps)
+        if show:
+            try:
+                import mediapy
+                mediapy.show_video(video, fps=fps)
+            except ImportError:
+                pass
+        return video
+
+    def render_video_pan(
+        self,
+        qposes: np.ndarray,
+        cameras: List[mujoco.MjvCamera],
+        height: int = 480,
+        width: int = 640,
+        fps: int = 30,
+        output_path: Optional[str] = None,
+        show: bool = False,
+        ctrls: Optional[np.ndarray] = None,
+        tendon_width: float = 0.003,
+        tendon_min_width: float = 0.0005,
+        tendon_alpha_min: float = 0.05,
+        tendon_baseline: float = 0.0,
+        actuator_color_fn: Optional[Callable] = None,
+        modify_scene_fns: Optional[Sequence[Callable]] = None,
+    ) -> np.ndarray:
+        """Render a video with per-frame camera positions (for panning shots).
+
+        Args:
+            qposes:         (T, nq) array — must have the same length as *cameras*.
+            cameras:        List of MjvCamera from :meth:`make_pan_cameras`.
+            height, width:  Frame resolution.
+            fps:            Playback frame rate.
+            output_path:    If provided, save the video to this path.
+            show:           If True, display inline (requires mediapy).
+            ctrls:          Optional (T, nu) control signals for muscle visualization.
+            tendon_width:   Max tendon rendering width at full activation.
+            tendon_min_width: Min tendon width at zero activation.
+            tendon_alpha_min: Minimum alpha for muscle tendons (default 0.05).
+            tendon_baseline: Baseline added to normalized activation before
+                scaling width and alpha (e.g. 0.3 makes low activations visible).
+            actuator_color_fn: Optional callable ``(name: str) -> color`` where
+                *color* is a hex string (e.g. ``'#d84a2e'``) or an RGBA
+                4-tuple.  Falls back to ``self.actuator_color_fn`` then solid red.
+
+        Returns:
+            np.ndarray of shape (T, height, width, 3) uint8.
+        """
+        self._apply_all()
+        opt = self._build_scene_option()
+        scene_mods = self._build_scene_modifiers()
+        vf = self.vis_state['vis_flags']
+        show_shadows   = vf.get('shadows',   True)
+        show_wireframe = vf.get('wireframe', False)
+        show_skybox    = self.vis_state.get('skybox', {}).get('show', True)
+
+        # Optional muscle visualization
+        show_muscles = ctrls is not None
+        orig_tendon_rgba = orig_tendon_width = act_to_ten = base_rgba = None
+        if show_muscles:
+            ctrls = np.asarray(ctrls)
+            opt.flags[mujoco.mjtVisFlag.mjVIS_TENDON] = True
+            # Resolve color function: parameter > self attribute > solid red.
+            _color_fn = actuator_color_fn or getattr(self, 'actuator_color_fn', None)
+            act_to_ten = {}
+            base_rgba = np.zeros((self.model.nu, 4), dtype=np.float32)
+            _mjTRN_TENDON = int(mujoco.mjtTrn.mjTRN_TENDON)
+            for i in range(self.model.nu):
+                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+                if name is None:
+                    continue
+                trntype = int(self.model.actuator_trntype[i])
+                trnid = self.model.actuator_trnid[i, 0]
+                if trntype == _mjTRN_TENDON and 0 <= trnid < self.model.ntendon:
+                    act_to_ten[i] = trnid
+                    if _color_fn is not None:
+                        clr = _color_fn(name)
+                        if isinstance(clr, str):
+                            clr = _hex_to_rgb(clr) + [1.0]
+                        base_rgba[i] = clr
+                    else:
+                        base_rgba[i] = [0.85, 0.15, 0.15, 1.0]
+            orig_tendon_rgba = self.model.tendon_rgba.copy()
+            orig_tendon_width = self.model.tendon_width.copy()
+            muscle_ten_ids = set(act_to_ten.values())
+            for t in range(self.model.ntendon):
+                if t not in muscle_ten_ids:
+                    self.model.tendon_rgba[t, 3] = 0.0
+            width_range = tendon_width - tendon_min_width
+            # Normalize to global max across all timesteps
+            ctrl_max = max(float(np.abs(ctrls).max()), 1e-8)
+
+        frames = []
+        with mujoco.Renderer(self.model, height=height, width=width) as renderer:
+            for i, qpos in enumerate(qposes):
+                self.data.qpos[:] = qpos
+                if show_muscles and ctrls is not None:
+                    self.data.ctrl[:] = ctrls[i]
+                mujoco.mj_forward(self.model, self.data)
+
+                if show_muscles and act_to_ten is not None:
+                    ctrl_i = ctrls[i]
+                    for act_id, ten_id in act_to_ten.items():
+                        raw = float(np.clip(abs(ctrl_i[act_id]) / ctrl_max, 0.0, 1.0))
+                        norm = tendon_baseline + (1.0 - tendon_baseline) * raw
+                        alpha = max(norm, tendon_alpha_min)
+                        self.model.tendon_rgba[ten_id] = (
+                            base_rgba[act_id] * np.array([1, 1, 1, alpha])
+                        )
+                        self.model.tendon_width[ten_id] = tendon_min_width + width_range * norm
+
+                renderer.update_scene(self.data, camera=cameras[i], scene_option=opt)
+                if not show_shadows:
+                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
+                if show_wireframe:
+                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
+                if not show_skybox:
+                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
+                for fn, kw in scene_mods:
+                    fn(renderer.scene, geom_xpos=self.data.geom_xpos, **kw)
+                if modify_scene_fns:
+                    for fn in modify_scene_fns:
+                        fn(renderer.scene, data=self.data, frame_idx=i)
+                frames.append(renderer.render().copy())
+
+        if show_muscles and orig_tendon_rgba is not None:
+            self.model.tendon_rgba[:] = orig_tendon_rgba
+            self.model.tendon_width[:] = orig_tendon_width
+
+        video = np.stack(frames)
+        if output_path is not None:
+            _save_video(video, output_path, fps)
+        if show:
+            try:
+                import mediapy
+                mediapy.show_video(video, fps=fps)
+            except ImportError:
+                pass
+        return video
+
+    # ── Camera utilities ──────────────────────────────────────────────────────
+
+    def make_pan_cameras(
+        self,
+        preset_names: List[str],
+        total_frames: int = 120,
+        segment_weights: Optional[List[float]] = None,
+        loop: bool = False,
+        settings: Optional[Union[str, dict]] = None,
+    ) -> List[mujoco.MjvCamera]:
+        """Build a list of MjvCamera objects for a smooth camera pan.
+
+        Args:
+            preset_names:     Ordered list of preset names (at least 2).
+                              Presets must exist in vis_state['camera_presets']
+                              or in an externally supplied *settings* dict.
+            total_frames:     Total number of frames to generate.
+            segment_weights:  Relative time budget per segment (normalised).
+            loop:             If True, append a segment back to the first preset.
+            settings:         Optional alternative settings dict/path to look up
+                              presets from (instead of self.vis_state).
+
+        Returns:
+            List of ``mujoco.MjvCamera`` of length *total_frames*.
+        """
+        if settings is not None:
+            if isinstance(settings, str):
+                with open(settings) as f:
+                    settings = json.load(f)
+            presets = settings.get('camera_presets', {})
+        else:
+            presets = self.vis_state.get('camera_presets', {})
+
+        if len(preset_names) < 2:
+            raise ValueError("Need at least two preset names to interpolate between.")
+
+        keyframes = []
+        for name in preset_names:
+            if name not in presets:
+                raise KeyError(
+                    f"Preset '{name}' not found. Available: {list(presets.keys())}"
+                )
+            keyframes.append(_resolve_preset(presets[name]))
+
+        if loop:
+            keyframes.append(keyframes[0])
+
+        n_segs = len(keyframes) - 1
+        if segment_weights is None:
+            weights = [1.0] * n_segs
+        else:
+            if len(segment_weights) != n_segs:
+                raise ValueError(
+                    f"segment_weights has {len(segment_weights)} entries but there are "
+                    f"{n_segs} segments."
+                )
+            weights = [float(w) for w in segment_weights]
+
+        total_w = sum(weights)
+        seg_frames = [max(1, round(w / total_w * total_frames)) for w in weights]
+        seg_frames[-1] = max(1, total_frames - sum(seg_frames[:-1]))
+
+        cameras = []
+        for seg in range(n_segs):
+            A = keyframes[seg]
+            B = keyframes[seg + 1]
+            n = seg_frames[seg]
+            for fi in range(n):
+                t = _cosine_ease(fi / n)
+                cameras.append(_build_pan_camera(self.model, A, B, t))
+
+        return cameras
+
+    # ── Convenience ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def scan_frames(
+        qposes: np.ndarray,
+        output_dir: str,
+        viz: 'Visualizer',
+        frame_indices: Optional[Union[List[int], np.ndarray]] = None,
+        camera: Optional[Union[str, mujoco.MjvCamera]] = None,
+        height: int = 2160,
+        width: int = 3840,
+        prefix: str = 'frame',
+    ) -> List[str]:
+        """Render and save multiple high-quality frames from a trajectory.
+
+        Useful for scanning a video to find good frames before committing to a
+        full high-quality render.
+
+        Args:
+            qposes:        (T, nq) trajectory array.
+            output_dir:    Directory to save frames.
+            viz:           Visualizer instance.
+            frame_indices: Which frame indices to render.  None = evenly spaced 10.
+            camera:        Camera override.
+            height, width: Output resolution (default 4K).
+            prefix:        File name prefix.
+
+        Returns:
+            List of output file paths.
+        """
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        if frame_indices is None:
+            T = len(qposes)
+            frame_indices = list(np.linspace(0, T - 1, min(10, T), dtype=int))
+
+        viz._apply_all()
+        paths = []
+        for idx in frame_indices:
+            out = str(Path(output_dir) / f'{prefix}_{idx:06d}.png')
+            viz.save_frame(qposes[idx], out, camera=camera, height=height, width=width)
+            paths.append(out)
+            print(f'  Saved {out}')
+        return paths

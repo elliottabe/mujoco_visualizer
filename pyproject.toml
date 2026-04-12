@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mujoco_visualizer"
+version = "0.1.0"
+description = "Generic, config-driven offscreen visualizer for any MuJoCo model"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "Elliott Abe"}]
+dependencies = [
+    "mujoco>=3.0",
+    "numpy",
+    "PyYAML",
+]
+
+[project.optional-dependencies]
+io = ["mediapy", "imageio", "Pillow"]
+gui = ["dearpygui"]
+jupyter = ["ipywidgets", "mediapy", "ipython"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+mujoco_visualizer = ["settings/*.json", "presets/fly/*.yaml", "presets/fly/*.py"]

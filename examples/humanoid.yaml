@@ -1,0 +1,32 @@
+cameras: []
+root_body: torso
+categories:
+  - name: torso
+    match:
+      body_substring: [torso, pelvis, abdomen]
+  - name: head
+    match:
+      body_substring: [head, neck]
+  - name: left_arm
+    match:
+      body_substring: [arm, left]
+      all: true
+  - name: right_arm
+    match:
+      body_substring: [arm, right]
+      all: true
+  - name: left_leg
+    match:
+      body_substring: [leg, left]
+      all: true
+  - name: right_leg
+    match:
+      body_substring: [leg, right]
+      all: true
+pose_groups:
+  - label: Arms
+    joint_substrings: [shoulder, elbow, wrist]
+    side_filters: [left, right]
+  - label: Legs
+    joint_substrings: [hip, knee, ankle]
+    side_filters: [left, right]
