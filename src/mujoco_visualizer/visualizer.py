@@ -153,10 +153,10 @@ def add_arrow_to_scene(
     scene.ngeom += 1
 
 
-def get_wing_fluid_idxs(model: mujoco.MjModel) -> List[int]:
+def get_wing_fluid_idxs(model: mujoco.MjModel, suffix='') -> List[int]:
     """Return geom ids of the wing fluid geoms (left, right) in *model*."""
     out = []
-    for name in ('wing_left_fluid', 'wing_right_fluid'):
+    for name in (f'wing_left_fluid{suffix}', f'wing_right_fluid{suffix}'):
         gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
         if gid >= 0:
             out.append(gid)
