@@ -714,7 +714,10 @@ class WidgetGUI:
         def _apply_cam_to_widgets(c):
             self._suppress = True
             mode_toggle.value = 'Named' if c.get('mode', 'named') == 'named' else 'Free orbit'
-            named_dd.value    = c.get('named', 'track1')
+            desired_named = c.get('named', '')
+            if desired_named not in named_dd.options:
+                desired_named = named_dd.options[0] if named_dd.options else ''
+            named_dd.value = desired_named
             free_type_dd.value = c.get('free_type', 'free')
             trackbody_txt.value = c.get('trackbody', '')
             fixedcam_txt.value  = c.get('fixedcamid', '')
