@@ -130,7 +130,14 @@ def parse_command(raw) -> Dict:
             lookat = cmd["lookat"]
             if not isinstance(lookat, (list, tuple)) or len(lookat) != 3:
                 raise CommandError("'camera.lookat' must be 3 numbers")
-            out["lookat"] = [float(v) for v in lookat]
+            lookat_values = []
+            for i, v in enumerate(lookat):
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise CommandError(
+                        f"'camera.lookat' element {i} must be a number, got {type(v).__name__}"
+                    )
+                lookat_values.append(float(v))
+            out["lookat"] = lookat_values
         if len(out) == 1:
             raise CommandError("'camera' needs 'named' or at least one of az/el/dist/lookat")
         return out

@@ -58,6 +58,26 @@ def test_stream_bounds_are_enforced():
         parse_command({"t": "stream", "quality": 101})
 
 
+def test_rejects_boolean_in_numeric_field():
+    """Booleans are instances of int, so must be explicitly rejected."""
+    with pytest.raises(CommandError):
+        parse_command({"t": "camera", "az": True})
+    with pytest.raises(CommandError):
+        parse_command({"t": "ctrl_group", "group": "g", "gain": False})
+
+
+def test_rejects_boolean_in_lookat():
+    """camera.lookat elements must reject booleans like all numeric fields."""
+    with pytest.raises(CommandError):
+        parse_command({"t": "camera", "lookat": [1.0, 2.0, True]})
+
+
+def test_rejects_non_numeric_lookat_element():
+    """camera.lookat elements must raise CommandError, not bare ValueError."""
+    with pytest.raises(CommandError):
+        parse_command({"t": "camera", "lookat": [1.0, 2.0, "bad"]})
+
+
 def test_coalesce_keeps_only_the_last_camera():
     cmds = [
         {"t": "camera", "az": 1.0},
