@@ -8,14 +8,19 @@
  * whatever still piles up, so a fast drag over a slow link cannot build a backlog of stale
  * camera positions.
  *
- * Two banners, deliberately kept separate:
+ * Three banners, deliberately kept separate. None of them may overwrite or hide another.
  *  - #banner holds scene.backend_warning. It is set once, from the one-time scene message,
  *    and means "the physics you are watching is not the trained dynamics" (e.g. the cpu
  *    backend drives tendons with linear force generators, not the real force-length/
  *    force-velocity muscle model). It must stay up for as long as that is true.
- *  - #warnbanner holds everything transient: a per-frame frame_meta.warn (e.g. a full
- *    contact buffer), connection state, and command/sim errors. These come and go and must
- *    never be able to overwrite or hide the backend warning above.
+ *  - #errbanner holds server errors: diverged / controller / render / command. These are the
+ *    only messages that explain why the simulation stopped, so they persist until the user
+ *    acts (Play or Reset -- the same actions that clear the error server-side). They used to
+ *    share #warnbanner, which meant the very next JPEG's showWarn(meta.warn) hid them under
+ *    one frame interval and they never came back: the sim stopped with no reason on screen.
+ *  - #warnbanner holds what is genuinely transient: the per-frame frame_meta.warn (a DELTA
+ *    for that frame, not a session-cumulative total, so it comes and goes with the condition)
+ *    and connection state.
  */
 (function () {
   const cv = document.getElementById("cv");
@@ -23,6 +28,7 @@
   const statsEl = document.getElementById("stats");
   const backendEl = document.getElementById("backend");
   const bannerEl = document.getElementById("banner");
+  const errbannerEl = document.getElementById("errbanner");
   const warnbannerEl = document.getElementById("warnbanner");
   const controlsEl = document.getElementById("controls");
   const cameraEl = document.getElementById("camera");
@@ -48,7 +54,16 @@
     bannerEl.textContent = msg;
   }
 
-  // Transient notice: frame warnings, connection state, command/sim errors.
+  // Server error notice: diverged / controller / render / command. Its own element, with
+  // priority over per-frame warnings, and NOT cleared by the arrival of the next frame --
+  // these messages are the only explanation the user gets for why the sim stopped.
+  function showError(msg) {
+    if (!msg) { errbannerEl.hidden = true; errbannerEl.textContent = ""; return; }
+    errbannerEl.hidden = false;
+    errbannerEl.textContent = msg;
+  }
+
+  // Transient notice: per-frame frame warnings and connection state only.
   function showWarn(msg) {
     if (!msg) { warnbannerEl.hidden = true; return; }
     warnbannerEl.hidden = false;
@@ -187,12 +202,17 @@
   const playBtn = document.getElementById("play");
   playBtn.onclick = () => {
     playing = !playing;
+    // Play and Reset are exactly the commands that clear SimLoop._error server-side, so they
+    // are also what clears the banner here. Anything sooner (e.g. the next frame) would erase
+    // the only explanation the user has for why the sim stopped.
+    if (playing) showError(null);
     send({ t: "sim", cmd: playing ? "play" : "pause" });
     playBtn.textContent = playing ? "Pause" : "Play";
   };
   document.getElementById("stepbtn").onclick = () => send({ t: "sim", cmd: "step", n: 1 });
   document.getElementById("reset").onclick = () => {
     playing = false; playBtn.textContent = "Play";
+    showError(null);
     send({ t: "sim", cmd: "reset" });
   };
   document.getElementById("substeps").onchange = (e) =>
@@ -217,6 +237,9 @@
           statsEl.textContent =
             `t=${pendingMeta.sim_time.toFixed(3)}s  rtf=${pendingMeta.rtf}x  ` +
             `${pendingMeta.w}x${pendingMeta.h}  #${pendingMeta.seq}`;
+          // meta.warn is a per-frame delta, so clearing the banner when it is null is
+          // correct: the condition genuinely stopped. It can no longer wipe a server error,
+          // which lives in its own element (#errbanner).
           showWarn(pendingMeta.warn);
           frameHandlers.forEach((fn) => fn(pendingMeta));
           pendingMeta = null;
@@ -233,7 +256,7 @@
       } else if (msg.t === "frame_meta") {
         pendingMeta = msg;
       } else if (msg.t === "error") {
-        showWarn(`${msg.kind}: ${msg.msg}`);
+        showError(`${msg.kind}: ${msg.msg}`);
         if (msg.paused) { playing = false; playBtn.textContent = "Play"; }
         errorHandlers.forEach((fn) => fn(msg));
       }

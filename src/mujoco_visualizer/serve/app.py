@@ -83,7 +83,7 @@ def _mujoco_gl_hint(exc: Exception) -> str:
     )
 
 
-def _ws_loop(sock_conn, loop, session) -> None:
+def _ws_loop(sock_conn, loop, session=None) -> None:
     """One connection: relay commands in, frames out.
 
     Frames are sent as a ``frame_meta`` JSON immediately followed by the binary JPEG. A
@@ -92,9 +92,17 @@ def _ws_loop(sock_conn, loop, session) -> None:
     Extracted from the ``/ws`` route (rather than left as a closure inside it) so it can be
     unit-tested directly against a fake socket object -- Flask's synchronous test client
     can't drive a real flask_sock connection.
+
+    The scene description comes from ``loop.scene()``, NOT from ``session.scene_message()``:
+    this function runs on a Flask request thread while the simulation thread mutates the
+    Session, and ``scene_message()`` reads ``viz.vis_state`` (which that thread rewrites via
+    apply_render/load_settings/set_camera). Serialising it from here could raise "dictionary
+    changed size during iteration" inside ``json.dumps`` -- and this function's bare ``except``
+    would silently turn that into a dropped connection. *session* is accepted but unused, for
+    call-compatibility.
     """
     loop.client_joined()
-    sock_conn.send(json.dumps(session.scene_message()))
+    sock_conn.send(json.dumps(loop.scene()))
     last_seq = -1
     # Compared by VALUE (kind, msg), not identity: SimLoop._publish() builds a brand-new
     # error dict every tick while a failure persists (see loop.py), so an identity check
@@ -143,6 +151,11 @@ def create_app(loop, session, extra_static: Optional[Path] = None) -> Flask:
 
     *extra_static* lets a host project (e.g. vnc_explorer) serve its own panel JS from
     ``/ext/<file>`` without vendoring it into this package.
+
+    *session* is held for ownership/lifetime only. Nothing here calls into it: every route
+    runs on a Flask request thread, and the Session belongs to the simulation thread (see
+    ``_ws_loop``). Scene data comes from ``loop.scene()``, which the simulation thread
+    publishes.
     """
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
     sock = Sock(app)
@@ -153,7 +166,10 @@ def create_app(loop, session, extra_static: Optional[Path] = None) -> Flask:
 
     @app.get("/api/scene")
     def scene():
-        return jsonify(session.scene_message())
+        # loop.scene() is seeded at SimLoop construction and republished with every frame, so
+        # it answers before the first frame and keeps answering after Session.close() -- where
+        # calling session.scene_message() would raise AttributeError on the dropped backend.
+        return jsonify(loop.scene())
 
     if extra_static is not None:
 

@@ -11,6 +11,9 @@ pytest.importorskip("flask_sock")
 from mujoco_visualizer.serve.app import _ws_loop, create_app  # noqa: E402
 
 
+_SCENE = {"t": "scene", "nq": 3, "nu": 2, "controls": {"groups": []}}
+
+
 class StubLoop:
     def __init__(self):
         self.submitted = []
@@ -27,6 +30,9 @@ class StubLoop:
     def wait_for_frame(self, last_seq, timeout=1.0):
         return None
 
+    def scene(self):
+        return dict(_SCENE)
+
     def client_joined(self):
         self.joined += 1
 
@@ -35,8 +41,14 @@ class StubLoop:
 
 
 class StubSession:
+    """A Session the app must never call into: every route and the ws handler run on Flask
+    request threads, and Session belongs to the simulation thread."""
+
     def scene_message(self):
-        return {"t": "scene", "nq": 3, "nu": 2, "controls": {"groups": []}}
+        raise AssertionError(
+            "app.py must not call Session.scene_message() from a request thread -- "
+            "the scene comes from loop.scene(), published by the simulation thread"
+        )
 
 
 @pytest.fixture
@@ -63,6 +75,21 @@ def test_scene_endpoint_returns_the_scene_message(client):
 def test_static_assets_are_served(client):
     assert client.get("/static/viewer.js").status_code == 200
     assert client.get("/static/viewer.css").status_code == 200
+
+
+def test_scene_endpoint_still_answers_after_the_session_is_closed():
+    """Session.close() drops the backend, so a request thread calling scene_message() would
+    raise AttributeError and 500. Reading the loop's published slot keeps answering."""
+
+    class ClosedSession(StubSession):
+        pass
+
+    loop = StubLoop()
+    app = create_app(loop, ClosedSession())
+    app.config["TESTING"] = True
+    resp = app.test_client().get("/api/scene")
+    assert resp.status_code == 200
+    assert json.loads(resp.data)["t"] == "scene"
 
 
 # -- _ws_loop -------------------------------------------------------------------------
@@ -112,6 +139,9 @@ class FrameLoop:
 
     def submit(self, cmd):
         self.submitted.append(cmd)
+
+    def scene(self):
+        return dict(_SCENE)
 
     def wait_for_frame(self, last_seq, timeout=1.0):
         self._seq += 1
@@ -198,3 +228,27 @@ def test_ws_error_relay_is_deduped_by_value_not_identity():
     errors = [m for m in _texts(conn.sent) if m["t"] == "error"]
     assert len(errors) == 1, f"expected exactly one error relay, got {len(errors)}"
     assert loop.left == 1
+
+
+def test_errors_and_frame_warnings_live_in_separate_dom_elements(client):
+    """Pinned at the asset level (there is no JS test harness here).
+
+    frame_meta.warn used to be written into the same #warnbanner as server errors, so the very
+    next JPEG's showWarn() hid a diverged/controller/render/command message under one frame
+    interval -- the sim stopped with no reason on screen. The three honesty signals
+    (#banner for backend_warning, #errbanner for errors, #warnbanner for per-frame warnings)
+    must stay distinct elements.
+    """
+    page = client.get("/").data.decode()
+    js = client.get("/static/viewer.js").data.decode()
+    css = client.get("/static/viewer.css").data.decode()
+
+    for element_id in ("banner", "errbanner", "warnbanner"):
+        assert 'id="{0}"'.format(element_id) in page
+    assert 'getElementById("errbanner")' in js
+    assert "function showError(" in js
+    # The scene-level backend warning still has its own setter, untouched by either of these.
+    assert "function showBackendWarning(" in js
+    # And the error branch no longer routes through the per-frame warning banner.
+    assert "showWarn(`${msg.kind}" not in js
+    assert "#errbanner" in css

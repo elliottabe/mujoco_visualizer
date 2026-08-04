@@ -13,6 +13,7 @@ stepping/state in the backend, so a later device-resident backend (Warp/MJX) dro
 touching this file.
 """
 
+import copy
 from typing import Dict, Optional, Sequence
 
 import mujoco
@@ -40,6 +41,18 @@ class Diverged(RuntimeError):
 #   config (e.g. the contact buffer filling up). These are expected to happen, are not a
 #   corrupt state, and must stay visible-but-non-fatal -- pausing the viewer on a full
 #   contact buffer would hide exactly the thing a user wants to watch develop.
+# Wire name -> vis_state['camera'] key. The protocol (and viewer.js) speak the short
+# az/el/dist that a drag handler naturally produces; Visualizer._cfg_to_mjvcamera reads the
+# long names. This mapping is the only place the two meet -- deliberately here rather than by
+# renaming either side, since the protocol is public to every connected browser and
+# vis_state's key names are shared with the settings JSON files on disk.
+_CAMERA_WIRE_KEYS = {
+    "az": "azimuth",
+    "el": "elevation",
+    "dist": "distance",
+    "lookat": "lookat",
+}
+
 _FATAL_WARNINGS = (
     mujoco.mjtWarning.mjWARN_BADQPOS,
     mujoco.mjtWarning.mjWARN_BADQVEL,
@@ -114,6 +127,14 @@ class Session:
         self._hi = self.model.actuator_ctrlrange[:, 1].copy()
         self._limited = self.model.actuator_ctrllimited.astype(bool)
 
+        # Per-frame warning deltas (see :meth:`new_warnings`) are measured against this.
+        self._warn_baseline = np.zeros(int(mujoco.mjtWarning.mjNWARNING), dtype=np.int64)
+
+        # A fresh MjData has geom_xpos all-zero and xquat all-zero, and mjv_updateScene draws
+        # from exactly those precomputed arrays -- so without this the frames published before
+        # the first Play (SimLoop publishes every tick but starts with _playing=False) draw the
+        # whole model collapsed at the origin, on every backend.
+        mujoco.mj_forward(self.model, self.data)
         self._snapshot()
 
     # -- controller -----------------------------------------------------------
@@ -185,10 +206,23 @@ class Session:
         self._good = (self.data.qpos.copy(), self.data.qvel.copy(), float(self.data.time))
 
     def _restore(self) -> None:
+        """Roll host AND backend state back to the last good step.
+
+        Pushing it through :meth:`PhysicsBackend.set_state` is what makes the rollback real
+        for a backend whose authoritative state lives off-host: rewriting only ``self.data``
+        leaves a device-resident backend (``WarpBackend``) holding the diverged state, so
+        every subsequent :meth:`step` re-diverges until :meth:`reset` -- and the "rolled back
+        to the last good step" message would be a lie.
+
+        Only qpos/qvel/time are restored; actuator activation (``data.act``, non-empty once
+        the muscle conversion sets ``dyntype=MUSCLE``) is not snapshotted, so the divergence
+        message below is deliberately explicit about what was rolled back.
+        """
         qpos, qvel, t = self._good
         self.data.qpos[:] = qpos
         self.data.qvel[:] = qvel
         self.data.time = t
+        self.backend.set_state(qpos, qvel, t)
         mujoco.mj_forward(self.model, self.data)
 
     def _is_finite(self) -> bool:
@@ -224,12 +258,21 @@ class Session:
         warn_before = self._fatal_warning_count()
         self.backend.step(int(n))
         self.backend.sync_to(self.data)
+        # MANDATORY, and deliberately unconditional. mjv_updateScene renders from the
+        # PRECOMPUTED xpos/xquat/geom_xpos, which only mj_forward/mj_step populate --
+        # ``sync_to`` writes qpos/qvel/time and nothing else. So for any backend whose
+        # authoritative state lives off-host (``WarpBackend``), skipping this pins the drawn
+        # pose to whatever derived state the MjData last held, for the whole session, while
+        # sim_time and rtf keep advancing convincingly. There is deliberately NO
+        # "skip it for CpuBackend" branch: ~1 ms against a 40 ms tick does not justify one,
+        # and a conditional is exactly how this class of bug comes back.
+        mujoco.mj_forward(self.model, self.data)
         diverged = (self._fatal_warning_count() > warn_before) or not self._is_finite()
         if diverged:
             self._restore()
             raise Diverged(
                 "physics diverged (fatal MuJoCo warning or non-finite qpos/qvel); "
-                "rolled back to the last good step"
+                "host and backend rolled back to the last good step (qpos/qvel/time)"
             )
         self._snapshot()
 
@@ -244,6 +287,27 @@ class Session:
             for i in range(mujoco.mjtWarning.mjNWARNING)
             if self.data.warning[i].number > 0
         ]
+        return ", ".join(names) if names else None
+
+    def new_warnings(self) -> Optional[str]:
+        """Warnings raised SINCE THE LAST CALL, or None. This is what rides on ``frame_meta``.
+
+        :meth:`warnings` reports MuJoCo's cumulative counters, which are only cleared by
+        :meth:`reset` -- so once anything ever warns, a banner fed from it is pinned to a
+        stale string forever, and a permanently-pinned banner then permanently masks whatever
+        else wants to use that slot. A per-frame delta comes and goes with the condition: a
+        contact buffer that is still filling re-increments every step and so stays visible,
+        while one that stopped clears itself.
+
+        STATEFUL: each call re-baselines, so it must be called exactly once per frame (from
+        ``SimLoop._publish``). Use :meth:`warnings` for the cumulative view.
+        """
+        names = []
+        for i in range(int(mujoco.mjtWarning.mjNWARNING)):
+            count = int(self.data.warning[i].number)
+            if count > self._warn_baseline[i]:
+                names.append(mujoco.mjtWarning(i).name)
+            self._warn_baseline[i] = count
         return ", ".join(names) if names else None
 
     def set_qpos(self, qpos: Sequence[float]) -> None:
@@ -278,8 +342,13 @@ class Session:
             mujoco.mj_resetData(self.model, self.data)
             mujoco.mj_forward(self.model, self.data)
         self.backend.sync_to(self.data)
+        # Same reason as in step(): sync_to writes only qpos/qvel/time, and mjv_updateScene
+        # needs the derived xpos/xquat/geom_xpos -- without this the first post-reset frame
+        # keeps drawing the pre-reset pose on a device-resident backend.
+        mujoco.mj_forward(self.model, self.data)
         for i in range(mujoco.mjtWarning.mjNWARNING):
             self.data.warning[i].number = 0
+        self._warn_baseline[:] = 0
         self._controller_out = None
         self._snapshot()
 
@@ -308,15 +377,31 @@ class Session:
 
     def set_camera(self, named: Optional[str] = None, **kw) -> None:
         """Point the camera. ``named`` selects a named camera/preset; keyword args
-        (az/el/dist/lookat) update the free camera in ``vis_state``."""
+        (az/el/dist/lookat) update the free camera in ``vis_state``.
+
+        The wire names are translated to the ``vis_state['camera']`` keys that
+        ``Visualizer._cfg_to_mjvcamera`` actually reads (see :data:`_CAMERA_WIRE_KEYS`).
+        Writing ``az``/``el``/``dist`` through verbatim looks like it works -- the keys land in
+        the dict and come back out in the scene message -- but the renderer never reads them,
+        so dragging the canvas is a silent no-op.
+        """
         if named is not None:
             self._camera = named
             return
         self._camera = None
         cam = self.viz.vis_state.setdefault("camera", {})
+        touched = False
         for key, value in kw.items():
-            if value is not None:
-                cam[key] = value
+            if value is None:
+                continue
+            cam[_CAMERA_WIRE_KEYS.get(key, key)] = value
+            touched = True
+        if touched:
+            # A settings file can pin camera.mode to "named" (Earthy_V1 does, and it is
+            # live.py's default), and Visualizer.get_camera short-circuits straight to the XML
+            # camera whenever mode == 'named' -- silently discarding the user's drag. Arriving
+            # free-camera parameters ARE the request to be on the free camera.
+            cam["mode"] = "free"
 
     def apply_render(self, settings: Dict) -> None:
         """Merge flat render-setting keys into ``vis_state`` (e.g. ``floor.alpha``)."""
@@ -328,12 +413,42 @@ class Session:
             node[parts[-1]] = value
 
     def load_settings(self, name: str) -> None:
+        """Load a BUNDLED settings preset by name.
+
+        Names only, never paths -- the same whitelist ``protocol.parse_command`` enforces, kept
+        here too so the invariant does not depend on which entry point reached this method.
+        ``Visualizer.load_settings`` deliberately still accepts paths for its own (local,
+        non-networked) callers, which is why this guard lives in the serve layer.
+        """
+        available = list_available_settings()
+        if name not in available:
+            raise ValueError(
+                "unknown settings preset {0!r}; available: {1}".format(
+                    name, ", ".join(available)
+                )
+            )
         self.viz.load_settings(name)
 
     # -- description -----------------------------------------------------------
 
     def scene_message(self) -> Dict:
-        """One-time description the client builds its whole UI from."""
+        """Description the client builds its whole UI from -- a SNAPSHOT, not a live view.
+
+        ``settings`` is a deep copy of ``vis_state`` rather than the dict itself. The loop
+        thread mutates ``vis_state`` continuously (``apply_render``, ``load_settings``,
+        ``set_camera``) while a Flask request thread may be part-way through serialising this
+        message; handing out the live dict is how ``json.dumps``/``jsonify`` ends up raising
+        "dictionary changed size during iteration" -- swallowed as a silently dropped
+        WebSocket in ``_ws_loop``, or a 500 on ``/api/scene``.
+
+        ``controls`` is the immutable tree built once in ``__init__`` and never written to
+        again, so it is shared by reference deliberately: on the fly model it is 272 actuator
+        dicts, and this method now runs once per published frame.
+
+        Safe to call after :meth:`close`, which drops the backend -- a late ``/api/scene``
+        should answer, not raise.
+        """
+        backend = getattr(self, "backend", None)
         return {
             "t": "scene",
             "nq": int(self.model.nq),
@@ -343,14 +458,14 @@ class Session:
             "controls": self._tree,
             "cameras": self.viz.list_cameras(),
             "presets": self.viz.list_presets(),
-            "settings": self.viz.vis_state,
+            "settings": copy.deepcopy(self.viz.vis_state),
             "settings_available": list_available_settings(),
             "has_controller": self._controller is not None,
             "ctrl_mode": self._mode,
             "width": self.width,
             "height": self.height,
-            "backend": self.backend.label,
-            "backend_warning": self.backend.warning,
+            "backend": None if backend is None else backend.label,
+            "backend_warning": None if backend is None else backend.warning,
         }
 
     def close(self) -> None:

@@ -24,6 +24,10 @@ class PhysicsBackend(Protocol):
     backend that already steps the caller's own ``MjData`` in place (:class:`CpuBackend`)
     implements it as a no-op; a backend that steps device-resident state (a future
     ``WarpBackend``) uses it to copy the current state back to host memory each frame.
+
+    ``set_state`` is its inverse and is what makes ``Session``'s divergence rollback real:
+    without it, ``Session`` can only rewrite the host ``MjData``, leaving a device-resident
+    backend still holding the diverged state and re-diverging on every subsequent step.
     """
 
     label: str
@@ -36,6 +40,9 @@ class PhysicsBackend(Protocol):
         ...
 
     def sync_to(self, data: mujoco.MjData) -> None:
+        ...
+
+    def set_state(self, qpos: np.ndarray, qvel: np.ndarray, time: float) -> None:
         ...
 
     def reset_to_keyframe(self, name: str) -> None:
@@ -93,6 +100,18 @@ class CpuBackend:
         """No-op: this backend steps the caller's own ``MjData`` in place, so there is
         nothing to copy -- copying an array onto itself would be dead work, not a safety net.
         """
+
+    def set_state(self, qpos: np.ndarray, qvel: np.ndarray, time: float) -> None:
+        """Overwrite this backend's state (used by ``Session``'s divergence rollback).
+
+        Forwards afterwards so the derived quantities (``xpos``/``geom_xpos``, and the
+        contact set) match the state just written, rather than still describing the diverged
+        one that is being rolled back out.
+        """
+        self.data.qpos[:] = qpos
+        self.data.qvel[:] = qvel
+        self.data.time = float(time)
+        mujoco.mj_forward(self.model, self.data)
 
     def reset_to_keyframe(self, name: str) -> None:
         """Reset to the keyframe named *name*, looked up BY NAME, never by index.

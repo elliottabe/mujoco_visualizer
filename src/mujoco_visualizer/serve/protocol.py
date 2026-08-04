@@ -4,10 +4,17 @@ Two jobs. Validation, so a malformed message from the browser produces an error 
 instead of a half-applied state change. And coalescing, so a mouse drag that emitted a
 dozen camera messages while the loop was busy stepping applies once -- without it, a fast
 drag over a slow link builds a backlog of stale positions the camera then walks through.
+
+Otherwise pure data: the one exception is ``settings.load``, which is checked against
+``list_available_settings()`` (a directory listing). That whitelist has to live in front of
+the simulation rather than behind it, because the value reaches ``open()``/``json.load()`` and
+validating a filename is exactly a validation job.
 """
 
 import json
 from typing import Dict, List
+
+from mujoco_visualizer.render_settings import list_available_settings
 
 COMMANDS = frozenset(
     {
@@ -152,6 +159,18 @@ def parse_command(raw) -> Dict:
         name = cmd.get("load")
         if not isinstance(name, str) or not name:
             raise CommandError("'settings' requires a 'load' name")
+        # Whitelisted by NAME against the bundled presets, never accepted as a path.
+        # Visualizer._resolve_settings_path's first branch is `if Path(x).is_file()`, which is
+        # correct for its own callers (a user naming a settings file on the command line) but
+        # means an unvalidated wire value makes the server open() and json.load() any path a
+        # client names -- and then echo the whitelisted keys back in the scene message. The
+        # bind address defaults to 127.0.0.1 but --host widens it.
+        available = list_available_settings()
+        if name not in available:
+            raise CommandError(
+                "'settings.load' must be one of the available settings presets; "
+                "{0!r} is not (available: {1})".format(name, ", ".join(available))
+            )
         return {"t": "settings", "load": name}
 
     if kind == "stream":

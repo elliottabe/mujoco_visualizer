@@ -10,6 +10,7 @@ instead of draining a backlog, so a slow link degrades frame rate rather than fa
 progressively further behind while server memory grows.
 """
 
+import math
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -44,6 +45,13 @@ class SimLoop(threading.Thread):
         self._seq = 0
         self._jpeg: Optional[bytes] = None
         self._meta: Dict = {}
+        # Scene description published from THIS thread alongside each frame. Flask request
+        # threads read it from here (see scene()) instead of calling session.scene_message()
+        # themselves, which would touch live Session state -- vis_state, mutated by this
+        # thread via apply_render/load_settings/set_camera -- from a request thread.
+        # Seeded here so /ws and /api/scene have an answer before the first frame exists;
+        # SimLoop is constructed on the simulation thread, so this call is on-thread.
+        self._scene: Dict = session.scene_message()
 
         self._playing = False
         self._pending_steps = 0
@@ -54,7 +62,9 @@ class SimLoop(threading.Thread):
         self._last_client_at = time.monotonic()
 
         self._rtf = 0.0
-        self._controller_debt = 0.0
+        # Physics steps still owed to the current control step. <= 0 means one is due now.
+        # Starts at 0 so the first tick advances the controller before its first physics step.
+        self._ctrl_countdown = 0.0
 
     # -- public surface --------------------------------------------------------
 
@@ -80,6 +90,20 @@ class SimLoop(threading.Thread):
         with self._qlock:
             if len(self._queue) < self._max_queue:
                 self._queue.append(cmd)
+
+    def scene(self) -> Dict:
+        """The most recently published scene message.
+
+        Built on the simulation thread (see :meth:`_publish`) and handed out under the frame
+        lock, so a Flask request thread never reads ``Session`` state that this thread is
+        concurrently mutating. Each publish stores a fresh, fully-snapshotted dict and nothing
+        ever mutates a published one, so the returned object is safe to serialise as-is.
+
+        Keeps answering after :meth:`stop` / ``Session.close()``: the last published
+        description is still a truthful description of the model that was being shown.
+        """
+        with self._frame_lock:
+            return self._scene
 
     def latest(self) -> Optional[Tuple[int, bytes, Dict]]:
         with self._frame_lock:
@@ -166,17 +190,63 @@ class SimLoop(threading.Thread):
                 self._error = None
                 self._session.reset()
 
-    def _advance_controller_for(self, n_steps: int) -> None:
-        """Call the controller once per ``1/rate_hz`` of simulated time covered by
-        *n_steps* physics steps -- not once per step."""
+    def _physics_steps_per_control_step(self) -> Optional[float]:
+        """Physics steps covered by one control step, or None when there is no controller.
+
+        Fractional on purpose: at the defaults this is exactly 10 (dt=1e-4, rate_hz=1000), but
+        a controller whose rate is not a divisor of the physics rate must not be silently
+        rounded to one -- that would change its effective rate, and ``rate_hz`` is a property
+        of the trained policy, not a knob.
+        """
         rate_hz = getattr(self._session, "controller_rate_hz", None)
         if not rate_hz:
-            return
+            return None
         dt = self._session.model.opt.timestep if hasattr(self._session, "model") else 1e-4
-        self._controller_debt += n_steps * dt * rate_hz
-        while self._controller_debt >= 1.0:
-            self._session.advance_controller()
-            self._controller_debt -= 1.0
+        control_periods_per_step = dt * float(rate_hz)
+        if control_periods_per_step <= 0.0:
+            return None
+        return 1.0 / control_periods_per_step
+
+    def _advance_and_step(self, n_steps: int) -> None:
+        """Interleave the controller with physics across one tick's *n_steps* steps.
+
+        The controller still runs at its own ``rate_hz``, NOT once per physics step -- that
+        property is unchanged. What changed is where its output is consumed. Advancing it 26
+        times (260 substeps x 1e-4 s x 1000 Hz) and only then calling ``Session.step(260)``
+        threw away 25 of the 26 outputs, because ``Session.step`` composes ``ctrl`` once and
+        then runs every physics step with that single value: control effectively updated at
+        ~38 Hz instead of the trained 1 kHz. With ``dyntype=MUSCLE`` (``tau_act`` 2 ms),
+        holding activation constant for 26 ms is not the trained mechanics -- and
+        ``WarpBackend.warning`` is None, i.e. this path advertises itself as the trained
+        dynamics. Stepping in control-sized chunks costs essentially nothing: physics is ~96%
+        of the tick either way.
+
+        The fractional remainder is CARRIED in ``self._ctrl_countdown`` rather than rounded,
+        so no physics step is lost or double-counted and the long-run controller rate is
+        exactly ``rate_hz``.
+
+        Divergence: each inner ``Session.step`` performs its own warning-counter delta, so the
+        delta is measured PER INNER CHUNK rather than across the whole tick. A divergence
+        therefore rolls back to the last good CHUNK (tighter than before) and propagates out of
+        this method immediately, so ``run()`` reports it exactly once and the remaining chunks
+        of a doomed tick are not ground through.
+        """
+        per_control_step = self._physics_steps_per_control_step()
+        if per_control_step is None:
+            self._session.step(n_steps)  # no controller: one call, exactly as before
+            return
+
+        remaining = int(n_steps)
+        while remaining > 0:
+            # A `while`, not an `if`: a controller faster than the physics rate owes more than
+            # one advance per physics step.
+            while self._ctrl_countdown <= 0.0:
+                self._session.advance_controller()
+                self._ctrl_countdown += per_control_step
+            chunk = min(remaining, max(1, int(math.ceil(self._ctrl_countdown))))
+            self._session.step(chunk)
+            self._ctrl_countdown -= chunk
+            remaining -= chunk
 
     def _publish(self) -> None:
         frame = self._session.render()
@@ -188,14 +258,22 @@ class SimLoop(threading.Thread):
             "w": self._session.width,
             "h": self._session.height,
             "playing": self._playing,
-            "warn": self._session.warnings(),
+            # Per-frame DELTA, not Session.warnings()'s cumulative totals: those are only
+            # cleared by reset(), so a banner fed from them is pinned to a stale string
+            # forever after the first warning of a session. new_warnings() is stateful and
+            # must be called exactly once per frame -- here.
+            "warn": self._session.new_warnings(),
             "readout": self._session.readout(),
         }
+        # Snapshotted on this thread, next to the frame it describes, for the same reason the
+        # frame is: request threads must never reach into live Session state.
+        scene = self._session.scene_message()
         with self._frame_lock:
             self._seq += 1
             meta["seq"] = self._seq
             self._jpeg = jpeg
             self._meta = meta
+            self._scene = scene
             self._frame_lock.notify_all()
 
     def _maybe_idle_pause(self) -> None:
@@ -268,8 +346,7 @@ class SimLoop(threading.Thread):
                     if n_steps:
                         sim_before = float(self._session.data.time)
                         try:
-                            self._advance_controller_for(n_steps)
-                            self._session.step(n_steps)
+                            self._advance_and_step(n_steps)
                         except Diverged as exc:
                             self._playing = False
                             self._error = {

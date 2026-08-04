@@ -130,3 +130,41 @@ def test_coalesce_is_stable_for_unrelated_types():
 def test_round_trips_through_json():
     original = {"t": "render", "set": {"floor.alpha": 0.5}}
     assert parse_command(json.dumps(original))["set"] == {"floor.alpha": 0.5}
+
+
+# -- settings.load is a name from a whitelist, never a path ---------------------------------
+
+
+def test_settings_load_accepts_a_bundled_preset_name():
+    from mujoco_visualizer import list_available_settings
+
+    name = list_available_settings()[0]
+    assert parse_command({"t": "settings", "load": name}) == {"t": "settings", "load": name}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "/etc/passwd",
+        "../../../../etc/hostname",
+        "./settings/Default.json",
+        "not_a_preset",
+    ],
+)
+def test_settings_load_rejects_anything_not_in_the_whitelist(value):
+    """Visualizer._resolve_settings_path's first branch is `if Path(x).is_file()`, so an
+    unvalidated wire value makes the server open() and json.load() any path a client names --
+    and then echo the whitelisted keys straight back in the scene message. The default bind is
+    127.0.0.1, but --host widens it."""
+    with pytest.raises(CommandError) as exc:
+        parse_command({"t": "settings", "load": value})
+    assert value in str(exc.value)  # the rejection names the offending value
+
+
+def test_settings_load_rejects_a_real_readable_file_outside_the_settings_dir(tmp_path):
+    """The path being genuinely readable is the whole point: an is_file() check would accept
+    this one."""
+    victim = tmp_path / "secret.json"
+    victim.write_text('{"alpha": 1.0}')
+    with pytest.raises(CommandError):
+        parse_command({"t": "settings", "load": str(victim)})

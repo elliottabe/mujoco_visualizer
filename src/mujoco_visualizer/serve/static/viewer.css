@@ -22,10 +22,21 @@ main { display:flex; gap:.75rem; padding:.75rem; align-items:flex-start; }
    -- so this stays up as long as that is true, not just for one frame. */
 #banner { position:absolute; inset:.5rem .5rem auto .5rem; padding:.5rem .6rem;
           background:#5a4a1f; border:1px solid #a37f33; border-radius:4px; }
-/* Transient: frame_meta.warn (e.g. a full contact buffer), connection state, and command/
-   sim errors. Deliberately a separate element from #banner so none of these can ever
-   overwrite or hide the backend warning above. */
-#warnbanner { position:absolute; inset:auto .5rem .5rem .5rem; padding:.5rem .6rem;
+/* Bottom notice stack. A flow container, not two absolutely-positioned boxes, so a server
+   error and a per-frame warning can both be visible without either hiding the other. */
+#notices { position:absolute; inset:auto .5rem .5rem .5rem; display:flex;
+           flex-direction:column; gap:.4rem; }
+/* Server-side errors: diverged / controller / render / command. These explain why the sim
+   stopped, so they own their own element and are NOT cleared by the next frame -- they used
+   to share #warnbanner, where the very next JPEG's showWarn(meta.warn) erased them under
+   50 ms later and the user saw the sim stop with no reason given. Cleared by Play/Reset,
+   the same actions that clear the error server-side. */
+#errbanner { padding:.5rem .6rem; background:#6b1414; border:1px solid #ff5c5c;
+             border-radius:4px; font-weight:600; }
+/* Transient: per-frame frame_meta.warn (e.g. a full contact buffer) and connection state.
+   Deliberately separate from BOTH #banner above and #errbanner, so none of the three can
+   overwrite or hide another. */
+#warnbanner { padding:.5rem .6rem;
               background:#5a1f1f; border:1px solid #a33; border-radius:4px; }
 #panel { flex:1 1 22rem; min-width:18rem; max-height:85vh; overflow-y:auto;
          background:var(--panel); border:1px solid var(--line); border-radius:4px;
