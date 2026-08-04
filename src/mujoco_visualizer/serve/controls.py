@@ -6,7 +6,7 @@ left/right token -- so the grouping is pure name introspection and stays model-a
 a model without those tokens simply lands everything in ``other.*``.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import mujoco
 

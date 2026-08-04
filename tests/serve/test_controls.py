@@ -44,6 +44,7 @@ _XML = """
     <motor name="wing_yaw_left"  joint="j_wing"           ctrlrange="-1 1"/>
     <motor name="abdomen_abduct" joint="j_abd"            ctrlrange="-1 1"/>
     <motor name="adhere_labrum_right" joint="j_misc"      ctrlrange="0 1"/>
+    <motor name="sensor_left"    joint="j_coxa_T1_left"   />
   </actuator>
 </mujoco>
 """
@@ -69,6 +70,7 @@ def test_group_ids_follow_the_scheme(model):
     assert got["wing.left"] == ["wing_yaw_left"]
     assert got["abdomen"] == ["abdomen_abduct"]
     assert got["other.right"] == ["adhere_labrum_right"]
+    assert got["other.left"] == ["sensor_left"]
 
 
 def test_ctrlrange_is_carried_through(model):
@@ -77,6 +79,15 @@ def test_ctrlrange_is_carried_through(model):
     assert by_name["femur_T2_left"]["lo"] == pytest.approx(-2.0)
     assert by_name["femur_T2_left"]["hi"] == pytest.approx(2.0)
     assert by_name["femur_T2_left"]["limited"] is True
+
+
+def test_ctrlrange_fallback_when_unlimited(model):
+    """When an actuator has no ctrlrange, lo/hi default to -1/1 and limited is False."""
+    tree = build_control_tree(model)
+    by_name = {a["name"]: a for g in tree["groups"] for a in g["actuators"]}
+    assert by_name["sensor_left"]["lo"] == pytest.approx(-1.0)
+    assert by_name["sensor_left"]["hi"] == pytest.approx(1.0)
+    assert by_name["sensor_left"]["limited"] is False
 
 
 def test_group_map_inverts_the_tree(model):
