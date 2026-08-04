@@ -450,6 +450,15 @@ class Visualizer:
         # Refresh originals after baking
         self._orig_geom_rgba = self.model.geom_rgba.copy()
 
+        # Cached render context. Building one re-uploads every mesh to the GPU (399 ms on
+        # the fly model vs 8.6 ms reused), so exactly one is kept and reused; a resolution
+        # change closes it and builds another. Released by close().
+        self._renderer_cache = None
+        self._renderer_key = None
+        # Fingerprint of the skybox settings the current tex_data was generated from.
+        # None means "never generated", so the first apply always runs.
+        self._sky_fingerprint = None
+
         # Detect floor geom and material
         self._floor_geom_id: Optional[int] = next(
             (i for i in range(self.model.ngeom)
@@ -694,18 +703,31 @@ class Visualizer:
             self.model.mat_shininess[self._floor_mat_id]   = fld['shininess']
             self.model.mat_emission[self._floor_mat_id]    = fld['emission']
 
-    def _apply_sky_props(self) -> None:
+    def _apply_sky_props(self) -> bool:
+        """Regenerate the skybox texture, but only if its settings changed.
+
+        Returns True if ``tex_data`` was rewritten, so a caller holding a live render
+        context knows to re-upload it.
+
+        Guarded because regenerating a 100x600 skybox costs ~4 ms -- about 45% of a 640x480
+        render -- and it previously ran on every single frame. The guard is a fingerprint
+        rather than a dirty flag because ``vis_state`` is a plain dict that gui.py,
+        widget_gui.py and Session.apply_render all mutate directly; a ``mark_dirty()`` API
+        would be silently bypassed by every one of them.
+        """
         if self._skybox_tex_id < 0:
-            return
+            return False
         sky = self.vis_state['skybox']
+        fingerprint = (sky.get('show', True), sky['sky_top'], sky['sky_bot'])
+        if fingerprint == self._sky_fingerprint:
+            return False
+
         pixels = _make_sky_pixels(
             self.model, self._skybox_tex_id,
             _hex_to_rgb(sky['sky_top']), _hex_to_rgb(sky['sky_bot'])
         )
         if pixels is None:
-            return
-        h = int(self.model.tex_height[self._skybox_tex_id])
-        w = int(self.model.tex_width[self._skybox_tex_id])
+            return False
         adr = int(self.model.tex_adr[self._skybox_tex_id])
         nchan = int(self.model.tex_nchannel[self._skybox_tex_id]) if hasattr(
             self.model, 'tex_nchannel') else 3
@@ -718,15 +740,23 @@ class Visualizer:
         tex_buf = getattr(self.model, 'tex_data', None)
         if tex_buf is None:
             tex_buf = getattr(self.model, 'tex_rgb', None)
-        if tex_buf is not None:
-            tex_buf[adr:adr + len(flat)] = flat
+        if tex_buf is None:
+            return False
+        tex_buf[adr:adr + len(flat)] = flat
+        self._sky_fingerprint = fingerprint
+        return True
 
-    def _apply_all(self) -> None:
-        """Apply all vis_state properties to the model."""
+    def _apply_all(self) -> bool:
+        """Apply all vis_state properties to the model.
+
+        Returns True if the skybox texture was regenerated, meaning any live render context
+        needs it re-uploaded. The other appliers are cheap (measured 0.025 ms combined) and
+        run unconditionally.
+        """
         self._apply_geom_colors()
         self._apply_lighting()
         self._apply_floor_props()
-        self._apply_sky_props()
+        return self._apply_sky_props()
 
     def _build_scene_option(self) -> mujoco.MjvOption:
         opt = mujoco.MjvOption()
@@ -823,6 +853,80 @@ class Visualizer:
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
+    def make_renderer(self, height: int = 480, width: int = 640) -> mujoco.Renderer:
+        """A fresh Renderer for this model. The caller owns it and must ``close()`` it.
+
+        Prefer :meth:`render_frame` / :meth:`render_with`, which reuse a cached one.
+        """
+        return mujoco.Renderer(self.model, height=height, width=width)
+
+    def _cached_renderer(self, height: int, width: int) -> mujoco.Renderer:
+        """The reused Renderer for (height, width), building it on first use.
+
+        Exactly one is kept. A resolution change closes the old one rather than keeping a
+        cache keyed by size: each Renderer holds GPU framebuffers plus every uploaded mesh
+        (139 MB of them on the fly model), so a multi-entry cache would leak VRAM across a
+        session that renders several resolutions.
+        """
+        key = (int(height), int(width))
+        if self._renderer_cache is not None and self._renderer_key == key:
+            return self._renderer_cache
+        if self._renderer_cache is not None:
+            self._renderer_cache.close()
+            self._renderer_cache = None
+        self._renderer_cache = self.make_renderer(height=key[0], width=key[1])
+        self._renderer_key = key
+        return self._renderer_cache
+
+    def render_with(
+        self,
+        renderer: mujoco.Renderer,
+        camera: Optional[Union[str, mujoco.MjvCamera]] = None,
+        apply_settings: bool = True,
+        modify_scene_fns: Optional[Sequence[Callable]] = None,
+        frame_idx: int = 0,
+    ) -> np.ndarray:
+        """Render ``self.data`` as it currently stands into a caller-supplied *renderer*.
+
+        Does NOT write ``qpos`` and does NOT call ``mj_forward`` -- the caller owns the
+        state, which is what lets a stepping simulation render its own live data. Use
+        :meth:`render_frame` for the set-a-pose-and-render-it case.
+
+        Returns (renderer.height, renderer.width, 3) uint8.
+        """
+        if apply_settings and self._apply_all():
+            # MuJoCo uploads textures when the render context is built, so a regenerated
+            # skybox never reaches a context that already exists. Without this, reusing a
+            # renderer silently pins the sky at whatever it was when the context was made
+            # (verified: max pixel diff 0 across a red->green change, vs 255 with a fresh
+            # context). ``_mjr_context`` is private to mujoco.Renderer; there is no public
+            # accessor for the MjrContext.
+            mujoco.mjr_uploadTexture(
+                self.model, renderer._mjr_context, self._skybox_tex_id
+            )
+
+        cam = self.get_camera(camera)
+        opt = self._build_scene_option()
+        scene_mods = self._build_scene_modifiers()
+        vf = self.vis_state['vis_flags']
+        show_shadows = vf.get('shadows', True)
+        show_wireframe = vf.get('wireframe', False)
+        show_skybox = self.vis_state.get('skybox', {}).get('show', True)
+
+        renderer.update_scene(self.data, camera=cam, scene_option=opt)
+        if not show_shadows:
+            renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
+        if show_wireframe:
+            renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
+        if not show_skybox:
+            renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
+        for fn, kw in scene_mods:
+            fn(renderer.scene, geom_xpos=self.data.geom_xpos, **kw)
+        if modify_scene_fns:
+            for fn in modify_scene_fns:
+                fn(renderer.scene, data=self.data, frame_idx=frame_idx)
+        return renderer.render().copy()
+
     def render_frame(
         self,
         qpos: np.ndarray,
@@ -832,7 +936,11 @@ class Visualizer:
         apply_settings: bool = True,
         modify_scene_fns: Optional[Sequence[Callable]] = None,
     ) -> np.ndarray:
-        """Render a single frame.
+        """Render a single frame at *qpos*.
+
+        Reuses a cached render context, so repeated calls at one resolution pay the mesh
+        upload once (399 ms -> 8.6 ms per frame on the fly model). Call :meth:`close` when
+        done with the Visualizer to release it.
 
         Args:
             qpos:            Joint positions array (nq,).
@@ -843,34 +951,26 @@ class Visualizer:
         Returns:
             np.ndarray of shape (height, width, 3) uint8.
         """
-        if apply_settings:
-            self._apply_all()
-
         self.data.qpos[:] = qpos
         mujoco.mj_forward(self.model, self.data)
+        renderer = self._cached_renderer(height, width)
+        return self.render_with(
+            renderer,
+            camera=camera,
+            apply_settings=apply_settings,
+            modify_scene_fns=modify_scene_fns,
+        )
 
-        cam = self.get_camera(camera)
-        opt = self._build_scene_option()
-        scene_mods = self._build_scene_modifiers()
-        vf = self.vis_state['vis_flags']
-        show_shadows   = vf.get('shadows',   True)
-        show_wireframe = vf.get('wireframe', False)
-        show_skybox    = self.vis_state.get('skybox', {}).get('show', True)
+    def close(self) -> None:
+        """Release the cached render context.
 
-        with mujoco.Renderer(self.model, height=height, width=width) as renderer:
-            renderer.update_scene(self.data, camera=cam, scene_option=opt)
-            if not show_shadows:
-                renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
-            if show_wireframe:
-                renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
-            if not show_skybox:
-                renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
-            for fn, kw in scene_mods:
-                fn(renderer.scene, geom_xpos=self.data.geom_xpos, **kw)
-            if modify_scene_fns:
-                for fn in modify_scene_fns:
-                    fn(renderer.scene, data=self.data, frame_idx=0)
-            return renderer.render().copy()
+        EGL teardown raises from ``Renderer.__del__`` if left to the garbage collector, so
+        release it deliberately. Safe to call more than once.
+        """
+        if getattr(self, '_renderer_cache', None) is not None:
+            self._renderer_cache.close()
+            self._renderer_cache = None
+            self._renderer_key = None
 
     def save_frame(
         self,
@@ -919,33 +1019,19 @@ class Visualizer:
         Returns:
             np.ndarray of shape (T, height, width, 3) uint8.
         """
-        self._apply_all()
-        cam = self.get_camera(camera)
-        opt = self._build_scene_option()
-        scene_mods = self._build_scene_modifiers()
-        vf = self.vis_state['vis_flags']
-        show_shadows   = vf.get('shadows',   True)
-        show_wireframe = vf.get('wireframe', False)
-        show_skybox    = self.vis_state.get('skybox', {}).get('show', True)
-
+        renderer = self._cached_renderer(height, width)
         frames = []
-        with mujoco.Renderer(self.model, height=height, width=width) as renderer:
-            for i, qpos in enumerate(qposes):
-                self.data.qpos[:] = qpos
-                mujoco.mj_forward(self.model, self.data)
-                renderer.update_scene(self.data, camera=cam, scene_option=opt)
-                if not show_shadows:
-                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
-                if show_wireframe:
-                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
-                if not show_skybox:
-                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
-                for fn, kw in scene_mods:
-                    fn(renderer.scene, geom_xpos=self.data.geom_xpos, **kw)
-                if modify_scene_fns:
-                    for fn in modify_scene_fns:
-                        fn(renderer.scene, data=self.data, frame_idx=i)
-                frames.append(renderer.render().copy())
+        for i, qpos in enumerate(qposes):
+            self.data.qpos[:] = qpos
+            mujoco.mj_forward(self.model, self.data)
+            frames.append(
+                self.render_with(
+                    renderer,
+                    camera=camera,
+                    modify_scene_fns=modify_scene_fns,
+                    frame_idx=i,
+                )
+            )
 
         video = np.stack(frames)
         if output_path is not None:
@@ -997,20 +1083,13 @@ class Visualizer:
         Returns:
             np.ndarray of shape (T, height, width, 3) uint8.
         """
-        self._apply_all()
-        opt = self._build_scene_option()
-        scene_mods = self._build_scene_modifiers()
-        vf = self.vis_state['vis_flags']
-        show_shadows   = vf.get('shadows',   True)
-        show_wireframe = vf.get('wireframe', False)
-        show_skybox    = self.vis_state.get('skybox', {}).get('show', True)
-
         # Optional muscle visualization
         show_muscles = ctrls is not None
         orig_tendon_rgba = orig_tendon_width = act_to_ten = base_rgba = None
         if show_muscles:
             ctrls = np.asarray(ctrls)
-            opt.flags[mujoco.mjtVisFlag.mjVIS_TENDON] = True
+            # mjVIS_TENDON defaults to on in a freshly-built MjvOption() (verified), which
+            # is what render_with constructs per frame, so no explicit override is needed.
             # Resolve color function: parameter > self attribute > solid red.
             _color_fn = actuator_color_fn or getattr(self, 'actuator_color_fn', None)
             act_to_ten = {}
@@ -1041,38 +1120,33 @@ class Visualizer:
             # Normalize to global max across all timesteps
             ctrl_max = max(float(np.abs(ctrls).max()), 1e-8)
 
+        renderer = self._cached_renderer(height, width)
         frames = []
-        with mujoco.Renderer(self.model, height=height, width=width) as renderer:
-            for i, qpos in enumerate(qposes):
-                self.data.qpos[:] = qpos
-                if show_muscles and ctrls is not None:
-                    self.data.ctrl[:] = ctrls[i]
-                mujoco.mj_forward(self.model, self.data)
+        for i, qpos in enumerate(qposes):
+            self.data.qpos[:] = qpos
+            if show_muscles and ctrls is not None:
+                self.data.ctrl[:] = ctrls[i]
+            mujoco.mj_forward(self.model, self.data)
 
-                if show_muscles and act_to_ten is not None:
-                    ctrl_i = ctrls[i]
-                    for act_id, ten_id in act_to_ten.items():
-                        raw = float(np.clip(abs(ctrl_i[act_id]) / ctrl_max, 0.0, 1.0))
-                        norm = tendon_baseline + (1.0 - tendon_baseline) * raw
-                        alpha = max(norm, tendon_alpha_min)
-                        self.model.tendon_rgba[ten_id] = (
-                            base_rgba[act_id] * np.array([1, 1, 1, alpha])
-                        )
-                        self.model.tendon_width[ten_id] = tendon_min_width + width_range * norm
+            if show_muscles and act_to_ten is not None:
+                ctrl_i = ctrls[i]
+                for act_id, ten_id in act_to_ten.items():
+                    raw = float(np.clip(abs(ctrl_i[act_id]) / ctrl_max, 0.0, 1.0))
+                    norm = tendon_baseline + (1.0 - tendon_baseline) * raw
+                    alpha = max(norm, tendon_alpha_min)
+                    self.model.tendon_rgba[ten_id] = (
+                        base_rgba[act_id] * np.array([1, 1, 1, alpha])
+                    )
+                    self.model.tendon_width[ten_id] = tendon_min_width + width_range * norm
 
-                renderer.update_scene(self.data, camera=cameras[i], scene_option=opt)
-                if not show_shadows:
-                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
-                if show_wireframe:
-                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
-                if not show_skybox:
-                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
-                for fn, kw in scene_mods:
-                    fn(renderer.scene, geom_xpos=self.data.geom_xpos, **kw)
-                if modify_scene_fns:
-                    for fn in modify_scene_fns:
-                        fn(renderer.scene, data=self.data, frame_idx=i)
-                frames.append(renderer.render().copy())
+            frames.append(
+                self.render_with(
+                    renderer,
+                    camera=cameras[i],
+                    modify_scene_fns=modify_scene_fns,
+                    frame_idx=i,
+                )
+            )
 
         if show_muscles and orig_tendon_rgba is not None:
             self.model.tendon_rgba[:] = orig_tendon_rgba

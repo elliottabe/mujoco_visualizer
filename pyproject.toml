@@ -25,3 +25,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 mujoco_visualizer = ["settings/*.json", "presets/fly/*.yaml", "presets/fly/*.py"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gl: requires a working headless OpenGL context (MUJOCO_GL=egl PYOPENGL_PLATFORM=egl)",
+]
