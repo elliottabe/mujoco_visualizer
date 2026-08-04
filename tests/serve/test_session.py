@@ -6,6 +6,7 @@ Session no longer calls ``mj_step`` directly -- it delegates to a ``backend`` (d
 below proves that seam is swappable without a real physics engine (or JAX) in the loop.
 """
 
+import mujoco
 import numpy as np
 import pytest
 
@@ -106,7 +107,7 @@ class FakeBackend:
         return self._t
 
     def close(self):
-        pass
+        self.close_calls = getattr(self, "close_calls", 0) + 1
 
 
 def test_step_advances_sim_time(sess):
@@ -164,6 +165,39 @@ def test_divergence_is_detected_and_state_restored(sess):
     np.testing.assert_allclose(sess.data.qpos, good)
 
 
+def test_divergence_is_detected_via_fatal_warning_counter_not_isfinite_alone(sess):
+    """MuJoCo's own 'Nan, Inf or huge value' check repairs the bad DOF in place before
+    mj_step returns, so qpos/qvel end up finite again even though a real blow-up happened --
+    an isfinite-only check would miss this. This pins that detection actually goes through
+    the mjWARN_BADQVEL/mjWARN_BADQACC counter, by checking the counter itself moved."""
+    sess.step(1)
+    before = (
+        sess.data.warning[mujoco.mjtWarning.mjWARN_BADQVEL].number
+        + sess.data.warning[mujoco.mjtWarning.mjWARN_BADQACC].number
+    )
+    sess.data.qvel[0] = np.nan  # inject the blow-up
+    with pytest.raises(Diverged):
+        sess.step(1)
+    after = (
+        sess.data.warning[mujoco.mjtWarning.mjWARN_BADQVEL].number
+        + sess.data.warning[mujoco.mjtWarning.mjWARN_BADQACC].number
+    )
+    assert after > before, "expected a fatal warning counter to increase during the step"
+    # And confirm the isfinite state alone would NOT have caught this: MuJoCo already
+    # repaired it back to finite by the time step() looks, which is exactly why the counter
+    # (not isfinite) has to be the primary signal.
+    assert np.isfinite(sess.data.qpos).all()
+
+
+def test_capacity_warning_is_not_treated_as_divergence(sess):
+    """A full contact buffer (mjWARN_CONTACTFULL) is a capacity/quality warning, not state
+    corruption -- step() must keep running (and keep surfacing it via warnings()), not pause
+    the viewer the way a fatal BADQVEL/BADQPOS/BADQACC/BADCTRL warning does."""
+    sess.data.warning[mujoco.mjtWarning.mjWARN_CONTACTFULL].number += 1
+    sess.step(1)  # must not raise Diverged
+    assert "CONTACTFULL" in sess.warnings()
+
+
 def test_reset_restores_initial_state(sess):
     """The fixture model has no 'default_pose' keyframe, so reset() must fall back to
     mj_resetData rather than raising."""
@@ -181,6 +215,26 @@ def test_set_qpos_writes_state_without_stepping(sess):
     sess.set_qpos(target)
     assert sess.data.qpos[0] == pytest.approx(0.3)
     assert sess.data.time == pytest.approx(0.0)
+
+
+def test_set_qpos_rejects_non_finite_input_and_does_not_poison_the_snapshot(sess):
+    """A non-finite qpos (a malformed replay-scrub, a bad client message) must be rejected
+    outright rather than written and snapshotted -- accepting it would make _good the bad
+    state, and every later step() would restore that poisoned snapshot and raise Diverged
+    forever until reset()."""
+    sess.step(1)
+    good_qpos = sess.data.qpos.copy()
+    bad = good_qpos.copy()
+    bad[0] = np.nan
+
+    with pytest.raises(ValueError):
+        sess.set_qpos(bad)
+
+    # Rejected before it touched data or the rollback snapshot.
+    np.testing.assert_allclose(sess.data.qpos, good_qpos)
+    # And stepping still works normally afterwards -- no poisoned snapshot to restore into.
+    sess.step(1)
+    assert np.isfinite(sess.data.qpos).all()
 
 
 def test_scene_message_describes_the_model(sess):
@@ -253,3 +307,14 @@ def test_reset_calls_backend_reset_to_keyframe_with_default_pose(xml):
         assert fake.reset_calls == ["default_pose"]
     finally:
         s.close()
+
+
+def test_close_does_not_close_the_backend_twice(xml):
+    """A backend holding a real device context (a future WarpBackend) must not be closed
+    twice by a double Session.close() -- harmless for CpuBackend/FakeBackend here, but a trap
+    for anything that isn't."""
+    fake = FakeBackend(nu=2, nq=2)
+    s = Session(xml_path=xml, width=64, height=64, backend=fake)
+    s.close()
+    s.close()  # idempotent
+    assert fake.close_calls == 1

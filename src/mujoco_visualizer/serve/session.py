@@ -29,6 +29,25 @@ class Diverged(RuntimeError):
     step before this is raised, so the caller can still render and offer a reset."""
 
 
+# mjtWarning splits into two classes that must NOT be conflated:
+#
+# - Divergence: the state itself is corrupt. MuJoCo's own check for "Nan, Inf or huge value"
+#   fires here, and it repairs the offending DOF in place before returning -- so by the time
+#   step() looks at qpos/qvel afterwards, the corruption can already be gone even though a
+#   real blow-up happened. Comparing this counter before/after backend.step() is what
+#   actually catches that, where an isfinite-only check cannot.
+# - Capacity/quality: the model hit a fixed-size buffer or a numerically stiff-but-valid
+#   config (e.g. the contact buffer filling up). These are expected to happen, are not a
+#   corrupt state, and must stay visible-but-non-fatal -- pausing the viewer on a full
+#   contact buffer would hide exactly the thing a user wants to watch develop.
+_FATAL_WARNINGS = (
+    mujoco.mjtWarning.mjWARN_BADQPOS,
+    mujoco.mjtWarning.mjWARN_BADQVEL,
+    mujoco.mjtWarning.mjWARN_BADQACC,
+    mujoco.mjtWarning.mjWARN_BADCTRL,
+)
+
+
 class Session:
     """Owns the simulation and how it is drawn.
 
@@ -175,32 +194,42 @@ class Session:
     def _is_finite(self) -> bool:
         return bool(np.isfinite(self.data.qpos).all() and np.isfinite(self.data.qvel).all())
 
+    def _fatal_warning_count(self) -> int:
+        """Sum of the divergence-class ``mjtWarning`` counters (see ``_FATAL_WARNINGS``).
+
+        Cumulative for the life of ``self.data``, so what matters is the *delta* across one
+        ``step()`` call, not the absolute value.
+        """
+        return sum(int(self.data.warning[int(w)].number) for w in _FATAL_WARNINGS)
+
     def step(self, n: int) -> None:
         """Advance physics *n* steps via the backend, then sync its state onto ``self.data``.
 
-        Raises :class:`Diverged`, rolling back to the last good step, if the state is
-        non-finite -- checked on ``self.data`` *after* the sync, since that is the state
-        actually rendered, which is what catches a backend's own dynamics blowing up: a
-        muscle model at dt=1e-4 with a user yanking sliders will blow up, and continuing to
-        step NaNs makes the rest of the session useless.
+        Raises :class:`Diverged`, rolling back to the last good step, if physics diverged
+        during those *n* steps -- checked on ``self.data`` *after* the sync, since that is
+        the state actually rendered.
 
-        Also checked once *before* stepping: MuJoCo's own ``mj_step`` silently repairs a
-        non-finite ``qvel``/``qpos`` it is handed (warns and resets the bad DOF rather than
-        propagating the NaN), so an already-corrupted incoming state would otherwise be
-        healed out from under this check instead of being caught.
+        Divergence is detected by an *increase* in the divergence-class warning counters
+        (``_FATAL_WARNINGS``) across the call, not by an ``isfinite`` check alone: MuJoCo's
+        own "Nan, Inf or huge value" check fires on exactly this condition and then silently
+        repairs the offending DOF before returning, so a real blow-up can leave ``qpos``/
+        ``qvel`` fully finite by the time this method looks at them. The ``isfinite`` check
+        is kept only as a cheap backstop for whatever that warning mechanism doesn't cover.
+
+        Capacity/quality warnings (contact buffer full, etc.) are deliberately excluded from
+        this check -- they are expected, not corrupt, and must stay visible-but-non-fatal via
+        :meth:`warnings`, not pause the viewer.
         """
         self._compose_ctrl()
-        if not self._is_finite():
-            self._restore()
-            raise Diverged(
-                "physics diverged (non-finite qpos/qvel); rolled back to the last good step"
-            )
+        warn_before = self._fatal_warning_count()
         self.backend.step(int(n))
         self.backend.sync_to(self.data)
-        if not self._is_finite():
+        diverged = (self._fatal_warning_count() > warn_before) or not self._is_finite()
+        if diverged:
             self._restore()
             raise Diverged(
-                "physics diverged (non-finite qpos/qvel); rolled back to the last good step"
+                "physics diverged (fatal MuJoCo warning or non-finite qpos/qvel); "
+                "rolled back to the last good step"
             )
         self._snapshot()
 
@@ -218,8 +247,18 @@ class Session:
         return ", ".join(names) if names else None
 
     def set_qpos(self, qpos: Sequence[float]) -> None:
-        """Write state directly, no stepping. Used by replay scrubbing."""
-        self.data.qpos[:] = np.asarray(qpos, dtype=np.float64)
+        """Write state directly, no stepping. Used by replay scrubbing.
+
+        Rejects non-finite input outright, before writing or snapshotting anything: a NaN/Inf
+        qpos (reachable via a malformed replay-scrub or client message) would otherwise flow
+        straight into :meth:`_snapshot`, permanently poisoning the rollback target that every
+        later :meth:`step` restores to -- turning one bad frame into a session that raises
+        :class:`Diverged` forever until :meth:`reset`.
+        """
+        arr = np.asarray(qpos, dtype=np.float64)
+        if not np.isfinite(arr).all():
+            raise ValueError("set_qpos: qpos contains non-finite values (NaN/Inf)")
+        self.data.qpos[:] = arr
         mujoco.mj_forward(self.model, self.data)
         self._snapshot()
 
@@ -315,9 +354,15 @@ class Session:
 
     def close(self) -> None:
         """Release the Renderer and backend explicitly. EGL teardown raises from ``__del__``
-        if left to the garbage collector, so lifetime is always explicit."""
+        if left to the garbage collector, so lifetime is always explicit.
+
+        Guarded the same way for both: a backend holding a real device context (a future
+        ``WarpBackend``) must not be closed twice, even though it is harmless for
+        ``CpuBackend``.
+        """
         if getattr(self, "_renderer", None) is not None:
             self._renderer.close()
             self._renderer = None
         if getattr(self, "backend", None) is not None:
             self.backend.close()
+            self.backend = None
