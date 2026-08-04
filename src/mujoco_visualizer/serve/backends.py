@@ -60,17 +60,22 @@ class CpuBackend:
     is a no-op -- there is nothing to copy; the data stepped here IS the data ``Session``
     renders.
 
-    The fly's tendons are driven by linear force generators here, not by the trained
-    force-length/force-velocity muscle model -- a real mechanical difference from the trained
-    dynamics, not a cosmetic one. :attr:`warning` is therefore a mandatory non-empty string: a
-    viewer that quietly shows the wrong mechanics is worse than one that admits it is a
-    simplified stand-in.
+    This steps MuJoCo's OWN engine, never this project's custom warp muscle functions
+    (see e.g. ``fly_neuromechanics.core.support_warp``): a model whose actuators are plain
+    FIXED-gain tendons gets linear force generators here, while a model whose actuators have
+    already been converted to ``gaintype=biastype=MUSCLE`` (e.g. by a caller's own muscle-
+    config conversion, applied to the compiled model before attaching this backend) gets
+    MuJoCo's own built-in Hill-type muscle formula instead -- a different formula from the
+    trained mechanics either way, not a cosmetic difference. :attr:`warning` is therefore a
+    mandatory non-empty string: a viewer that quietly shows the wrong mechanics is worse than
+    one that admits it is a simplified stand-in.
     """
 
     label = "cpu"
     warning = (
-        "CPU backend drives tendons with linear force generators, not the trained "
-        "force-length/force-velocity muscle model -- this is NOT the trained dynamics."
+        "CPU backend runs MuJoCo's own built-in muscle model (or, for FIXED-gain "
+        "actuators, plain linear tendons), never this project's custom warp muscle "
+        "functions -- this is NOT the trained dynamics."
     )
 
     def __init__(self, model: mujoco.MjModel, data: mujoco.MjData):
