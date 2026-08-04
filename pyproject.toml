@@ -19,6 +19,7 @@ dependencies = [
 io = ["mediapy", "imageio", "Pillow"]
 gui = ["dearpygui"]
 jupyter = ["ipywidgets", "mediapy", "ipython"]
+serve = ["flask>=2.2", "flask-sock>=0.7", "simplejpeg>=1.6"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
