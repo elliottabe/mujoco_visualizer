@@ -231,9 +231,12 @@ def test_controller_exception_pauses_instead_of_killing_the_thread():
     assert loop.playing is False
 
 
-def test_bad_command_pauses_and_reports_instead_of_killing_the_thread():
-    """A malformed/rejected command must pause and report, exactly like the physics-side
-    errors above -- not just get logged while playing silently continues."""
+def test_bad_command_reports_but_does_not_pause_playback():
+    """A malformed/rejected command is a client-input problem, not evidence the physics
+    state is untrustworthy -- unlike divergence/controller/render errors, it must NOT pause
+    playback. SimLoop is shared across viewers: pausing here would let one client's bad or
+    version-skewed message freeze the session for every other viewer -- a denial of service
+    via a single malformed message."""
 
     class BadCtrl(FakeSession):
         def set_ctrl(self, values):
@@ -247,10 +250,29 @@ def test_bad_command_pauses_and_reports_instead_of_killing_the_thread():
         loop.submit({"t": "ctrl", "set": {"nope": 1.0}})
         assert wait_until(lambda: loop.error is not None)
         assert loop.error["kind"] == "command"
-        assert loop.playing is False
         assert loop.is_alive() is True
-        renders_at_error = sess.renders
-        assert wait_until(lambda: sess.renders > renders_at_error)
+        assert loop.playing is True  # playback must continue despite the bad command
+        steps_after_error = sess.steps
+        assert wait_until(lambda: sess.steps > steps_after_error)
+
+
+def test_malformed_command_without_type_field_reports_error_without_killing_thread():
+    """A command dict with no 't' key fails inside coalesce()/_drain() -- before any
+    individual command is ever applied to the session. That must not kill the thread, and
+    (being a client-input problem like the bad-command case above) must not pause
+    playback either."""
+    sess = FakeSession()
+    loop = SimLoop(sess, fps_cap=60, substeps_per_frame=1, idle_pause_s=None)
+    with running(loop):
+        loop.submit({"t": "sim", "cmd": "play", "n": 1})
+        assert wait_until(lambda: sess.steps >= 1)
+        loop.submit({"no_type_field": "oops"})
+        assert wait_until(lambda: loop.error is not None)
+        assert loop.error["kind"] == "command"
+        assert loop.is_alive() is True
+        assert loop.playing is True
+        steps_after_error = sess.steps
+        assert wait_until(lambda: sess.steps > steps_after_error)
 
 
 def test_render_failure_pauses_and_reports_instead_of_killing_the_thread():
@@ -276,6 +298,23 @@ def test_render_failure_pauses_and_reports_instead_of_killing_the_thread():
         assert loop.error["kind"] == "render"
         assert loop.playing is False
         assert loop.is_alive() is True
+
+
+def test_wait_for_frame_blocks_until_timeout_when_no_frame_yet():
+    """Before any frame is ever published, _seq == 0 and the 'never seen a frame' sentinel
+    is last_seq=-1 -- so a naive '_seq <= last_seq' pre-wait check (0 <= -1 is False) would
+    skip the wait entirely and return None immediately. That would busy-spin a caller
+    polling in a loop (the expected usage pattern, see the watcher above) at native call
+    rate. Assert this actually blocks for ~timeout, not that it merely returns None."""
+    sess = FakeSession()
+    loop = SimLoop(sess, fps_cap=60, substeps_per_frame=1, idle_pause_s=None)
+    # Deliberately never started: no frame has been published, so this exercises the
+    # first-ever-frame case directly and deterministically (nothing will ever notify).
+    start = time.monotonic()
+    got = loop.wait_for_frame(-1, timeout=0.3)
+    elapsed = time.monotonic() - start
+    assert got is None
+    assert elapsed >= 0.25  # actually waited out (most of) the timeout, not an instant return
 
 
 def test_latest_frame_slot_drops_intermediates():

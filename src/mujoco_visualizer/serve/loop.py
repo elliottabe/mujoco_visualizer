@@ -90,9 +90,16 @@ class SimLoop(threading.Thread):
     def wait_for_frame(
         self, last_seq: int, timeout: float = 1.0
     ) -> Optional[Tuple[int, bytes, Dict]]:
-        """Block until a frame newer than *last_seq* exists, then return the NEWEST one."""
+        """Block until a frame newer than *last_seq* exists, then return the NEWEST one.
+
+        Must also block before the very first frame is ever published: with the
+        "never seen a frame" sentinel ``last_seq=-1``, ``self._seq`` starts at 0, so the
+        wait condition here has to match the post-wait check exactly (``_jpeg is None or
+        _seq <= last_seq``) -- otherwise a caller polling in a loop (the expected usage)
+        busy-spins at native call rate until the first frame exists.
+        """
         with self._frame_lock:
-            if self._seq <= last_seq:
+            if self._jpeg is None or self._seq <= last_seq:
                 self._frame_lock.wait(timeout)
             if self._jpeg is None or self._seq <= last_seq:
                 return None
@@ -205,67 +212,109 @@ class SimLoop(threading.Thread):
         try:
             while not self._stop_event.is_set():
                 tick_started = time.monotonic()
-                for cmd in self._drain():
+                # Everything inside a tick is wrapped as defense-in-depth: nothing in
+                # here -- however unexpected -- may propagate out of run() and kill this
+                # thread. The specific error kinds below (command/diverged/controller/
+                # render) are the ones we understand and want a precise label+pause
+                # policy for; this outer catch is the backstop for anything else (e.g. a
+                # bug reachable through _drain()/coalesce(), or a degenerate fps_cap).
+                slack = 0.05
+                try:
+                    # _drain() runs coalesce(), which indexes cmd["t"] on every queued
+                    # command -- a malformed dict (no "t") raises KeyError here, before
+                    # any individual command is ever applied. That is exactly a
+                    # client-input problem, not a physics problem, so it gets the same
+                    # "command" kind and no-pause treatment as a bad command caught
+                    # below: one malformed message from one client must not halt
+                    # playback for every other viewer sharing this loop.
                     try:
-                        self._apply(cmd)
-                    except Exception as exc:  # a bad command must not kill the loop
-                        self._playing = False
+                        cmds = self._drain()
+                    except Exception as exc:
+                        cmds = []
                         self._error = {
                             "t": "error",
                             "kind": "command",
                             "msg": str(exc),
-                            "paused": True,
+                            "paused": False,
                         }
 
-                self._maybe_idle_pause()
+                    for cmd in cmds:
+                        try:
+                            self._apply(cmd)
+                        except Exception as exc:
+                            # A bad command (unknown actuator/group/mode, etc.) is a
+                            # client-input problem, not evidence the physics state is
+                            # untrustworthy -- so unlike diverged/controller/render this
+                            # must NOT pause playback. Pausing here would let a single
+                            # malformed or version-skewed message from one client freeze
+                            # the shared session for every other viewer: a denial of
+                            # service via one bad message.
+                            self._error = {
+                                "t": "error",
+                                "kind": "command",
+                                "msg": str(exc),
+                                "paused": False,
+                            }
 
-                n_steps = 0
-                if self._pending_steps > 0:
-                    n_steps = self._substeps * self._pending_steps
-                    self._pending_steps = 0
-                elif self._playing:
-                    n_steps = self._substeps
+                    self._maybe_idle_pause()
 
-                if n_steps:
-                    sim_before = float(self._session.data.time)
+                    n_steps = 0
+                    if self._pending_steps > 0:
+                        n_steps = self._substeps * self._pending_steps
+                        self._pending_steps = 0
+                    elif self._playing:
+                        n_steps = self._substeps
+
+                    if n_steps:
+                        sim_before = float(self._session.data.time)
+                        try:
+                            self._advance_controller_for(n_steps)
+                            self._session.step(n_steps)
+                        except Diverged as exc:
+                            self._playing = False
+                            self._error = {
+                                "t": "error",
+                                "kind": "diverged",
+                                "msg": str(exc),
+                                "paused": True,
+                            }
+                        except Exception as exc:
+                            self._playing = False
+                            self._error = {
+                                "t": "error",
+                                "kind": "controller",
+                                "msg": str(exc),
+                                "paused": True,
+                            }
+                        else:
+                            advanced = float(self._session.data.time) - sim_before
+                            elapsed = max(time.monotonic() - tick_started, 1e-9)
+                            # EMA so the reported factor is readable rather than jittery
+                            self._rtf = 0.8 * self._rtf + 0.2 * (advanced / elapsed)
+
                     try:
-                        self._advance_controller_for(n_steps)
-                        self._session.step(n_steps)
-                    except Diverged as exc:
-                        self._playing = False
-                        self._error = {
-                            "t": "error",
-                            "kind": "diverged",
-                            "msg": str(exc),
-                            "paused": True,
-                        }
+                        self._publish()
                     except Exception as exc:
                         self._playing = False
                         self._error = {
                             "t": "error",
-                            "kind": "controller",
+                            "kind": "render",
                             "msg": str(exc),
                             "paused": True,
                         }
-                    else:
-                        advanced = float(self._session.data.time) - sim_before
-                        elapsed = max(time.monotonic() - tick_started, 1e-9)
-                        # EMA so the reported factor is readable rather than jittery
-                        self._rtf = 0.8 * self._rtf + 0.2 * (advanced / elapsed)
 
-                try:
-                    self._publish()
+                    fps_cap = self._fps_cap if self._fps_cap > 0 else 1.0
+                    budget = 1.0 / fps_cap
+                    slack = budget - (time.monotonic() - tick_started)
                 except Exception as exc:
                     self._playing = False
                     self._error = {
                         "t": "error",
-                        "kind": "render",
+                        "kind": "internal",
                         "msg": str(exc),
                         "paused": True,
                     }
 
-                budget = 1.0 / self._fps_cap
-                slack = budget - (time.monotonic() - tick_started)
                 if slack > 0:
                     self._stop_event.wait(slack)
         finally:
