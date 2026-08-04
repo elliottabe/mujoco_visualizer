@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MuJoCo viewer</title>
+  <link rel="stylesheet" href="/static/viewer.css">
+</head>
+<body>
+  <header>
+    <button id="play">Play</button>
+    <button id="stepbtn">Step</button>
+    <button id="reset">Reset</button>
+    <label>substeps <input id="substeps" type="number" min="1" max="100000" value="260"></label>
+    <label>quality <input id="quality" type="range" min="10" max="95" value="75"></label>
+    <div class="status">
+      <span id="backend"></span>
+      <span id="stats"></span>
+    </div>
+  </header>
+  <main>
+    <section id="view">
+      <canvas id="cv" width="640" height="480"></canvas>
+      <div id="banner" hidden></div>
+      <div id="warnbanner" hidden></div>
+    </section>
+    <aside id="panel">
+      <div class="row">
+        <label>camera
+          <select id="camera"></select>
+        </label>
+        <label>settings
+          <select id="settings"></select>
+        </label>
+      </div>
+      <div class="row" id="modes">
+        <label><input type="radio" name="ctrlmode" value="additive"> additive</label>
+        <label><input type="radio" name="ctrlmode" value="absolute" checked> absolute</label>
+      </div>
+      <div id="ext"></div>
+      <div id="controls"></div>
+    </aside>
+  </main>
+  <script src="/static/viewer.js"></script>
+</body>
+</html>

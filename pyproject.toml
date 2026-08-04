@@ -24,7 +24,7 @@ jupyter = ["ipywidgets", "mediapy", "ipython"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-mujoco_visualizer = ["settings/*.json", "presets/fly/*.yaml", "presets/fly/*.py"]
+mujoco_visualizer = ["settings/*.json", "presets/fly/*.yaml", "presets/fly/*.py", "serve/static/*"]
 
 [tool.pytest.ini_options]
 markers = [

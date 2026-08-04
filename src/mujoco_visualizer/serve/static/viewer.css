@@ -1,0 +1,42 @@
+:root { --bg:#14161a; --fg:#e6e6e6; --panel:#1d2026; --line:#2c313a; --accent:#6aa9ff; }
+* { box-sizing: border-box; }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:13px/1.4 ui-sans-serif, system-ui, sans-serif; }
+header { display:flex; gap:.75rem; align-items:center; flex-wrap:wrap;
+         padding:.5rem .75rem; border-bottom:1px solid var(--line); }
+header button { background:var(--panel); color:var(--fg); border:1px solid var(--line);
+                border-radius:4px; padding:.3rem .7rem; cursor:pointer; }
+header button:hover { border-color:var(--accent); }
+header input[type=number] { width:5.5rem; }
+.status { margin-left:auto; display:flex; gap:.6rem; align-items:center; }
+#backend { font-variant-numeric:tabular-nums; opacity:.8; }
+#stats { font-variant-numeric:tabular-nums; opacity:.8; }
+main { display:flex; gap:.75rem; padding:.75rem; align-items:flex-start; }
+#view { position:relative; }
+#cv { background:#000; border:1px solid var(--line); border-radius:4px;
+      max-width:100%; height:auto; cursor:grab; touch-action:none; }
+#cv:active { cursor:grabbing; }
+/* Persistent: set once from scene.backend_warning, never touched by a per-frame
+   frame_meta.warn. A non-empty backend_warning means the physics driving what you see is a
+   simplified stand-in (e.g. the cpu backend's linear tendon model), not the trained dynamics
+   -- so this stays up as long as that is true, not just for one frame. */
+#banner { position:absolute; inset:.5rem .5rem auto .5rem; padding:.5rem .6rem;
+          background:#5a4a1f; border:1px solid #a37f33; border-radius:4px; }
+/* Transient: frame_meta.warn (e.g. a full contact buffer), connection state, and command/
+   sim errors. Deliberately a separate element from #banner so none of these can ever
+   overwrite or hide the backend warning above. */
+#warnbanner { position:absolute; inset:auto .5rem .5rem .5rem; padding:.5rem .6rem;
+              background:#5a1f1f; border:1px solid #a33; border-radius:4px; }
+#panel { flex:1 1 22rem; min-width:18rem; max-height:85vh; overflow-y:auto;
+         background:var(--panel); border:1px solid var(--line); border-radius:4px;
+         padding:.6rem; }
+.row { display:flex; gap:.6rem; flex-wrap:wrap; margin-bottom:.6rem; }
+details { border-top:1px solid var(--line); padding:.35rem 0; }
+summary { cursor:pointer; display:flex; align-items:center; gap:.5rem; }
+summary .count { opacity:.55; }
+.act { display:grid; grid-template-columns: 9rem 1fr 3.2rem; gap:.4rem;
+       align-items:center; padding:.1rem 0 .1rem 1rem; }
+.act span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.act output { font-variant-numeric:tabular-nums; text-align:right; opacity:.8; }
+input[type=range] { width:100%; accent-color:var(--accent); }
+label { display:flex; gap:.35rem; align-items:center; }
