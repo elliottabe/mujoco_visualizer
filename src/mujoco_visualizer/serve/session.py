@@ -19,7 +19,7 @@ import mujoco
 import numpy as np
 import simplejpeg
 
-from mujoco_visualizer import Visualizer
+from mujoco_visualizer import Visualizer, list_available_settings
 from mujoco_visualizer.serve.backends import CpuBackend, PhysicsBackend, UnknownKeyframe
 from mujoco_visualizer.serve.controls import actuator_group_map, build_control_tree
 
@@ -344,6 +344,7 @@ class Session:
             "cameras": self.viz.list_cameras(),
             "presets": self.viz.list_presets(),
             "settings": self.viz.vis_state,
+            "settings_available": list_available_settings(),
             "has_controller": self._controller is not None,
             "ctrl_mode": self._mode,
             "width": self.width,

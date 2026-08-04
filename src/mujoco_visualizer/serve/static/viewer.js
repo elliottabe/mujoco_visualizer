@@ -66,6 +66,10 @@
       ctx.drawImage(img, 0, 0);
       URL.revokeObjectURL(url);
     };
+    // A truncated/corrupt JPEG (a flaky link is exactly what this viewer runs over) fires
+    // onerror instead of onload -- without this handler that path never revokes its blob
+    // URL, leaking one object URL per bad frame over a long streaming session.
+    img.onerror = () => { URL.revokeObjectURL(url); };
     img.src = url;
   }
 
@@ -138,6 +142,11 @@
     const blank = document.createElement("option");
     blank.value = ""; blank.textContent = "(current)";
     settingsEl.append(blank);
+    for (const name of (scene.settings_available || [])) {
+      const opt = document.createElement("option");
+      opt.value = name; opt.textContent = name;
+      settingsEl.append(opt);
+    }
     settingsEl.onchange = () => {
       if (settingsEl.value) send({ t: "settings", load: settingsEl.value });
     };

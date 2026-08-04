@@ -246,6 +246,15 @@ def test_scene_message_describes_the_model(sess):
     assert sorted(ids) == list(range(sess.model.nu))
 
 
+def test_scene_message_lists_available_settings(sess):
+    msg = sess.scene_message()
+    assert isinstance(msg["settings_available"], list)
+    assert len(msg["settings_available"]) > 0
+    assert all(isinstance(name, str) for name in msg["settings_available"])
+    # The existing "settings" field (current vis_state) is unchanged by this addition.
+    assert isinstance(msg["settings"], dict)
+
+
 @pytest.mark.gl
 def test_render_and_encode_round_trip(sess):
     frame = sess.render()
