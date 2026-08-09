@@ -363,18 +363,25 @@ class SimLoop(threading.Thread):
             self._frame = frame
 
         if "ghost" in cmd and bool(cmd["ghost"]) != self._ghost:
-            self._ghost = bool(cmd["ghost"])
-            # The source and the model must flip together, in this same command
-            # application, so no tick can ever observe one without the other: a
-            # ghost-off-width source (e.g. 101 DOF) paired with the ghost-on model (e.g.
-            # 202 DOF, policy+reference concatenated) is exactly the mismatch that makes
-            # Session.set_qpos raise on the very next frame. Duck-typed, like
+            new_ghost = bool(cmd["ghost"])
+            # Swap FIRST, flip flags only after it succeeds. If swap_model raises (e.g. a
+            # GL failure mid mesh-upload), nothing below has run: self._ghost and the
+            # source's own flag are still exactly what they were, so the session, the
+            # source, and this loop's own bookkeeping all still agree -- the failure is
+            # reported (by run()'s per-command handler) and playback continues on the
+            # unchanged, still-coherent model/source pair, rather than being left with
+            # flags flipped and the swap only half-done. ~400-560 ms: every mesh
+            # re-uploads. Coalescing means at most one call per tick either way.
+            self._session.swap_model("alt" if new_ghost else "primary")
+            self._ghost = new_ghost
+            # The source and the model must agree on qpos width in every tick from here
+            # on: a ghost-off-width source (e.g. 101 DOF) paired with the ghost-on model
+            # (e.g. 202 DOF, policy+reference concatenated) is exactly the mismatch that
+            # makes Session.set_qpos raise on the very next frame. Duck-typed, like
             # `controller_rate_hz` above: a source with no `ghost` attribute (e.g. the
             # generic ArrayTrajectorySource) is untouched and keeps working.
             if hasattr(self._source, "ghost"):
                 self._source.ghost = self._ghost
-            # ~400-560 ms: every mesh re-uploads. Coalescing means at most one per tick.
-            self._session.swap_model("alt" if self._ghost else "primary")
 
         if "play" in cmd:
             self._playing = bool(cmd["play"])
