@@ -41,7 +41,9 @@ _SIM_CMDS = frozenset({"play", "pause", "step", "reset"})
 _MODES = frozenset({"absolute", "additive"})
 
 # Types whose messages fully supersede an earlier one of the same type: only the last
-# matters. ``ctrl``, ``ctrl_group`` and ``replay`` are merged instead (see :func:`coalesce`).
+# matters. ``ctrl``, ``ctrl_group``, ``replay``, ``lock`` and ``render`` are merged instead
+# (see :func:`coalesce`). Keep this list exhaustive: a half-updated enumeration reads as
+# current and is worse than a visibly stale one.
 #
 # ``replay`` is deliberately NOT here. Wholesale last-wins was correct when the command
 # carried only ``{load, frame, play}``; it now carries eight independent fields, and dropping
@@ -49,7 +51,12 @@ _MODES = frozenset({"absolute", "additive"})
 # Two commands in the same tick (33 ms at the default fps) is ordinary UI traffic -- holding
 # ArrowRight while pressing ``]``, or ticking the ghost box mid scrub-drag -- and
 # ``{ghost:true}`` followed by ``{frame:10}`` lost the ghost toggle with no error at all.
-_LAST_WINS = frozenset({"mode", "speed", "camera", "render", "settings", "stream"})
+#
+# ``render`` is deliberately NOT here either, for the same reason: its payload is
+# ``{"set": {<dotted.key>: value}}``, a key-value delta, not a whole state. A settings panel
+# with dozens of controls emitting two independent edits in one tick -- ``{colors.thorax:...}``
+# then ``{alpha:...}`` -- must keep both, not have the second silently erase the first.
+_LAST_WINS = frozenset({"mode", "speed", "camera", "settings", "stream"})
 
 # Roots that exist in Visualizer.vis_state. A `render.set` key outside these was previously
 # merged verbatim, creating a dead entry: the control appeared to do nothing and nothing said
@@ -400,9 +407,10 @@ def parse_command(raw, user_settings_dir: Optional[str] = None) -> Dict:
 def coalesce(cmds: List[Dict]) -> List[Dict]:
     """Collapse redundant commands, keeping the order of the survivors.
 
-    ``_LAST_WINS`` types keep only their final message. ``ctrl`` sets and ``replay`` commands
-    merge key-by-key with later values winning. ``ctrl_group`` keeps the last gain per group.
-    ``sim`` messages are events (play/pause/step/reset) and are all preserved in order.
+    ``_LAST_WINS`` types keep only their final message. ``ctrl``, ``render`` and ``replay``
+    commands merge key-by-key with later values winning. ``ctrl_group`` keeps the last gain
+    per group. ``sim`` messages are events (play/pause/step/reset) and are all preserved in
+    order.
 
     ``lock`` commands merge with special handling: ``clear`` is an ordered event that resets the
     running set accumulator, and is preserved in output. When a message carries both ``set`` and
@@ -419,6 +427,12 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
     ``lock.set`` merges for the same reason: a UI that toggles multiple joints in quick
     succession (e.g. a group checkbox covering nine legs) must apply all toggles, not just
     the last one.
+
+    ``render.set`` merges for the same reason as ``lock.set``: its payload is a
+    ``{<dotted.key>: value}`` delta, so a settings panel with dozens of controls emitting two
+    edits to different keys within one tick (e.g. ``{colors.thorax:...}`` then
+    ``{alpha:...}``) must keep both instead of the second replacing the whole ``set`` dict and
+    silently reverting the first.
     """
     last_index: Dict[str, int] = {}
     merged_ctrl: Dict[str, float] = {}
@@ -428,6 +442,8 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
     merged_lock_set: Dict = {}
     lock_clear_flag: bool = False
     lock_index = None
+    merged_render_set: Dict = {}
+    render_index = None
     group_index: Dict[str, int] = {}
     keep = [True] * len(cmds)
 
@@ -459,6 +475,11 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             if lock_index is not None:
                 keep[lock_index] = False
             lock_index = i
+        elif kind == "render":
+            merged_render_set.update(cmd["set"])
+            if render_index is not None:
+                keep[render_index] = False
+            render_index = i
         elif kind == "ctrl_group":
             group = cmd["group"]
             if group in group_index:
@@ -480,6 +501,8 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             if merged_lock_set:
                 out_lock["set"] = dict(merged_lock_set)
             out.append(out_lock)
+        elif i == render_index:
+            out.append({"t": "render", "set": dict(merged_render_set)})
         else:
             out.append(cmd)
     return out
