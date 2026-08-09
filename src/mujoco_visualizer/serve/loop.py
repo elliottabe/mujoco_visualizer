@@ -30,6 +30,8 @@ class SimLoop(threading.Thread):
         substeps_per_frame: int = 260,
         idle_pause_s: Optional[float] = 60.0,
         max_queue: int = 4096,
+        source=None,
+        frame_dt: float = 1e-3,
     ):
         super().__init__(name="SimLoop", daemon=True)
         self._session = session
@@ -66,6 +68,31 @@ class SimLoop(threading.Thread):
         # Starts at 0 so the first tick advances the controller before its first physics step.
         self._ctrl_countdown = 0.0
 
+        # -- replay state. All frame indices are ORIGINAL rollout frames, never strided
+        # ones: if `stride` changed what `in`/`out` meant, the trim handles would move
+        # under the user every time they changed the slow-motion factor.
+        self._source = source
+        self._frame_dt = float(frame_dt)
+        self._clip = 0
+        self._frame = 0
+        self._in = 0
+        self._out = (source.clip_length(0) - 1) if source is not None else 0
+        self._stride = 1
+        self._loop_playback = True
+        self._ghost = False
+        # The frame whose pose was actually last written by _advance_replay -- what
+        # replay_state()/_publish report. NOT the same as self._frame once playback has
+        # advanced past it: self._frame means "what the next tick will draw", and reporting
+        # that instead (as opposed to what is on screen right now) is exactly the bug this
+        # field exists to avoid. Seeded to match self._frame so a read before the first tick
+        # (nothing written yet) is still sane.
+        self._published_frame = 0
+        # Set when a command moved the playhead while paused, so the tick renders the new
+        # pose once instead of waiting for Play. Also seeded True here (whenever a source is
+        # attached) so the very first tick renders frame 0 immediately, before Play is ever
+        # pressed -- deliberate UX, not an incidental side effect of the paused-scrub case.
+        self._replay_dirty = source is not None
+
     # -- public surface --------------------------------------------------------
 
     @property
@@ -83,6 +110,31 @@ class SimLoop(threading.Thread):
     @property
     def error(self) -> Optional[Dict]:
         return self._error
+
+    @property
+    def replay_mode(self) -> bool:
+        return self._source is not None
+
+    def replay_state(self) -> Dict:
+        """Snapshot of the replay playhead. Read from the sim thread and from _publish.
+
+        ``frame`` is ``self._published_frame`` -- the frame whose pose was last actually
+        written -- not ``self._frame``, which by the time playback has advanced past it means
+        "what the next tick will draw". A UI slider bound to this field must always match
+        what is on screen, in both the playing and paused/scrubbed cases.
+        """
+        return {
+            "clip": self._clip,
+            "frame": self._published_frame,
+            "in": self._in,
+            "out": self._out,
+            "stride": self._stride,
+            "playing": self._playing,
+            "loop": self._loop_playback,
+            "ghost": self._ghost,
+            "n_clips": 0 if self._source is None else self._source.n_clips,
+            "length": 0 if self._source is None else self._source.clip_length(self._clip),
+        }
 
     def submit(self, cmd: Dict) -> None:
         """Queue a validated command. Silently drops past ``max_queue`` -- an unbounded
@@ -176,6 +228,8 @@ class SimLoop(threading.Thread):
             height = cmd.get("height", self._session.height)
             if (width, height) != (self._session.width, self._session.height):
                 self._session.resize(width, height)
+        elif kind == "replay":
+            self._apply_replay(cmd)
         elif kind == "sim":
             action = cmd["cmd"]
             if action == "play":
@@ -248,12 +302,192 @@ class SimLoop(threading.Thread):
             self._ctrl_countdown -= chunk
             remaining -= chunk
 
+    def _apply_replay(self, cmd: Dict) -> None:
+        """Move the playhead / retarget the source. Raises on out-of-range values.
+
+        Raising is what gets this reported as an ``error`` with ``kind='command'`` and
+        ``paused=False`` by ``run()``'s per-command handler -- the same treatment every other
+        bad command gets, and deliberately not a pause.
+        """
+        if self._source is None:
+            raise ValueError("this session has no trajectory source; replay is unavailable")
+
+        if "clip" in cmd:
+            clip = int(cmd["clip"])
+            if not 0 <= clip < self._source.n_clips:
+                raise IndexError(
+                    f"clip {clip} out of range (have {self._source.n_clips} clips)"
+                )
+            if clip != self._clip:
+                self._clip = clip
+                # A new clip has its own length, so a trim from the previous one is
+                # meaningless -- and a stale `out` past this clip's end would raise on the
+                # very next advance.
+                self._in = 0
+                self._out = self._source.clip_length(clip) - 1
+                self._frame = min(self._frame, self._out)
+
+        length = self._source.clip_length(self._clip)
+
+        if "trim" in cmd:
+            lo, hi = cmd["trim"]
+            # protocol.py already enforces ordering and non-negativity before a command
+            # reaches this loop; this is defence-in-depth for callers that construct a
+            # replay command by hand (e.g. an export job) rather than through protocol.py.
+            if lo > hi:
+                raise ValueError(f"trim must be ordered [in, out]; got in={lo} > out={hi}")
+            if hi >= length:
+                raise IndexError(
+                    f"trim out={hi} past the end of clip {self._clip} (length {length})"
+                )
+            self._in, self._out = lo, hi
+            self._frame = min(max(self._frame, lo), hi)
+
+        if "stride" in cmd:
+            stride = int(cmd["stride"])
+            # Same defence-in-depth rationale as trim above: protocol.py already enforces
+            # stride >= 1.
+            if stride < 1:
+                raise ValueError(f"stride must be >= 1, got {stride}")
+            self._stride = stride
+
+        if "loop" in cmd:
+            self._loop_playback = bool(cmd["loop"])
+
+        if "frame" in cmd:
+            frame = int(cmd["frame"])
+            if not 0 <= frame < length:
+                raise IndexError(
+                    f"frame {frame} out of range for clip {self._clip} (length {length})"
+                )
+            self._frame = frame
+
+        if "ghost" in cmd and bool(cmd["ghost"]) != self._ghost:
+            new_ghost = bool(cmd["ghost"])
+            # Swap FIRST, flip flags only after it succeeds. If swap_model raises (e.g. a
+            # GL failure mid mesh-upload), nothing below has run: self._ghost and the
+            # source's own flag are still exactly what they were, so the session, the
+            # source, and this loop's own bookkeeping all still agree -- the failure is
+            # reported (by run()'s per-command handler) and playback continues on the
+            # unchanged, still-coherent model/source pair, rather than being left with
+            # flags flipped and the swap only half-done. ~400-560 ms: every mesh
+            # re-uploads. Coalescing means at most one call per tick either way.
+            self._session.swap_model("alt" if new_ghost else "primary")
+            self._ghost = new_ghost
+            # The source and the model must agree on qpos width in every tick from here
+            # on: a ghost-off-width source (e.g. 101 DOF) paired with the ghost-on model
+            # (e.g. 202 DOF, policy+reference concatenated) is exactly the mismatch that
+            # makes Session.set_qpos raise on the very next frame. Duck-typed, like
+            # `controller_rate_hz` above: a source with no `ghost` attribute (e.g. the
+            # generic ArrayTrajectorySource) is untouched and keeps working.
+            if hasattr(self._source, "ghost"):
+                self._source.ghost = self._ghost
+
+        if "play" in cmd:
+            self._playing = bool(cmd["play"])
+            if self._playing:
+                self._error = None
+
+        self._replay_dirty = True
+
+    def _next_replay_frame(self, frame: int) -> Tuple[int, bool]:
+        """Where one stride sends ``frame``, and whether that ran past ``out`` with
+        ``loop=False`` -- the boundary at which advancing must stop.
+
+        Pure arithmetic, no side effects (in particular: does NOT touch ``self._playing``),
+        so both playback (:meth:`_advance_replay`) and a step
+        (:meth:`_step_replay`) go through this one place and the wrap/stop rule can never
+        drift between them.
+        """
+        nxt = frame + self._stride
+        if nxt > self._out:
+            if self._loop_playback:
+                return self._in, False
+            return self._out, True
+        return nxt, False
+
+    def _advance_replay(self) -> None:
+        """Write the current frame, then move the playhead one stride if playing.
+
+        Write-THEN-advance is correct here: a playing tick's frame has already been
+        rendered (or was just scrubbed to), so this writes it and only then moves the
+        cursor on for the tick after. ``self._published_frame`` is set to the frame just
+        written, BEFORE ``self._frame`` potentially moves on below -- callers that read
+        state after this returns (i.e. ``_publish``) must see "what was drawn", not "what
+        the cursor now points at for next time". Contrast :meth:`_step_replay`, which needs
+        the opposite order for the opposite reason.
+        """
+        self._session.set_qpos(self._source.qpos(self._clip, self._frame))
+        self._published_frame = self._frame
+        self._replay_dirty = False
+        if not self._playing:
+            return
+        nxt, stop = self._next_replay_frame(self._frame)
+        self._frame = nxt
+        if stop:
+            self._playing = False
+
+    def _step_replay(self, n: int) -> None:
+        """Advance the cursor by ``n`` strides, THEN write and report the result --
+        deliberately the opposite order from :meth:`_advance_replay`.
+
+        A step means "show me the next frame": the frame currently on screen has already
+        been seen, so writing it again first (this used to reuse _advance_replay's
+        write-then-advance order) makes a single step press produce no visible change at
+        all -- the cursor moves internally but nothing new is ever rendered until some
+        later command happens to trigger another write. Moving first fixes that: exactly
+        one write, for the frame the cursor lands on.
+
+        ``n`` strides are folded into ONE cursor move and ONE write/publish (never one
+        write per intermediate stride, which the caller -- one publish per tick -- could
+        not represent anyway). If a non-looping advance hits ``out`` partway through,
+        further strides would just repeat ``out``, so the loop stops early rather than
+        spinning through them for nothing.
+
+        Does not touch ``self._playing``: a step is a paused-state operation by convention,
+        and it is already ``False`` in the ordinary case, so there is nothing to change.
+        Forcing it False here would also incorrectly override a `play` command coalesced
+        into the very same command batch.
+        """
+        frame = self._frame
+        for _ in range(max(1, int(n))):
+            frame, stop = self._next_replay_frame(frame)
+            if stop:
+                break
+        self._frame = frame
+        self._session.set_qpos(self._source.qpos(self._clip, self._frame))
+        self._published_frame = self._frame
+        self._replay_dirty = False
+
+    def _publish_guarded(self, tick_started: float) -> None:
+        """Publish, converting a render-side failure into a paused ``render`` error instead
+        of letting it escape the tick. Shared by the physics and replay paths so both get
+        the same failure handling. ``tick_started`` is unused by the body; it is kept in the
+        signature for symmetry with the caller's own timing use of it.
+        """
+        try:
+            self._publish()
+        except Exception as exc:
+            self._playing = False
+            self._error = {
+                "t": "error",
+                "kind": "render",
+                "msg": str(exc),
+                "paused": True,
+            }
+
     def _publish(self) -> None:
         frame = self._session.render()
         jpeg = self._session.encode(frame)
+        if self.replay_mode:
+            replay = self.replay_state()
+            sim_time = replay["frame"] * self._frame_dt
+        else:
+            replay = None
+            sim_time = float(self._session.data.time)
         meta = {
             "t": "frame_meta",
-            "sim_time": float(self._session.data.time),
+            "sim_time": sim_time,
             "rtf": round(self._rtf, 3),
             "w": self._session.width,
             "h": self._session.height,
@@ -265,6 +499,10 @@ class SimLoop(threading.Thread):
             "warn": self._session.new_warnings(),
             "readout": self._session.readout(),
         }
+        if replay is not None:
+            # rtf stays 0 in replay mode: nothing advances data.time, and reporting a
+            # real-time factor for a file scrub would be a made-up number.
+            meta["replay"] = replay
         # Snapshotted on this thread, next to the frame it describes, for the same reason the
         # frame is: request threads must never reach into live Session state.
         scene = self._session.scene_message()
@@ -336,6 +574,42 @@ class SimLoop(threading.Thread):
 
                     self._maybe_idle_pause()
 
+                    if self.replay_mode:
+                        # Replay never steps physics: state comes from the file. `step`
+                        # commands nudge the playhead by n strides instead (advance-then-
+                        # write -- see _step_replay's docstring for why that is the
+                        # opposite order from continuous playback below).
+                        if self._pending_steps > 0:
+                            n = self._pending_steps
+                            self._pending_steps = 0
+                            try:
+                                self._step_replay(n)
+                            except Exception as exc:
+                                # The happy path leaves `playing` untouched (see
+                                # _step_replay's docstring), but an actual failure here is
+                                # exactly the diverged-state situation every other "paused":
+                                # True error in this file stops playback for.
+                                self._playing = False
+                                self._error = {
+                                    "t": "error", "kind": "replay",
+                                    "msg": str(exc), "paused": True,
+                                }
+                        elif self._playing or self._replay_dirty:
+                            try:
+                                self._advance_replay()
+                            except Exception as exc:
+                                self._playing = False
+                                self._error = {
+                                    "t": "error", "kind": "replay",
+                                    "msg": str(exc), "paused": True,
+                                }
+                        self._publish_guarded(tick_started)
+                        fps_cap = self._fps_cap if self._fps_cap > 0 else 1.0
+                        slack = (1.0 / fps_cap) - (time.monotonic() - tick_started)
+                        if slack > 0:
+                            self._stop_event.wait(slack)
+                        continue
+
                     n_steps = 0
                     if self._pending_steps > 0:
                         n_steps = self._substeps * self._pending_steps
@@ -369,16 +643,7 @@ class SimLoop(threading.Thread):
                             # EMA so the reported factor is readable rather than jittery
                             self._rtf = 0.8 * self._rtf + 0.2 * (advanced / elapsed)
 
-                    try:
-                        self._publish()
-                    except Exception as exc:
-                        self._playing = False
-                        self._error = {
-                            "t": "error",
-                            "kind": "render",
-                            "msg": str(exc),
-                            "paused": True,
-                        }
+                    self._publish_guarded(tick_started)
 
                     fps_cap = self._fps_cap if self._fps_cap > 0 else 1.0
                     budget = 1.0 / fps_cap

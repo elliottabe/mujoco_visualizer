@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from mujoco_visualizer.serve.loop import SimLoop
+from mujoco_visualizer.serve.replay import ArrayTrajectorySource
 from mujoco_visualizer.serve.session import Diverged
 
 
@@ -31,6 +32,8 @@ class FakeSession:
         self.controller_rate_hz = None
         self._diverge_after = diverge_after
         self._time = 0.0
+        self.qpos_writes = []
+        self.model_swaps = []
 
     # -- surface SimLoop uses --
     @property
@@ -80,8 +83,15 @@ class FakeSession:
     def load_settings(self, name):
         pass
 
+    # -- added for replay mode --
     def set_qpos(self, qpos):
-        pass
+        self.qpos_writes.append(np.asarray(qpos).copy())
+
+    def swap_model(self, which):
+        self.model_swaps.append(which)
+
+    def vis_state_snapshot(self):
+        return {}
 
     def reset(self):
         self.resets += 1
@@ -499,3 +509,390 @@ def test_stop_closes_the_session():
     loop = SimLoop(sess, fps_cap=60, substeps_per_frame=1, idle_pause_s=None)
     _run_briefly(loop, lambda: sess.renders >= 1)
     assert sess.closed is True
+
+
+# -- replay mode --------------------------------------------------------------
+
+
+def make_source(n_clips=2, n_frames=10, nq=3):
+    q = np.arange(n_clips * n_frames * nq, dtype=np.float32)
+    return ArrayTrajectorySource(q.reshape(n_clips, n_frames, nq))
+
+
+@contextlib.contextmanager
+def running_replay_loop(source=None, **kw):
+    session = FakeSession()
+    loop = SimLoop(session, source=source or make_source(), fps_cap=1000.0, idle_pause_s=None, **kw)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        yield session, loop
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
+
+
+def test_replay_mode_is_detected_from_the_source():
+    session = FakeSession()
+    assert SimLoop(session).replay_mode is False
+    assert SimLoop(session, source=make_source()).replay_mode is True
+
+
+def test_replay_never_steps_physics():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "play": True})
+        time.sleep(0.2)
+        assert session.steps == 0, "replay mode must not call session.step()"
+        assert len(session.qpos_writes) > 1, "replay mode must write qpos each tick"
+
+
+def test_scrub_writes_that_exact_frame_without_playing():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 7})
+        time.sleep(0.15)
+        assert loop.replay_state()["frame"] == 7
+        expected = make_source().qpos(0, 7)
+        np.testing.assert_array_equal(session.qpos_writes[-1], expected)
+        assert loop.playing is False
+
+
+def test_playback_advances_by_stride():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 0, "stride": 3, "play": True})
+        time.sleep(0.3)
+        loop.submit({"t": "replay", "play": False})
+        time.sleep(0.1)
+        frames = [int(w[0] / 3) for w in session.qpos_writes]  # dof0 encodes frame index
+        deltas = {b - a for a, b in zip(frames, frames[1:]) if b > a}
+        assert deltas == {3}, f"expected stride-3 advance, saw deltas {deltas}"
+
+
+def test_playback_loops_within_trim_when_loop_is_true():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "trim": [2, 5], "frame": 2, "loop": True, "play": True})
+        # Thread.start() blocks until the child thread has begun running, so the loop's very
+        # first tick -- with the constructor's initial `_replay_dirty` -- can write frame 0
+        # before this command is even drained. Wait for the trim to actually land, then only
+        # look at writes from that point on: what this test cares about is playback staying
+        # in bounds, not the one-off startup frame that precedes any command.
+        assert wait_until(lambda: loop.replay_state()["in"] == 2)
+        start = len(session.qpos_writes)
+        time.sleep(0.4)
+        st = loop.replay_state()
+        assert 2 <= st["frame"] <= 5
+        assert all(2 <= int(w[0] / 3) <= 5 for w in session.qpos_writes[start:])
+
+
+def test_playback_stops_at_out_when_loop_is_false():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "trim": [0, 3], "frame": 0, "loop": False, "play": True})
+        time.sleep(0.4)
+        assert loop.replay_state()["frame"] == 3
+        assert loop.playing is False, "reaching `out` with loop=False must pause"
+
+
+def test_changing_clip_clamps_frame_and_resets_trim():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 9})
+        time.sleep(0.1)
+        loop.submit({"t": "replay", "clip": 1})
+        time.sleep(0.1)
+        st = loop.replay_state()
+        assert st["clip"] == 1
+        assert st["out"] == 9, "a new clip resets the trim to its full length"
+
+
+def test_out_of_range_clip_reports_a_command_error_without_pausing():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "play": True})
+        time.sleep(0.1)
+        loop.submit({"t": "replay", "clip": 99})
+        time.sleep(0.15)
+        err = loop.error
+        assert err is not None and err["kind"] == "command"
+        assert err["paused"] is False
+        assert loop.playing is True, "a bad command must not stop playback for everyone"
+
+
+def test_ghost_toggle_swaps_the_model():
+    """``make_source()`` returns a plain ``ArrayTrajectorySource``, which has no ``ghost``
+    attribute -- this doubles as proof that a source lacking it is untouched and the toggle
+    still works end to end (no AttributeError from the ``hasattr`` guard in ``loop.py``)."""
+    with running_replay_loop() as (session, loop):
+        assert not hasattr(loop._source, "ghost")
+        loop.submit({"t": "replay", "ghost": True})
+        time.sleep(0.15)
+        assert session.model_swaps == ["alt"]
+        loop.submit({"t": "replay", "ghost": False})
+        time.sleep(0.15)
+        assert session.model_swaps == ["alt", "primary"]
+
+
+class GhostAwareSource(ArrayTrajectorySource):
+    """Stands in for the real fly-side source, which exposes a ``ghost`` flag: off it returns
+    101-wide qpos, on it returns ``concat(policy, reference)`` at 202 wide. SimLoop must flip
+    this flag in lockstep with ``session.swap_model``, or a tick could observe a ghost-width
+    model paired with a non-ghost-width source -- exactly what makes ``Session.set_qpos``
+    raise on the next frame."""
+
+    def __init__(self, qpos):
+        super().__init__(qpos)
+        self.ghost = False
+
+
+def make_ghost_source(n_clips=2, n_frames=10, nq=3):
+    q = np.arange(n_clips * n_frames * nq, dtype=np.float32)
+    return GhostAwareSource(q.reshape(n_clips, n_frames, nq))
+
+
+def test_ghost_toggle_also_flips_a_source_that_supports_it():
+    session = FakeSession()
+    source = make_ghost_source()
+    loop = SimLoop(session, source=source, fps_cap=1000.0, idle_pause_s=None)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        loop.submit({"t": "replay", "ghost": True})
+        assert wait_until(lambda: session.model_swaps == ["alt"])
+        assert source.ghost is True, "the source's own ghost flag must flip too"
+        loop.submit({"t": "replay", "ghost": False})
+        assert wait_until(lambda: session.model_swaps == ["alt", "primary"])
+        assert source.ghost is False
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
+
+
+class BrokenGhostSession(FakeSession):
+    """``swap_model`` always fails -- proves the ghost toggle leaves the loop's own flag,
+    the source's flag, and the session's active model all agreeing on the PRE-toggle state
+    when the swap itself fails, per finding 3's guarantee that no tick may ever observe a
+    mismatched model/source pair (relocating that mismatch to a later tick, rather than
+    preventing it, would not satisfy that guarantee)."""
+
+    def swap_model(self, which):
+        self.model_swaps.append(which)  # record the attempt for the assertion below
+        raise RuntimeError("mesh upload failed")
+
+
+def test_failed_ghost_swap_leaves_flags_and_model_consistent():
+    session = BrokenGhostSession()
+    source = make_ghost_source()
+    loop = SimLoop(session, source=source, fps_cap=1000.0, idle_pause_s=None)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        loop.submit({"t": "replay", "ghost": True})
+        assert wait_until(lambda: loop.error is not None)
+        assert loop.error["kind"] == "command"
+        assert loop.error["paused"] is False
+        # swap_model was attempted (and recorded before it raised) but never succeeded --
+        # and, because loop.py now swaps BEFORE flipping either flag, neither the loop's
+        # own bookkeeping nor the source itself moved either. All three still agree on the
+        # pre-toggle (non-ghost) state.
+        assert session.model_swaps == ["alt"]
+        assert loop.replay_state()["ghost"] is False
+        assert source.ghost is False
+
+        # A later, ordinary tick must still work normally: nothing was left inconsistent,
+        # so a fresh scrub renders without a kind="replay" error (which is what a stale
+        # ghost/source mismatch would produce on its very next write).
+        writes_before = len(session.qpos_writes)
+        loop.submit({"t": "replay", "frame": 3})
+        assert wait_until(lambda: len(session.qpos_writes) > writes_before)
+        assert loop.error["kind"] == "command", (
+            "the original command error must not have been replaced by a new "
+            "kind='replay' failure -- nothing should be wrong to fail on"
+        )
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
+
+
+def test_frame_meta_carries_replay_state_and_rollout_time():
+    # make_source()'s default clip is only 10 frames long, so frame 250 needs a bigger
+    # source here -- 10 frames would make frame 250 out of range and raise, never landing
+    # in replay_state().
+    big_source = make_source(n_frames=300)
+    with running_replay_loop(source=big_source, frame_dt=1e-3) as (session, loop):
+        loop.submit({"t": "replay", "frame": 250})
+        time.sleep(0.15)
+        got = loop.wait_for_frame(-1, timeout=1.0)
+        assert got is not None
+        _seq, _jpeg, meta = got
+        assert meta["replay"]["frame"] == 250
+        assert meta["replay"]["stride"] == 1
+        assert meta["sim_time"] == pytest.approx(0.250)
+
+
+def _poll_until_published_frame(loop, expected_frame, timeout=2.0):
+    """Poll ``wait_for_frame`` until a published ``meta["replay"]["frame"]`` equals
+    ``expected_frame`` (or the timeout elapses), returning that meta -- or ``None``.
+
+    Anchors a caller's subsequent ``session.qpos_writes[-1]`` check to a report we have
+    directly, freshly observed, rather than pairing it with a SEPARATE, later, unsynchronized
+    read of ``qpos_writes`` that a slow test thread could grab one tick late (see the
+    now-fixed ``test_reported_frame_matches_the_written_pose_while_playing`` below for why
+    that particular shape of race is dangerous: it reproduces the exact ``published ==
+    written + stride`` signature of the original bug well enough to pass against broken
+    code).
+    """
+    seq = -1
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        got = loop.wait_for_frame(seq, timeout=0.3)
+        if got is None:
+            continue
+        seq, _jpeg, meta = got
+        replay = meta.get("replay")
+        if replay is not None and replay["frame"] == expected_frame:
+            return meta
+    return None
+
+
+def test_reported_frame_matches_the_written_pose_while_playing():
+    """Regression for: ``_advance_replay`` writes ``qpos(frame)`` and THEN advances
+    ``self._frame`` to the next one before returning, so a naive ``_publish`` that re-reads
+    ``self._frame`` reports the frame the *next* tick will draw, one stride ahead of what is
+    actually on screen right now.
+
+    Compares SEQUENCES, not a single latest-vs-latest snapshot. Reading
+    ``meta["replay"]["frame"]`` from ``wait_for_frame()`` and ``session.qpos_writes[-1]``
+    from two separate, unsynchronized reads cannot tell "this publish reports the frame
+    THIS tick just wrote" from "the loop has already advanced past it since we read the
+    published meta" -- and that second, purely-timing-dependent scenario produces EXACTLY
+    the same ``published == written + stride`` shape as the original bug, so a single-sample
+    comparison can pass against broken code if the reads happen to land unluckily.
+
+    The fix: capture a write count at a point PROVEN quiescent (paused, not dirty -- nothing
+    can write again until the next command lands, so there is nothing left to race), collect
+    an unbroken run of published frames while playing (gap-checked via ``seq``, so no publish
+    -- and so no corresponding write -- was skipped), then compare that whole sequence
+    against the correspondingly-positioned slice of the full, now-stable
+    ``session.qpos_writes``. Under the bug every entry in that slice would be
+    ``published[i] - stride``, which fails at position 0 regardless of exactly when either
+    read happens to land relative to the loop thread's tick -- no timing can rescue it.
+    """
+    session = FakeSession()
+    loop = SimLoop(
+        session, source=make_source(n_frames=1000), fps_cap=200.0, idle_pause_s=None
+    )
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        # Phase 1: scrub to a known frame and wait for it to become quiescent (paused, and
+        # -- since replay_state()["frame"] is only ever set AFTER the write that produced it
+        # -- the corresponding write is guaranteed to have already landed too). Nothing
+        # further will write until the `play` command below is drained, so the write count
+        # captured next is a reliable alignment point, not a guess.
+        loop.submit({"t": "replay", "frame": 0})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 0 and not loop.playing)
+        pre_writes = len(session.qpos_writes)
+
+        # Phase 2: play, and collect an unbroken run of published frames.
+        loop.submit({"t": "replay", "play": True})
+        published = []
+        last_appended_seq = None
+        seq = -1
+        deadline = time.time() + 2.0
+        while time.time() < deadline and len(published) < 12:
+            got = loop.wait_for_frame(seq, timeout=0.5)
+            if got is None:
+                continue
+            seq, _jpeg, meta = got
+            replay = meta.get("replay")
+            if replay is None or not replay["playing"]:
+                continue
+            if last_appended_seq is not None and seq != last_appended_seq + 1:
+                raise AssertionError(
+                    f"gap in published seq: {last_appended_seq} -> {seq}; a publish (and "
+                    "so possibly a write) was missed, which would make the alignment below "
+                    "unreliable -- rerun rather than trust a comparison built on a gap"
+                )
+            published.append(replay["frame"])
+            last_appended_seq = seq
+
+        # Phase 3: stop and let it quiesce before reading the now-stable write list.
+        loop.submit({"t": "replay", "play": False})
+        time.sleep(0.1)
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
+
+    assert len(published) >= 8, "never observed enough published frames while playing"
+    written = [int(w[0] / 3) for w in session.qpos_writes]
+    aligned = written[pre_writes : pre_writes + len(published)]
+    assert aligned == published, (
+        f"published sequence {published} does not match the written sequence at the same "
+        f"position {aligned} -- the report is racing ahead of (or behind) the actual poses"
+    )
+
+
+def test_step_advances_and_renders_the_next_frame():
+    """Regression for: a single ``sim step`` used to write the frame already on screen and
+    only silently move the cursor, so pressing Step produced no visible change at all. A
+    step's contract is "show me the next frame", so it must move the cursor BEFORE writing
+    -- the opposite order from continuous playback.
+
+    Checked against the actual POSE (``session.qpos_writes``), not just the reported state:
+    that is exactly the check whose absence let the original defect through review. The pose
+    read below is anchored to a freshly-observed publish of the expected frame (see
+    ``_poll_until_published_frame``), and safe to read at that point because a step is a
+    one-shot write -- nothing advances again until another command arrives, so there is no
+    race between "we just saw frame 6 published" and "read the pose it corresponds to".
+    """
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 4, "stride": 2})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 4)
+
+        loop.submit({"t": "sim", "cmd": "step", "n": 1})
+        meta = _poll_until_published_frame(loop, 6)
+        assert meta is not None, "step never published frame 6"
+        assert loop.playing is False, "a step must not leave playback running"
+
+        written_frame = int(session.qpos_writes[-1][0] / 3)
+        assert written_frame == 6, (
+            "one step at stride 2 must WRITE frame 6, not just move an internal cursor to it"
+        )
+
+
+def test_step_with_n_greater_than_one_advances_n_strides_and_writes_once():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 0, "stride": 1})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 0)
+        writes_before = len(session.qpos_writes)
+
+        loop.submit({"t": "sim", "cmd": "step", "n": 3})
+        assert wait_until(lambda: int(session.qpos_writes[-1][0] / 3) == 3)
+        # One tick, one publish -- n=3 must fold into a single write of the FINAL frame,
+        # never one write per intermediate stride.
+        assert len(session.qpos_writes) == writes_before + 1
+        assert loop.playing is False
+
+
+def test_step_at_out_wraps_to_in_when_looping():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "trim": [2, 5], "frame": 5, "loop": True})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 5)
+
+        loop.submit({"t": "sim", "cmd": "step", "n": 1})
+        meta = _poll_until_published_frame(loop, 2)
+        assert meta is not None, "step never published frame 2"
+        assert loop.playing is False
+        assert int(session.qpos_writes[-1][0] / 3) == 2
+
+
+def test_step_at_out_stays_at_out_when_not_looping():
+    """Already paused, so this is "nothing moves": no error, no advance past `out`, and the
+    same frame is simply re-rendered."""
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "trim": [2, 5], "frame": 5, "loop": False})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 5)
+        writes_before = len(session.qpos_writes)
+
+        loop.submit({"t": "sim", "cmd": "step", "n": 1})
+        assert wait_until(lambda: len(session.qpos_writes) == writes_before + 1)
+        assert int(session.qpos_writes[-1][0] / 3) == 5
+        assert loop.replay_state()["frame"] == 5
+        assert loop.error is None
+        assert loop.playing is False
