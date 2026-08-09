@@ -552,6 +552,9 @@ class Visualizer:
             gname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ''
             if '_inertial' in gname:
                 self.model.geom_rgba[gid, 3] = 0.0
+            # The truthiness guard also makes excluded_suffix="" a no-op, even though every
+            # name technically ends with "" under str.endswith. Only None is required to be a
+            # no-op; "" piggybacking on that is deliberate, not an oversight.
             if self.excluded_suffix and gname.endswith(self.excluded_suffix):
                 self._excluded_geom_ids.add(gid)
 

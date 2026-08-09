@@ -68,4 +68,15 @@ def test_ghost_alpha_replaces_rather_than_multiplies_the_global_alpha():
 
 def test_default_vis_state_carries_a_ghost_group():
     viz = _viz()
-    assert set(viz.vis_state["ghost"]) == {"tint", "alpha"}
+    assert viz.vis_state["ghost"] == {"tint": "#cccccc", "alpha": 0.3}
+
+
+def test_ghost_tint_wins_over_a_per_geom_override_on_an_excluded_geom():
+    viz = _viz(excluded_suffix="-ghost")
+    gid = _gid(viz.model, "thorax_geom-ghost")
+    viz.vis_state["geom_colors"][gid] = "#00ff00"
+    viz.vis_state["ghost"]["tint"] = "#0000ff"
+    viz._apply_all()
+    ghost = viz.model.geom_rgba[gid]
+    assert ghost[2] == pytest.approx(1.0), "ghost tint (blue) wins"
+    assert ghost[1] != pytest.approx(1.0), "the per-geom override (green) must be ignored"
