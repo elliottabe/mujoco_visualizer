@@ -896,3 +896,127 @@ def test_step_at_out_stays_at_out_when_not_looping():
         assert loop.replay_state()["frame"] == 5
         assert loop.error is None
         assert loop.playing is False
+
+
+# -- export --------------------------------------------------------------------
+
+
+class FakeExportJob:
+    """Stand-in for ExportJob: records what it was handed, never renders."""
+
+    def __init__(self, qpos_frames, cmd):
+        self.frames = np.asarray(qpos_frames)
+        self.cmd = cmd
+        self.started = False
+        self.cancelled = False
+        self._state = "pending"
+
+    def start(self):
+        self.started = True
+        self._state = "rendering"
+
+    def cancel(self):
+        self.cancelled = True
+        self._state = "cancelled"
+
+    def is_alive(self):
+        return self._state == "rendering"
+
+    def finish(self):
+        self._state = "done"
+
+    def progress(self):
+        return {"state": self._state, "done": 0, "total": len(self.frames),
+                 "path": "x.mp4", "error": None, "note": None}
+
+
+@contextlib.contextmanager
+def replay_loop_with_export():
+    session = FakeSession()
+    made = []
+
+    def factory(qpos_frames, cmd):
+        job = FakeExportJob(qpos_frames, cmd)
+        made.append(job)
+        return job
+
+    loop = SimLoop(session, source=make_source(n_frames=10), fps_cap=1000.0,
+                   idle_pause_s=None, export_factory=factory)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        yield loop, made
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
+
+
+def test_export_receives_the_trimmed_strided_frames():
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "trim": [2, 8], "stride": 3, "format": "mp4", "crf": 20})
+        time.sleep(0.2)
+        assert len(made) == 1
+        job = made[0]
+        assert job.started is True
+        # frames 2, 5, 8 -- inclusive of `out`, in original frame units
+        assert [int(f[0] / 3) for f in job.frames] == [2, 5, 8]
+
+
+def test_export_defaults_to_the_current_trim_and_stride():
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "replay", "trim": [1, 4], "stride": 2})
+        time.sleep(0.1)
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "format": "mp4", "crf": 20})
+        time.sleep(0.2)
+        assert [int(f[0] / 3) for f in made[0].frames] == [1, 3]
+
+
+def test_second_concurrent_export_is_rejected_without_killing_the_first():
+    with replay_loop_with_export() as (loop, made):
+        cmd = {"t": "export", "width": 64, "height": 48, "fps": 30,
+               "format": "mp4", "crf": 20}
+        loop.submit(dict(cmd))
+        time.sleep(0.15)
+        loop.submit(dict(cmd))
+        time.sleep(0.15)
+        assert len(made) == 1, "a second export must not start"
+        err = loop.error
+        assert err is not None and "one export at a time" in err["msg"]
+        assert err["paused"] is False
+        assert made[0].cancelled is False
+
+
+def test_export_cancel_cancels_the_running_job():
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "format": "mp4", "crf": 20})
+        time.sleep(0.15)
+        loop.submit({"t": "export_cancel"})
+        time.sleep(0.15)
+        assert made[0].cancelled is True
+
+
+def test_a_finished_export_lets_a_new_one_start():
+    with replay_loop_with_export() as (loop, made):
+        cmd = {"t": "export", "width": 64, "height": 48, "fps": 30,
+               "format": "mp4", "crf": 20}
+        loop.submit(dict(cmd))
+        time.sleep(0.15)
+        made[0].finish()
+        loop.submit(dict(cmd))
+        time.sleep(0.15)
+        assert len(made) == 2
+
+
+def test_export_progress_rides_the_frame_meta():
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "format": "mp4", "crf": 20})
+        time.sleep(0.2)
+        got = loop.wait_for_frame(-1, timeout=1.0)
+        assert got is not None
+        _seq, _jpeg, meta = got
+        assert meta["export"]["state"] == "rendering"
+        assert meta["export"]["total"] == 10

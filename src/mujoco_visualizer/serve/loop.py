@@ -15,6 +15,8 @@ import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from mujoco_visualizer.serve.protocol import coalesce
 from mujoco_visualizer.serve.session import Diverged
 
@@ -32,6 +34,7 @@ class SimLoop(threading.Thread):
         max_queue: int = 4096,
         source=None,
         frame_dt: float = 1e-3,
+        export_factory=None,
     ):
         super().__init__(name="SimLoop", daemon=True)
         self._session = session
@@ -92,6 +95,11 @@ class SimLoop(threading.Thread):
         # attached) so the very first tick renders frame 0 immediately, before Play is ever
         # pressed -- deliberate UX, not an incidental side effect of the paused-scrub case.
         self._replay_dirty = source is not None
+
+        # Injected so the loop is testable with no GL: production passes a factory that
+        # builds a real ExportJob (see serve/app.py and the fly launcher).
+        self._export_factory = export_factory
+        self._export_job = None
 
     # -- public surface --------------------------------------------------------
 
@@ -230,6 +238,11 @@ class SimLoop(threading.Thread):
                 self._session.resize(width, height)
         elif kind == "replay":
             self._apply_replay(cmd)
+        elif kind == "export":
+            self._start_export(cmd)
+        elif kind == "export_cancel":
+            if self._export_job is not None:
+                self._export_job.cancel()
         elif kind == "sim":
             action = cmd["cmd"]
             if action == "play":
@@ -390,6 +403,36 @@ class SimLoop(threading.Thread):
 
         self._replay_dirty = True
 
+    def _start_export(self, cmd: Dict) -> None:
+        """Slice the frames on THIS thread, then hand them to a job thread.
+
+        The slice is what keeps the job independent: at most 1588 x 202 float32 = 1.3 MB for
+        a full ghost clip, so copying is free, and afterwards the job needs neither the
+        source nor this Session. Frame indices are original rollout frames.
+        """
+        if self._export_factory is None:
+            raise ValueError("this session cannot export: no export_factory was configured")
+        if self._source is None:
+            raise ValueError("this session has no trajectory source; nothing to export")
+        if self._export_job is not None and self._export_job.is_alive():
+            raise ValueError(
+                "one export at a time; cancel the running export first "
+                f"({self._export_job.progress()['done']}/"
+                f"{self._export_job.progress()['total']} frames done)"
+            )
+
+        lo, hi = cmd.get("trim", (self._in, self._out))
+        stride = int(cmd.get("stride", self._stride))
+        length = self._source.clip_length(self._clip)
+        if hi >= length:
+            raise IndexError(
+                f"export trim out={hi} past the end of clip {self._clip} (length {length})"
+            )
+        indices = list(range(lo, hi + 1, stride))
+        frames = np.stack([self._source.qpos(self._clip, i) for i in indices])
+        self._export_job = self._export_factory(frames, cmd)
+        self._export_job.start()
+
     def _next_replay_frame(self, frame: int) -> Tuple[int, bool]:
         """Where one stride sends ``frame``, and whether that ran past ``out`` with
         ``loop=False`` -- the boundary at which advancing must stop.
@@ -503,6 +546,8 @@ class SimLoop(threading.Thread):
             # rtf stays 0 in replay mode: nothing advances data.time, and reporting a
             # real-time factor for a file scrub would be a made-up number.
             meta["replay"] = replay
+        if self._export_job is not None:
+            meta["export"] = self._export_job.progress()
         # Snapshotted on this thread, next to the frame it describes, for the same reason the
         # frame is: request threads must never reach into live Session state.
         scene = self._session.scene_message()
