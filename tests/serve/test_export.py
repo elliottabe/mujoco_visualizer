@@ -147,6 +147,74 @@ def test_png_sequence_writes_numbered_frames(tmp_path):
 
 
 @pytest.mark.gl
+def test_a_cancelled_png_sequence_removes_the_frames_it_wrote(tmp_path):
+    """§9 promises "partial file removed", and a half-written sequence is a partial file.
+
+    Left behind, those frames are worse than a truncated MP4: ``_render_png`` uses
+    ``mkdir(exist_ok=True)`` and always numbers from zero, so a later, shorter export into the
+    same directory sits on top of the previous run's higher-numbered frames and anything
+    globbing ``frame_*.png`` (ffmpeg, a figure script) silently splices two renders together.
+    """
+    outdir = tmp_path / "seq"
+    job = make_job(tmp_path, frames=400, width=320, height=240, fmt="png", path=outdir)
+    job.start()
+    while job.progress()["done"] < 2 and job.is_alive():
+        pass
+    job.cancel()
+    job.join(timeout=120)
+    prog = job.progress()
+    assert prog["state"] == "cancelled"
+    assert prog["done"] < 400, "the job finished, so this proves nothing about a partial run"
+    assert list(outdir.glob("frame_*.png")) == [], (
+        "a cancelled PNG export left its frames on disk"
+    )
+
+
+@pytest.mark.gl
+def test_a_failed_png_sequence_removes_the_frames_it_wrote(tmp_path, monkeypatch):
+    """Same guarantee on the failure path, which is the one a user does not choose."""
+    import imageio
+
+    real_imwrite = imageio.imwrite
+    calls = {"n": 0}
+
+    def explode(path, frame, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise OSError("disk full")
+        return real_imwrite(path, frame, *a, **kw)
+
+    monkeypatch.setattr(imageio, "imwrite", explode)
+    outdir = tmp_path / "seq"
+    job = make_job(tmp_path, frames=6, fmt="png", path=outdir)
+    job.start()
+    job.join(timeout=120)
+    prog = job.progress()
+    assert prog["state"] == "failed"
+    assert "disk full" in prog["error"]
+    assert list(outdir.glob("frame_*.png")) == []
+
+
+@pytest.mark.gl
+def test_cleanup_leaves_unrelated_files_in_a_sequence_directory_alone(tmp_path):
+    """The sequence directory can be one the user named explicitly, so only the frames THIS
+    job wrote are removed -- not the directory, and not its other contents."""
+    outdir = tmp_path / "seq"
+    outdir.mkdir()
+    keep = outdir / "notes.txt"
+    keep.write_text("mine")
+    job = make_job(tmp_path, frames=400, width=320, height=240, fmt="png", path=outdir)
+    job.start()
+    while job.progress()["done"] < 2 and job.is_alive():
+        pass
+    job.cancel()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "cancelled"
+    assert keep.read_text() == "mine"
+    assert outdir.is_dir()
+
+
+@pytest.mark.gl
 def test_sidecar_records_provenance(tmp_path):
     job = make_job(tmp_path, frames=2, meta={"clip": 42, "stride": 10})
     job.start()

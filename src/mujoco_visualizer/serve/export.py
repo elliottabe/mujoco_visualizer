@@ -22,13 +22,18 @@ requires ``path.parent`` to already exist (a missing one is reported as a failed
 silently created -- see ``_render_mp4``); PNG-sequence export creates ``path`` itself as the
 sequence's own output directory, because that creation is inherent to what a sequence export
 is (see ``_render_png``).
+
+Cleanup after a cancel or a failure differs by format for the same reason: the MP4 is one
+file and is deleted outright, while a PNG sequence has only the frames this job wrote deleted
+-- the directory may be one the user named and may hold other things (see
+``_cleanup_partial``).
 """
 
 import copy
 import json
 import threading
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import mujoco
 import numpy as np
@@ -132,6 +137,9 @@ class ExportJob(threading.Thread):
         self._done = 0
         self._error: Optional[str] = None
         self._cancel = threading.Event()
+        # Every PNG this job actually wrote, so a cancel/failure can remove exactly its own
+        # frames and nothing else (see _cleanup_partial). Touched only by the job thread.
+        self._png_written: List[Path] = []
 
     # -- public surface ------------------------------------------------------------
 
@@ -248,7 +256,12 @@ class ExportJob(threading.Thread):
         renderer = viz.make_renderer(height=self._height, width=self._width)
         try:
             for i, frame in enumerate(self._iter_rendered(viz, renderer)):
-                imageio.imwrite(str(self._path / f"frame_{i:05d}.png"), frame)
+                target = self._path / f"frame_{i:05d}.png"
+                imageio.imwrite(str(target), frame)
+                # Recorded, not re-derived from self._done, so cleanup deletes exactly the
+                # files that exist: _done is incremented by the generator *after* the body
+                # above runs, so the two disagree by one frame at any cancel point.
+                self._png_written.append(target)
         finally:
             renderer.close()
 
@@ -272,8 +285,24 @@ class ExportJob(threading.Thread):
         target.write_text(json.dumps(payload, indent=2, sort_keys=True))
 
     def _cleanup_partial(self) -> None:
-        """A truncated MP4 that plays for two frames is worse than no file."""
+        """A truncated MP4 that plays for two frames is worse than no file.
+
+        The PNG case is not exempt, it is just narrower. ``_render_png`` uses
+        ``mkdir(exist_ok=True)`` and writes ``frame_00000.png`` upwards, so a cancelled or
+        failed run left its frames behind -- and a later, shorter export into the same
+        directory then sat on top of the previous run's higher-numbered frames, so anything
+        globbing ``frame_*.png`` (ffmpeg, a figure script) spliced two different renders into
+        one sequence without a word. Only the files THIS job wrote are removed: the directory
+        itself, the sidecar, and any unrelated contents are left alone, because a sequence
+        directory a user pointed at explicitly is not ours to empty.
+        """
         if self._fmt == "png":
+            for target in self._png_written:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._png_written.clear()
             return
         try:
             self._path.unlink(missing_ok=True)

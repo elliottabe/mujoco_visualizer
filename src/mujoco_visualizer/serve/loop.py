@@ -130,6 +130,10 @@ class SimLoop(threading.Thread):
         written -- not ``self._frame``, which by the time playback has advanced past it means
         "what the next tick will draw". A UI slider bound to this field must always match
         what is on screen, in both the playing and paused/scrubbed cases.
+
+        ``frame_dt`` is published so a client can convert frames to recorded time (and hence
+        report a slow-motion factor) instead of assuming a sample rate. A UI that hardcodes
+        one is wrong, silently, for every source not sampled at that rate.
         """
         return {
             "clip": self._clip,
@@ -140,6 +144,7 @@ class SimLoop(threading.Thread):
             "playing": self._playing,
             "loop": self._loop_playback,
             "ghost": self._ghost,
+            "frame_dt": self._frame_dt,
             "n_clips": 0 if self._source is None else self._source.n_clips,
             "length": 0 if self._source is None else self._source.clip_length(self._clip),
         }
@@ -256,6 +261,20 @@ class SimLoop(threading.Thread):
                 self._playing = False
                 self._error = None
                 self._session.reset()
+                if self.replay_mode:
+                    # Session.reset() snaps qpos to the rest-pose keyframe, but the playhead is
+                    # untouched -- so without this the next publish reports the old frame while
+                    # the canvas shows the rest pose, and nothing re-renders the replay frame
+                    # until some later command happens to arrive. The same "reported frame !=
+                    # rendered pose" failure _advance_replay's write-then-publish order exists
+                    # to prevent, reached through a different door.
+                    #
+                    # The playhead is deliberately NOT moved: reset is about simulation state,
+                    # not about the cursor, and yanking a user's scrub position back to the
+                    # trim-in point is not what "reset the physics" asks for. The visible
+                    # effect in replay mode is therefore that the rest pose is replaced by the
+                    # current frame again on the next tick.
+                    self._replay_dirty = True
 
     def _physics_steps_per_control_step(self) -> Optional[float]:
         """Physics steps covered by one control step, or None when there is no controller.
@@ -406,9 +425,18 @@ class SimLoop(threading.Thread):
     def _start_export(self, cmd: Dict) -> None:
         """Slice the frames on THIS thread, then hand them to a job thread.
 
-        The slice is what keeps the job independent: at most 1588 x 202 float32 = 1.3 MB for
-        a full ghost clip, so copying is free, and afterwards the job needs neither the
-        source nor this Session. Frame indices are original rollout frames.
+        The slice is what keeps the job independent: at most 1588 x 202 float64 = 2.6 MB for a
+        full ghost clip (``TrajectorySource.qpos`` returns float64, which is what MjData's qpos
+        is), so copying is free, and afterwards the job needs neither the source nor this
+        Session. Frame indices are original rollout frames.
+
+        The factory is handed the RESOLVED request, not the client's ``cmd``: ``clip`` is not a
+        wire field at all (the clip being replayed is this loop's state, and letting a client
+        name a different one for export would be a new way for the file to disagree with the
+        pixels), and ``trim``/``stride`` are optional on the wire but default to this loop's
+        current values. A factory that has to re-derive them can only guess -- which is how
+        every auto-named export ended up called ``clip000_...``, overwriting the last one, with
+        ``"clip": null`` in its provenance sidecar.
         """
         if self._export_factory is None:
             raise ValueError("this session cannot export: no export_factory was configured")
@@ -422,15 +450,26 @@ class SimLoop(threading.Thread):
             )
 
         lo, hi = cmd.get("trim", (self._in, self._out))
+        lo, hi = int(lo), int(hi)
         stride = int(cmd.get("stride", self._stride))
         length = self._source.clip_length(self._clip)
+        # Same defence-in-depth as _apply_replay's own trim/stride guards: protocol.py already
+        # enforces both, so these only fire for a caller that builds an export command by hand.
+        # Without them a reversed trim exports zero frames (np.stack([]) raising far from the
+        # cause) and stride <= 0 surfaces as a bare "range() arg 3 must not be zero".
+        if lo > hi:
+            raise ValueError(f"export trim must be ordered [in, out]; got in={lo} > out={hi}")
+        if stride < 1:
+            raise ValueError(f"export stride must be >= 1, got {stride}")
         if hi >= length:
             raise IndexError(
                 f"export trim out={hi} past the end of clip {self._clip} (length {length})"
             )
         indices = list(range(lo, hi + 1, stride))
         frames = np.stack([self._source.qpos(self._clip, i) for i in indices])
-        self._export_job = self._export_factory(frames, cmd)
+        self._export_job = self._export_factory(
+            frames, dict(cmd, clip=self._clip, trim=[lo, hi], stride=stride)
+        )
         self._export_job.start()
 
     def _next_replay_frame(self, frame: int) -> Tuple[int, bool]:

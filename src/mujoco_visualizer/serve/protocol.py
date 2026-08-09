@@ -38,8 +38,15 @@ _SIM_CMDS = frozenset({"play", "pause", "step", "reset"})
 _MODES = frozenset({"absolute", "additive"})
 
 # Types whose messages fully supersede an earlier one of the same type: only the last
-# matters. ``ctrl`` and ``ctrl_group`` are merged instead (see _coalesce_*).
-_LAST_WINS = frozenset({"mode", "speed", "camera", "render", "settings", "stream", "replay"})
+# matters. ``ctrl``, ``ctrl_group`` and ``replay`` are merged instead (see :func:`coalesce`).
+#
+# ``replay`` is deliberately NOT here. Wholesale last-wins was correct when the command
+# carried only ``{load, frame, play}``; it now carries eight independent fields, and dropping
+# an earlier message wholesale silently discards every field the later one does not mention.
+# Two commands in the same tick (33 ms at the default fps) is ordinary UI traffic -- holding
+# ArrowRight while pressing ``]``, or ticking the ghost box mid scrub-drag -- and
+# ``{ghost:true}`` followed by ``{frame:10}`` lost the ghost toggle with no error at all.
+_LAST_WINS = frozenset({"mode", "speed", "camera", "render", "settings", "stream"})
 
 
 class CommandError(ValueError):
@@ -192,9 +199,15 @@ def parse_command(raw) -> Dict:
     if kind == "replay":
         out = {"t": "replay"}
         if "load" in cmd:
-            if not isinstance(cmd["load"], str):
-                raise CommandError("'replay.load' must be a path string")
-            out["load"] = cmd["load"]
+            # Rejected rather than validated-and-ignored. The loop's _apply_replay never
+            # reads this field: the trajectory source is chosen once, at launch, and swapping
+            # it mid-session would have to rebuild the model, the clip table and every cached
+            # width. Accepting the key made the server look like it honoured a request it
+            # silently dropped, which is worse than refusing it.
+            raise CommandError(
+                "'replay.load' is not supported: the trajectory source is fixed when the "
+                "server starts. Use 'clip' to choose which clip of that source to replay."
+            )
         if "clip" in cmd:
             out["clip"] = int(_num(cmd, "clip", lo=0, hi=1e9))
         if "frame" in cmd:
@@ -228,7 +241,7 @@ def parse_command(raw) -> Dict:
                 out[flag] = cmd[flag]
         if len(out) == 1:
             raise CommandError(
-                "'replay' needs at least one of load/clip/frame/play/stride/trim/loop/ghost"
+                "'replay' needs at least one of clip/frame/play/stride/trim/loop/ghost"
             )
         return out
 
@@ -276,13 +289,21 @@ def parse_command(raw) -> Dict:
 def coalesce(cmds: List[Dict]) -> List[Dict]:
     """Collapse redundant commands, keeping the order of the survivors.
 
-    ``_LAST_WINS`` types keep only their final message. ``ctrl`` sets merge key-by-key with
-    later values winning. ``ctrl_group`` keeps the last gain per group. ``sim`` messages are
-    events (play/pause/step/reset) and are all preserved in order.
+    ``_LAST_WINS`` types keep only their final message. ``ctrl`` sets and ``replay`` commands
+    merge key-by-key with later values winning. ``ctrl_group`` keeps the last gain per group.
+    ``sim`` messages are events (play/pause/step/reset) and are all preserved in order.
+
+    ``replay`` merges rather than last-wins because its eight fields are independent knobs,
+    not one value: a scrub drag emitting ``{frame:...}`` every few ms must still coalesce to a
+    single seek (the reason it was collapsed in the first place), but a ``{ghost:true}`` that
+    happens to share the tick must not vanish with the earlier frames. Later values still win
+    per key, so the collapsed drag behaves exactly as before.
     """
     last_index: Dict[str, int] = {}
     merged_ctrl: Dict[str, float] = {}
     ctrl_index = None
+    merged_replay: Dict = {}
+    replay_index = None
     group_index: Dict[str, int] = {}
     keep = [True] * len(cmds)
 
@@ -297,6 +318,13 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             if ctrl_index is not None:
                 keep[ctrl_index] = False
             ctrl_index = i
+        elif kind == "replay":
+            for key, value in cmd.items():
+                if key != "t":
+                    merged_replay[key] = value
+            if replay_index is not None:
+                keep[replay_index] = False
+            replay_index = i
         elif kind == "ctrl_group":
             group = cmd["group"]
             if group in group_index:
@@ -309,6 +337,8 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             continue
         if i == ctrl_index:
             out.append({"t": "ctrl", "set": dict(merged_ctrl)})
+        elif i == replay_index:
+            out.append({"t": "replay", **merged_replay})
         else:
             out.append(cmd)
     return out

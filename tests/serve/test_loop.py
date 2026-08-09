@@ -34,6 +34,7 @@ class FakeSession:
         self._time = 0.0
         self.qpos_writes = []
         self.model_swaps = []
+        self.pose = None
 
     # -- surface SimLoop uses --
     @property
@@ -86,6 +87,12 @@ class FakeSession:
     # -- added for replay mode --
     def set_qpos(self, qpos):
         self.qpos_writes.append(np.asarray(qpos).copy())
+        # `pose` models WHAT IS ON SCREEN, as opposed to `qpos_writes`, which is a history.
+        # The real Session.reset() snaps qpos to a keyframe, so a reset that does not
+        # re-render leaves the canvas showing the rest pose while replay_state() keeps
+        # reporting the old frame -- see
+        # test_a_reset_in_replay_mode_re_renders_the_frame_it_reports.
+        self.pose = np.asarray(qpos).copy()
 
     def swap_model(self, which):
         self.model_swaps.append(which)
@@ -95,6 +102,7 @@ class FakeSession:
 
     def reset(self):
         self.resets += 1
+        self.pose = "rest"  # what Session.reset() does: snap qpos to the rest keyframe
 
     def resize(self, w, h):
         self.resizes.append((w, h))
@@ -591,6 +599,45 @@ def test_playback_stops_at_out_when_loop_is_false():
         assert loop.playing is False, "reaching `out` with loop=False must pause"
 
 
+def test_a_reset_in_replay_mode_re_renders_the_frame_it_reports():
+    """``sim reset`` snaps qpos to the rest pose; the playhead does not move.
+
+    Without marking replay dirty, the next publish reports the old frame while the canvas
+    shows the rest pose, and nothing re-renders until some later command happens to arrive --
+    the same "reported frame != rendered pose" failure ``_advance_replay``'s write-then-publish
+    order exists to prevent, reached through a different door.
+    """
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 7})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 7)
+        # Paused and clean: the loop keeps publishing but stops writing qpos, so any later
+        # write can only have been caused by the reset below.
+        time.sleep(0.1)
+        settled = len(session.qpos_writes)
+        time.sleep(0.1)
+        assert len(session.qpos_writes) == settled, "paused replay should not keep writing"
+
+        loop.submit({"t": "sim", "cmd": "reset", "n": 1})
+        assert wait_until(lambda: session.resets >= 1)
+        assert wait_until(lambda: len(session.qpos_writes) > settled), (
+            "the reset left the rest pose on screen: nothing re-rendered the replay frame"
+        )
+        # The pose on screen is frame 7 again...
+        np.testing.assert_array_equal(session.pose, make_source().qpos(0, 7))
+        # ...and it is still frame 7 that is reported. Reset is about simulation state, not
+        # about the cursor, so the playhead deliberately does not move.
+        assert loop.replay_state()["frame"] == 7
+
+
+def test_a_reset_outside_replay_mode_does_not_touch_qpos():
+    """The counterpart: with no source, reset must stay exactly what it was."""
+    session = FakeSession()
+    loop = SimLoop(session, fps_cap=1000.0, idle_pause_s=None)
+    loop.submit({"t": "sim", "cmd": "reset", "n": 1})
+    assert _run_briefly(loop, lambda: session.resets >= 1)
+    assert session.pose == "rest", "nothing should have re-rendered a replay frame"
+
+
 def test_changing_clip_clamps_frame_and_resets_trim():
     with running_replay_loop() as (session, loop):
         loop.submit({"t": "replay", "frame": 9})
@@ -1008,6 +1055,71 @@ def test_a_finished_export_lets_a_new_one_start():
         loop.submit(dict(cmd))
         time.sleep(0.15)
         assert len(made) == 2
+
+
+def test_the_loop_hands_the_factory_its_own_clip_trim_and_stride():
+    """The export request the FACTORY sees must be fully resolved by the loop.
+
+    ``clip`` is not a wire field at all, and ``trim``/``stride`` are optional -- so a factory
+    that reads them off the raw command can only guess. It guessed ``clip=0`` and
+    ``trim=(0, n_frames-1)`` in strided units, which is how every auto-named export got the
+    same filename and quietly overwrote the previous one, and how the provenance sidecar
+    recorded ``"clip": null``.
+
+    This drives a real ``export`` command through ``SimLoop`` rather than calling a factory by
+    hand with a ``clip`` key no other party ever sets -- which is exactly why the old
+    factory-side test stayed green while nothing upheld its contract.
+    """
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "replay", "clip": 1, "trim": [2, 8], "stride": 3})
+        time.sleep(0.1)
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "format": "mp4", "crf": 20})
+        assert wait_until(lambda: made), f"no export ever started: {loop.error}"
+        cmd = made[0].cmd
+        assert cmd["clip"] == 1, "the factory was not told which clip it is exporting"
+        assert cmd["trim"] == [2, 8], "trim must be resolved, in original frame units"
+        assert cmd["stride"] == 3
+
+
+def test_a_client_cannot_name_a_clip_for_export_that_the_loop_is_not_on():
+    """The loop is the source of truth for which clip is being exported.
+
+    ``protocol.parse_command`` does not even pass a ``clip`` through on an ``export``, but a
+    hand-built command reaching ``submit`` must not be able to make the file's name and
+    provenance disagree with the frames actually sliced out of the source.
+    """
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "replay", "clip": 1})
+        time.sleep(0.1)
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "format": "mp4", "crf": 20, "clip": 0})
+        assert wait_until(lambda: made), f"no export ever started: {loop.error}"
+        assert made[0].cmd["clip"] == 1
+
+
+@pytest.mark.parametrize(
+    "bad, message",
+    [
+        ({"trim": [8, 2]}, "ordered"),
+        ({"stride": 0}, "stride must be >= 1"),
+    ],
+)
+def test_export_defends_against_a_hand_built_out_of_order_request(bad, message):
+    """Defence-in-depth, mirroring ``_apply_replay``'s own trim/stride guards.
+
+    ``protocol.py`` enforces both before a command reaches the loop, so these only fire for a
+    caller that constructs an export command directly. Without them a reversed trim exports
+    zero frames (``np.stack([])`` raising far from the cause) and ``stride=0`` surfaces as a
+    bare "range() arg 3 must not be zero".
+    """
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "format": "mp4", "crf": 20, **bad})
+        assert wait_until(lambda: loop.error is not None), "the bad request was accepted"
+        assert message in loop.error["msg"]
+        assert loop.error["paused"] is False  # a bad command must not pause a shared session
+        assert not made, "no job may start from a request that failed validation"
 
 
 def test_export_progress_rides_the_frame_meta():

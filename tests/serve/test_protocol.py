@@ -257,3 +257,53 @@ def test_replay_still_last_wins_so_a_scrub_drag_applies_once():
         parse_command({"t": "replay", "frame": 300}),
     ])
     assert out == [{"t": "replay", "frame": 300}]
+
+
+def test_coalescing_a_replay_never_discards_a_field_the_later_one_omits():
+    """The reason ``replay`` merges instead of last-wins.
+
+    A scrub drag and any other replay control landing in the same tick (33 ms at the default
+    fps -- holding ArrowRight while pressing ``]``, or ticking the ghost box mid-drag) used to
+    collapse to just the later message, silently dropping the toggle with no error at all.
+    """
+    out = coalesce([
+        parse_command({"t": "replay", "ghost": True}),
+        parse_command({"t": "replay", "frame": 10}),
+    ])
+    assert out == [{"t": "replay", "ghost": True, "frame": 10}]
+
+
+def test_coalescing_a_replay_still_lets_the_later_value_win_per_key():
+    out = coalesce([
+        parse_command({"t": "replay", "frame": 10, "stride": 2, "loop": True}),
+        parse_command({"t": "replay", "frame": 40, "loop": False}),
+    ])
+    assert out == [{"t": "replay", "frame": 40, "stride": 2, "loop": False}]
+
+
+def test_a_coalesced_replay_keeps_the_position_of_the_last_message():
+    """The merged command must sit where the LAST replay sat, not the first: a ``sim`` event
+    queued between the two is an ordered event, and moving the replay in front of it would
+    reorder "seek, then step" into "step, then seek"."""
+    out = coalesce([
+        parse_command({"t": "replay", "ghost": True}),
+        parse_command({"t": "sim", "cmd": "step"}),
+        parse_command({"t": "replay", "frame": 10}),
+    ])
+    assert [c["t"] for c in out] == ["sim", "replay"]
+    assert out[-1] == {"t": "replay", "ghost": True, "frame": 10}
+
+
+def test_replay_load_is_rejected_rather_than_validated_and_ignored():
+    """``_apply_replay`` never reads ``load``: the source is fixed when the server starts.
+
+    Accepting the field made the server look like it honoured a request it silently dropped.
+    """
+    with pytest.raises(CommandError, match="fixed when the server starts"):
+        parse_command({"t": "replay", "load": "/some/other/rollout.h5"})
+
+
+def test_the_replay_error_message_no_longer_advertises_load():
+    with pytest.raises(CommandError) as excinfo:
+        parse_command({"t": "replay"})
+    assert "load" not in str(excinfo.value)
