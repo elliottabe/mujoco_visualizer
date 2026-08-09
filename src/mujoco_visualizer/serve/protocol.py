@@ -30,6 +30,7 @@ COMMANDS = frozenset(
         "replay",
         "export",
         "export_cancel",
+        "lock",
         "ping",
     }
 )
@@ -316,6 +317,58 @@ def parse_command(raw) -> Dict:
     if kind == "export_cancel":
         return {"t": "export_cancel"}
 
+    if kind == "lock":
+        out = {"t": "lock"}
+        has_set = "set" in cmd
+        has_clear = "clear" in cmd
+        if not (has_set or has_clear):
+            raise CommandError("'lock' requires at least one of 'set' or 'clear'")
+        if has_set:
+            values = cmd.get("set")
+            if not isinstance(values, dict):
+                raise CommandError("'lock' requires a 'set' object")
+            normalized = {}
+            for name, value in values.items():
+                if value is None:
+                    # None means freeze at the current value when lock engages
+                    normalized[str(name)] = None
+                elif isinstance(value, (list, tuple)):
+                    # List of numbers
+                    converted = []
+                    for i, v in enumerate(value):
+                        if isinstance(v, bool) or not isinstance(v, (int, float)):
+                            raise CommandError(
+                                f"lock value for {name!r} element {i} must be a number, "
+                                f"got {type(v).__name__}"
+                            )
+                        float_val = float(v)
+                        if not (float_val == float_val and float_val != float('inf') and float_val != float('-inf')):
+                            raise CommandError(
+                                f"lock value for {name!r} element {i} must be finite, got {float_val}"
+                            )
+                        converted.append(float_val)
+                    normalized[str(name)] = converted
+                else:
+                    # Scalar number
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise CommandError(
+                            f"lock value for {name!r} must be a number or None, "
+                            f"got {type(value).__name__}"
+                        )
+                    float_val = float(value)
+                    if not (float_val == float_val and float_val != float('inf') and float_val != float('-inf')):
+                        raise CommandError(
+                            f"lock value for {name!r} must be finite, got {float_val}"
+                        )
+                    # Normalize scalar to list
+                    normalized[str(name)] = [float_val]
+            out["set"] = normalized
+        if has_clear:
+            if not isinstance(cmd.get("clear"), bool):
+                raise CommandError("'lock.clear' must be a boolean")
+            out["clear"] = cmd.get("clear")
+        return out
+
     return {"t": "ping"}
 
 
@@ -325,18 +378,25 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
     ``_LAST_WINS`` types keep only their final message. ``ctrl`` sets and ``replay`` commands
     merge key-by-key with later values winning. ``ctrl_group`` keeps the last gain per group.
     ``sim`` messages are events (play/pause/step/reset) and are all preserved in order.
+    ``lock.clear`` is an event (always preserved); ``lock.set`` merges key-by-key.
 
     ``replay`` merges rather than last-wins because its eight fields are independent knobs,
     not one value: a scrub drag emitting ``{frame:...}`` every few ms must still coalesce to a
     single seek (the reason it was collapsed in the first place), but a ``{ghost:true}`` that
     happens to share the tick must not vanish with the earlier frames. Later values still win
     per key, so the collapsed drag behaves exactly as before.
+
+    ``lock.set`` merges for the same reason: a UI that toggles multiple joints in quick
+    succession (e.g. a group checkbox covering nine legs) must apply all toggles, not just
+    the last one.
     """
     last_index: Dict[str, int] = {}
     merged_ctrl: Dict[str, float] = {}
     ctrl_index = None
     merged_replay: Dict = {}
     replay_index = None
+    merged_lock_set: Dict = {}
+    lock_set_index = None
     group_index: Dict[str, int] = {}
     keep = [True] * len(cmds)
 
@@ -358,6 +418,14 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             if replay_index is not None:
                 keep[replay_index] = False
             replay_index = i
+        elif kind == "lock":
+            # Merge set values key-by-key, but keep clear commands as separate events
+            if "set" in cmd:
+                merged_lock_set.update(cmd["set"])
+                if lock_set_index is not None:
+                    keep[lock_set_index] = False
+                lock_set_index = i
+            # clear is an event; keep it
         elif kind == "ctrl_group":
             group = cmd["group"]
             if group in group_index:
@@ -372,6 +440,8 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             out.append({"t": "ctrl", "set": dict(merged_ctrl)})
         elif i == replay_index:
             out.append({"t": "replay", **merged_replay})
+        elif i == lock_set_index:
+            out.append({"t": "lock", "set": dict(merged_lock_set)})
         else:
             out.append(cmd)
     return out

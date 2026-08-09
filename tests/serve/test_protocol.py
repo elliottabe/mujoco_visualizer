@@ -356,3 +356,60 @@ def test_render_still_accepts_a_bare_alpha_key():
     address and whole-root replacement is exactly what setting it means."""
     cmd = parse_command({"t": "render", "set": {"alpha": 0.5}})
     assert cmd["set"] == {"alpha": 0.5}
+
+
+# --- lock -----------------------------------------------------------------------
+
+def test_lock_accepts_scalar_list_and_null_values():
+    cmd = parse_command({"t": "lock", "set": {"hinge_a": 0.5, "root.quat": [1, 0, 0, 0],
+                                              "wing_yaw_left": None}})
+    assert cmd["set"]["hinge_a"] == [0.5]
+    assert cmd["set"]["root.quat"] == [1.0, 0.0, 0.0, 0.0]
+    assert cmd["set"]["wing_yaw_left"] is None, "None means freeze at the current value"
+
+
+def test_lock_clear_parses_alone():
+    assert parse_command({"t": "lock", "clear": True}) == {"t": "lock", "clear": True}
+
+
+def test_lock_needs_set_or_clear():
+    with pytest.raises(CommandError, match="set.*clear"):
+        parse_command({"t": "lock"})
+
+
+def test_lock_rejects_non_numeric_and_non_finite_values():
+    with pytest.raises(CommandError):
+        parse_command({"t": "lock", "set": {"hinge_a": "0.5"}})
+    with pytest.raises(CommandError, match="finite"):
+        parse_command({"t": "lock", "set": {"hinge_a": float("inf")}})
+
+
+def test_lock_rejects_a_boolean_value():
+    with pytest.raises(CommandError):
+        parse_command({"t": "lock", "set": {"hinge_a": True}})
+
+
+def test_lock_merges_key_by_key_rather_than_replacing():
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+        parse_command({"t": "lock", "set": {"b": 2.0}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["set"] == {"a": [1.0], "b": [2.0]}, "a group toggle sets many at once"
+
+
+def test_lock_later_value_wins_per_key():
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+        parse_command({"t": "lock", "set": {"a": 3.0}}),
+    ])
+    assert out[0]["set"] == {"a": [3.0]}
+
+
+def test_lock_clear_is_not_swallowed_by_a_later_set():
+    out = coalesce([
+        parse_command({"t": "lock", "clear": True}),
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+    ])
+    kinds = [(c.get("clear"), c.get("set")) for c in out]
+    assert any(c is True for c, _ in kinds), "a clear must not vanish into a later set"
