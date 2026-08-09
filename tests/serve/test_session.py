@@ -691,3 +691,86 @@ def test_load_settings_accepts_a_bundled_preset_name(sess):
     from mujoco_visualizer import list_available_settings
 
     sess.load_settings(list_available_settings()[0])  # must not raise
+
+
+# -- vis_state_snapshot / swap_model ----------------------------------------
+#
+# NOTE: the task brief's snippets name the single-model fixture `session`, but this file's
+# existing fixture for "one small model, width=64, height=64" is `sess` -- there is no
+# `session` fixture anywhere in this package. Using `sess` here rather than introducing a
+# duplicate fixture under a second name.
+
+
+def test_vis_state_snapshot_is_a_deep_copy(sess):
+    snap = sess.vis_state_snapshot()
+    snap["vis_flags"]["shadows"] = "mutated"
+    assert sess.viz.vis_state["vis_flags"]["shadows"] != "mutated"
+
+
+def test_active_model_name_defaults_to_primary(sess):
+    assert sess.active_model_name == "primary"
+
+
+def test_swap_model_without_alt_raises(sess):
+    with pytest.raises(ValueError, match="no alt_model"):
+        sess.swap_model("alt")
+
+
+def test_swap_model_rejects_unknown_name(sess):
+    with pytest.raises(ValueError, match="unknown"):
+        sess.swap_model("ghost")
+
+
+_ONE_BODY = """
+<mujoco><worldbody>
+  <body name="b1"><joint name="j1" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1"/></body>
+</worldbody></mujoco>
+"""
+
+_TWO_BODY = """
+<mujoco><worldbody>
+  <body name="b1"><joint name="j1" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1"/></body>
+  <body name="b2" pos="0 .5 0"><joint name="j2" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1" rgba=".8 .8 .8 .3"/></body>
+</worldbody></mujoco>
+"""
+
+
+@pytest.fixture
+def two_model_session():
+    import mujoco
+    from mujoco_visualizer.serve.session import Session
+
+    primary = mujoco.MjModel.from_xml_string(_ONE_BODY)
+    alt = mujoco.MjModel.from_xml_string(_TWO_BODY)
+    s = Session(model=primary, alt_model=alt, width=64, height=48)
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+@pytest.mark.gl
+def test_swap_model_switches_nq_and_keeps_rendering(two_model_session):
+    """The ghost toggle's whole job: a different model, still rendering, right size."""
+    s = two_model_session
+    primary_nq = s.model.nq
+    s.swap_model("alt")
+    assert s.active_model_name == "alt"
+    assert s.model.nq != primary_nq
+    frame = s.render()
+    assert frame.shape == (s.height, s.width, 3)
+    s.swap_model("primary")
+    assert s.model.nq == primary_nq
+    assert s.render().shape == (s.height, s.width, 3)
+
+
+@pytest.mark.gl
+def test_swap_model_preserves_the_edited_look(two_model_session):
+    """A swap rebuilds the renderer; it must not silently reset the user's settings."""
+    s = two_model_session
+    s.apply_render({"vis_flags.shadows": False})
+    s.swap_model("alt")
+    assert s.viz.vis_state["vis_flags"]["shadows"] is False

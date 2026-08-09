@@ -86,6 +86,7 @@ class Session:
         height: int = 480,
         jpeg_quality: int = 75,
         backend: Optional[PhysicsBackend] = None,
+        alt_model: Optional[mujoco.MjModel] = None,
         **viz_kwargs,
     ):
         self.viz = Visualizer(
@@ -108,6 +109,15 @@ class Session:
         self.height = int(height)
         self.jpeg_quality = int(jpeg_quality)
         self._renderer = self.viz.make_renderer(height=self.height, width=self.width)
+
+        # A second prebuilt model the client can swap to (the reference-ghost pair). Kept
+        # compiled from the start because compiling is slow and, more importantly, because
+        # the swap has to happen on THIS thread -- the one holding the GL context -- and a
+        # client command must not be the thing that triggers a first-time compile there.
+        self._models = {"primary": self.model}
+        if alt_model is not None:
+            self._models["alt"] = alt_model
+        self._active_model = "primary"
 
         self._tree = build_control_tree(self.model)
         self._group_of = actuator_group_map(self._tree)
@@ -411,6 +421,60 @@ class Session:
             for part in parts[:-1]:
                 node = node.setdefault(part, {})
             node[parts[-1]] = value
+
+    @property
+    def active_model_name(self) -> str:
+        return self._active_model
+
+    def vis_state_snapshot(self) -> Dict:
+        """A deep copy of ``vis_state``, safe to hand to another thread.
+
+        An export job renders with the look the user had when they pressed the button, while
+        this thread keeps editing ``vis_state`` live. Sharing the dict would let a mid-export
+        colour change land halfway through the video -- and could raise "dictionary changed
+        size during iteration" in the job.
+        """
+        return copy.deepcopy(self.viz.vis_state)
+
+    def swap_model(self, which: str) -> None:
+        """Point this Session at one of its prebuilt models, rebuilding the renderer.
+
+        Costs ~400-560 ms (every mesh re-uploads), exactly like :meth:`resize`, so it is a
+        deliberate operation and never per-frame. Called only from the SimLoop thread, which
+        is the thread that owns the GL context.
+
+        The ghost pair cannot be a render flag: it is a second fly compiled into the model
+        (nq 101 -> 202). Hiding it by geom group was measured to recover almost none of its
+        cost (34.9 ms vs 37.1 ms) because the shadow pass still pays for hidden geometry --
+        so an always-ghost model would cost 27 fps even with the ghost invisible.
+        """
+        if which not in self._models:
+            if which in ("primary", "alt"):
+                raise ValueError(
+                    f"cannot swap to {which!r}: no alt_model was supplied to this Session"
+                )
+            raise ValueError(
+                f"unknown model {which!r}; have {sorted(self._models)}"
+            )
+        if which == self._active_model:
+            return
+
+        vis_state = copy.deepcopy(self.viz.vis_state)
+        old_renderer = self._renderer
+        self._renderer = None
+
+        model = self._models[which]
+        self.viz.rebind_model(model)
+        self.viz.vis_state = vis_state
+        self.model = self.viz.model
+        self.data = self.viz.data
+        self.backend = CpuBackend(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
+        self._warn_baseline[:] = 0
+        self._snapshot()
+        self._renderer = self.viz.make_renderer(height=self.height, width=self.width)
+        old_renderer.close()
+        self._active_model = which
 
     def load_settings(self, name: str) -> None:
         """Load a BUNDLED settings preset by name.
