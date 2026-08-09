@@ -61,6 +61,25 @@ _FATAL_WARNINGS = (
 )
 
 
+def _carry_vis_state_across_swap(vis_state: Dict, model: mujoco.MjModel) -> Dict:
+    """Drop ``geom_colors`` entries that don't exist on *model*, in place; return *vis_state*.
+
+    Category colours, lighting, floor, flags and camera are all model-agnostic and carry
+    across a swap unchanged. ``geom_colors`` is the one exception: it is keyed by geom id, and
+    ids are model-specific -- on the real reference-ghost pair the policy model has 274 geoms
+    and the ghost has 547, so a ghost->policy swap would otherwise leave ids >= 274 pointing at
+    geoms that no longer exist on the smaller model (wrong at best, an index error at worst).
+    Going the other way (policy->ghost) every existing id is still a valid prefix, so nothing
+    is dropped.
+    """
+    geom_colors = vis_state.get("geom_colors")
+    if geom_colors:
+        vis_state["geom_colors"] = {
+            gid: hexcolor for gid, hexcolor in geom_colors.items() if gid < model.ngeom
+        }
+    return vis_state
+
+
 class Session:
     """Owns the simulation and how it is drawn.
 
@@ -86,6 +105,7 @@ class Session:
         height: int = 480,
         jpeg_quality: int = 75,
         backend: Optional[PhysicsBackend] = None,
+        alt_model: Optional[mujoco.MjModel] = None,
         **viz_kwargs,
     ):
         self.viz = Visualizer(
@@ -108,6 +128,15 @@ class Session:
         self.height = int(height)
         self.jpeg_quality = int(jpeg_quality)
         self._renderer = self.viz.make_renderer(height=self.height, width=self.width)
+
+        # A second prebuilt model the client can swap to (the reference-ghost pair). Kept
+        # compiled from the start because compiling is slow and, more importantly, because
+        # the swap has to happen on THIS thread -- the one holding the GL context -- and a
+        # client command must not be the thing that triggers a first-time compile there.
+        self._models = {"primary": self.model}
+        if alt_model is not None:
+            self._models["alt"] = alt_model
+        self._active_model = "primary"
 
         self._tree = build_control_tree(self.model)
         self._group_of = actuator_group_map(self._tree)
@@ -411,6 +440,88 @@ class Session:
             for part in parts[:-1]:
                 node = node.setdefault(part, {})
             node[parts[-1]] = value
+
+    @property
+    def active_model_name(self) -> str:
+        return self._active_model
+
+    def vis_state_snapshot(self) -> Dict:
+        """A deep copy of ``vis_state``, safe to hand to another thread.
+
+        An export job renders with the look the user had when they pressed the button, while
+        this thread keeps editing ``vis_state`` live. Sharing the dict would let a mid-export
+        colour change land halfway through the video -- and could raise "dictionary changed
+        size during iteration" in the job.
+        """
+        return copy.deepcopy(self.viz.vis_state)
+
+    def swap_model(self, which: str) -> None:
+        """Point this Session at one of its prebuilt models, rebuilding the renderer.
+
+        Costs ~400-560 ms (every mesh re-uploads), exactly like :meth:`resize`, so it is a
+        deliberate operation and never per-frame. Called only from the SimLoop thread, which
+        is the thread that owns the GL context.
+
+        The ghost pair cannot be a render flag: it is a second fly compiled into the model
+        (nq 101 -> 202). Hiding it by geom group was measured to recover almost none of its
+        cost (34.9 ms vs 37.1 ms) because the shadow pass still pays for hidden geometry --
+        so an always-ghost model would cost 27 fps even with the ghost invisible.
+
+        Failure safety mirrors :meth:`resize`: nothing owned by this Session (``model``,
+        ``data``, ``backend``, ``_renderer``, ``_active_model``) is committed until rebind,
+        backend construction, ``mj_forward``, the snapshot, AND the new renderer have all
+        succeeded -- ``_renderer`` in particular is never set to ``None``, so a mid-swap
+        exception leaves ``render()`` serving the last good frame instead of crashing on it.
+        ``self.viz`` itself is mutated in place by ``rebind_model`` before that point (it has
+        no transaction of its own), so a failure there is rolled back explicitly by rebinding
+        it back to the old model before re-raising.
+        """
+        if which not in self._models:
+            if which in ("primary", "alt"):
+                raise ValueError(
+                    f"cannot swap to {which!r}: no alt_model was supplied to this Session"
+                )
+            raise ValueError(
+                f"unknown model {which!r}; have {sorted(self._models)}"
+            )
+        if which == self._active_model:
+            return
+
+        vis_state = copy.deepcopy(self.viz.vis_state)
+        old_renderer = self._renderer
+        old_model, old_data = self.model, self.data
+
+        model = self._models[which]
+        try:
+            self.viz.rebind_model(model)
+            new_model, new_data = self.viz.model, self.viz.data
+            new_backend = CpuBackend(new_model, new_data)
+            mujoco.mj_forward(new_model, new_data)
+            good = (new_data.qpos.copy(), new_data.qvel.copy(), float(new_data.time))
+            new_renderer = self.viz.make_renderer(height=self.height, width=self.width)
+        except Exception:
+            # rebind_model mutates self.viz.model/data (and their model-derived caches) in
+            # place and may already have partially committed before raising -- e.g. it sets
+            # self.viz.model before recomputing the caches that read it. Put the Visualizer
+            # back on the OLD model: cheap and safe, because the colour-baking it repeats is
+            # idempotent (geom_matid is already -1 from the first bake, so a second pass is a
+            # no-op), and then restore its ACTUAL previous MjData -- rebind_model would
+            # otherwise hand back a freshly zeroed one, silently discarding whatever
+            # pose/velocity the old model was really holding.
+            self.viz.rebind_model(old_model)
+            self.viz.data = old_data
+            raise
+
+        # Nothing below here can fail, so this is where the swap actually becomes real.
+        self.viz.vis_state = _carry_vis_state_across_swap(vis_state, new_model)
+        self.model = new_model
+        self.data = new_data
+        self.backend = new_backend
+        self._warn_baseline[:] = 0
+        self._good = good
+        self._renderer = new_renderer
+        old_renderer.close()
+        self._active_model = which
 
     def load_settings(self, name: str) -> None:
         """Load a BUNDLED settings preset by name.

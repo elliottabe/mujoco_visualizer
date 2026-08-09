@@ -20,7 +20,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import mujoco
 import numpy as np
@@ -311,6 +311,21 @@ def _save_image(frame: np.ndarray, output_path: str) -> None:
             )
 
 
+class _ModelInitVisuals(NamedTuple):
+    """The floor/light initial-state snapshot ``__init__`` needs to seed ``vis_state``.
+
+    Returned by :meth:`Visualizer._rebuild_model_derived_state` rather than stashed on
+    ``self``: ``__init__``'s ``vis_state`` literal is the only reader, so its correctness
+    should not depend on attributes a prior call happened to leave behind. ``rebind_model``
+    calls the same method and simply discards this -- ``vis_state`` already exists by the
+    time a rebind happens and is deliberately left alone.
+    """
+    lights: list
+    floor_rgb: list
+    floor_alpha: float
+    floor_mat_props: dict
+
+
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
@@ -418,6 +433,76 @@ class Visualizer:
 
         # Save originals for reset / color baking
         self._orig_geom_rgba = self.model.geom_rgba.copy()
+        _init_visuals = self._rebuild_model_derived_state()
+
+        # Initialize vis_state (mirrors notebook vis_state)
+        self.vis_state: dict = {
+            'colors':      {cat: self._cat_default_hex.get(cat, '#888888')
+                            for cat in self.anatomy.category_names},
+            'geom_colors': {},   # {geom_id (int): hex str} per-geom overrides
+            'alpha': 1.0,
+            'vis_flags': {
+                'contact_points': False, 'contact_forces': False,
+                'actuators': False, 'joints': False, 'transparent': False,
+                'shadows': True, 'wireframe': False,
+            },
+            'geom_groups': [True, True, True, True, False, False],
+            'site_groups':  [True, True, True, True, True,  False],
+            'camera': {
+                'mode': 'free', 'named': '',
+                'azimuth': 180.0, 'elevation': -30.0, 'distance': 0.3,
+                'lookat': [0.0, 0.0, 0.0],
+                'free_type': 'free', 'trackbody': '', 'fixedcamid': '',
+            },
+            'lighting': {
+                'lights': _init_visuals.lights,
+                'use_dual_lighting':   False,
+                'use_scale_lights':    False,
+                'scale_lights_factor': 1.25,
+                'headlight': {
+                    'active':   bool(self.model.vis.headlight.active),
+                    'ambient':  list(map(float, self.model.vis.headlight.ambient)),
+                    'diffuse':  list(map(float, self.model.vis.headlight.diffuse)),
+                    'specular': list(map(float, self.model.vis.headlight.specular)),
+                },
+            },
+            'floor': {
+                'color':       _rgb_to_hex(_init_visuals.floor_rgb),
+                'alpha':       _init_visuals.floor_alpha,
+                'texrepeat_x': _init_visuals.floor_mat_props['texrepeat'][0],
+                'texrepeat_y': _init_visuals.floor_mat_props['texrepeat'][1],
+                'reflectance': _init_visuals.floor_mat_props['reflectance'],
+                'shininess':   _init_visuals.floor_mat_props['shininess'],
+                'emission':    _init_visuals.floor_mat_props['emission'],
+            },
+            'skybox': {
+                'show':    True,
+                'sky_top': _rgb_to_hex([0.4, 0.6, 0.8]),
+                'sky_bot': _rgb_to_hex([0.0, 0.0, 0.0]),
+            },
+            'camera_presets': {},
+        }
+
+        if settings_json is not None:
+            self.load_settings(settings_json)
+
+    def _rebuild_model_derived_state(self) -> _ModelInitVisuals:
+        """(Re)compute everything derived purely from ``self.model``: baked colors, geom
+        categories, floor/skybox/light detection, and per-category default hex.
+
+        Called from ``__init__`` and from :meth:`rebind_model`. Deliberately does NOT touch
+        ``vis_state`` -- a rebind must be able to either carry the caller's current look
+        across to the new model (:meth:`Session.swap_model` does exactly this) or leave it to
+        be replaced wholesale, and clobbering it here would make both impossible.
+
+        Callers must set ``self._orig_geom_rgba = self.model.geom_rgba.copy()`` before calling
+        this, since baking below reads it as the pre-bake original.
+
+        Returns the floor/light initial-state snapshot (see :class:`_ModelInitVisuals`) so
+        ``__init__`` can fold it straight into its ``vis_state`` literal without depending on
+        instance attributes this method happens to leave behind; ``rebind_model`` calls this
+        for its side effects alone and discards the return value.
+        """
         self._orig_mat_rgba  = self.model.mat_rgba.copy()
 
         # Build body-segment → geom_id categorization
@@ -524,57 +609,12 @@ class Visualizer:
                 'specular': list(map(float, self.model.light_specular[li])),
                 'dir_az': az, 'dir_el': el,
             })
-
-        # Initialize vis_state (mirrors notebook vis_state)
-        self.vis_state: dict = {
-            'colors':      {cat: self._cat_default_hex.get(cat, '#888888')
-                            for cat in self.anatomy.category_names},
-            'geom_colors': {},   # {geom_id (int): hex str} per-geom overrides
-            'alpha': 1.0,
-            'vis_flags': {
-                'contact_points': False, 'contact_forces': False,
-                'actuators': False, 'joints': False, 'transparent': False,
-                'shadows': True, 'wireframe': False,
-            },
-            'geom_groups': [True, True, True, True, False, False],
-            'site_groups':  [True, True, True, True, True,  False],
-            'camera': {
-                'mode': 'free', 'named': '',
-                'azimuth': 180.0, 'elevation': -30.0, 'distance': 0.3,
-                'lookat': [0.0, 0.0, 0.0],
-                'free_type': 'free', 'trackbody': '', 'fixedcamid': '',
-            },
-            'lighting': {
-                'lights': _init_lights,
-                'use_dual_lighting':   False,
-                'use_scale_lights':    False,
-                'scale_lights_factor': 1.25,
-                'headlight': {
-                    'active':   bool(self.model.vis.headlight.active),
-                    'ambient':  list(map(float, self.model.vis.headlight.ambient)),
-                    'diffuse':  list(map(float, self.model.vis.headlight.diffuse)),
-                    'specular': list(map(float, self.model.vis.headlight.specular)),
-                },
-            },
-            'floor': {
-                'color':       _rgb_to_hex(_floor_rgb),
-                'alpha':       _floor_alpha,
-                'texrepeat_x': _floor_mat_props['texrepeat'][0],
-                'texrepeat_y': _floor_mat_props['texrepeat'][1],
-                'reflectance': _floor_mat_props['reflectance'],
-                'shininess':   _floor_mat_props['shininess'],
-                'emission':    _floor_mat_props['emission'],
-            },
-            'skybox': {
-                'show':    True,
-                'sky_top': _rgb_to_hex([0.4, 0.6, 0.8]),
-                'sky_bot': _rgb_to_hex([0.0, 0.0, 0.0]),
-            },
-            'camera_presets': {},
-        }
-
-        if settings_json is not None:
-            self.load_settings(settings_json)
+        return _ModelInitVisuals(
+            lights=_init_lights,
+            floor_rgb=_floor_rgb,
+            floor_alpha=_floor_alpha,
+            floor_mat_props=_floor_mat_props,
+        )
 
     # ── Settings I/O ─────────────────────────────────────────────────────────
 
@@ -859,6 +899,26 @@ class Visualizer:
         Prefer :meth:`render_frame` / :meth:`render_with`, which reuse a cached one.
         """
         return mujoco.Renderer(self.model, height=height, width=width)
+
+    def rebind_model(self, model: mujoco.MjModel) -> None:
+        """Point this Visualizer at a different compiled model, keeping its settings.
+
+        Rebuilds only what is derived from the model: the pristine colour/lighting baselines
+        used for reset and colour baking, the geom categories, and ``data``. ``vis_state`` is
+        left alone deliberately -- the caller may want to carry the current look across
+        (Session.swap_model does) or replace it wholesale.
+
+        Any cached renderer belongs to the OLD model's context and would draw the old
+        geometry, so it is dropped here rather than left to be reused.
+        """
+        if self._renderer_cache is not None:
+            self._renderer_cache.close()
+            self._renderer_cache = None
+            self._renderer_key = None
+        self.model = model
+        self.data = mujoco.MjData(model)
+        self._orig_geom_rgba = self.model.geom_rgba.copy()
+        self._rebuild_model_derived_state()
 
     def _cached_renderer(self, height: int, width: int) -> mujoco.Renderer:
         """The reused Renderer for (height, width), building it on first use.

@@ -691,3 +691,190 @@ def test_load_settings_accepts_a_bundled_preset_name(sess):
     from mujoco_visualizer import list_available_settings
 
     sess.load_settings(list_available_settings()[0])  # must not raise
+
+
+# -- vis_state_snapshot / swap_model ----------------------------------------
+#
+# NOTE: the task brief's snippets name the single-model fixture `session`, but this file's
+# existing fixture for "one small model, width=64, height=64" is `sess` -- there is no
+# `session` fixture anywhere in this package. Using `sess` here rather than introducing a
+# duplicate fixture under a second name.
+
+
+def test_vis_state_snapshot_is_a_deep_copy(sess):
+    snap = sess.vis_state_snapshot()
+    snap["vis_flags"]["shadows"] = "mutated"
+    assert sess.viz.vis_state["vis_flags"]["shadows"] != "mutated"
+
+
+def test_active_model_name_defaults_to_primary(sess):
+    assert sess.active_model_name == "primary"
+
+
+def test_swap_model_without_alt_raises(sess):
+    with pytest.raises(ValueError, match="no alt_model"):
+        sess.swap_model("alt")
+
+
+def test_swap_model_rejects_unknown_name(sess):
+    with pytest.raises(ValueError, match="unknown"):
+        sess.swap_model("ghost")
+
+
+_ONE_BODY = """
+<mujoco><worldbody>
+  <body name="b1"><joint name="j1" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1"/></body>
+</worldbody></mujoco>
+"""
+
+_TWO_BODY = """
+<mujoco><worldbody>
+  <body name="b1"><joint name="j1" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1"/></body>
+  <body name="b2" pos="0 .5 0"><joint name="j2" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1" rgba=".8 .8 .8 .3"/></body>
+</worldbody></mujoco>
+"""
+
+
+@pytest.fixture
+def two_model_session():
+    import mujoco
+    from mujoco_visualizer.serve.session import Session
+
+    primary = mujoco.MjModel.from_xml_string(_ONE_BODY)
+    alt = mujoco.MjModel.from_xml_string(_TWO_BODY)
+    s = Session(model=primary, alt_model=alt, width=64, height=48)
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+@pytest.mark.gl
+def test_swap_model_switches_nq_and_keeps_rendering(two_model_session):
+    """The ghost toggle's whole job: a different model, still rendering, right size."""
+    s = two_model_session
+    primary_nq = s.model.nq
+    s.swap_model("alt")
+    assert s.active_model_name == "alt"
+    assert s.model.nq != primary_nq
+    frame = s.render()
+    assert frame.shape == (s.height, s.width, 3)
+    s.swap_model("primary")
+    assert s.model.nq == primary_nq
+    assert s.render().shape == (s.height, s.width, 3)
+
+
+@pytest.mark.gl
+def test_swap_model_preserves_the_edited_look(two_model_session):
+    """A swap rebuilds the renderer; it must not silently reset the user's settings."""
+    s = two_model_session
+    s.apply_render({"vis_flags.shadows": False})
+    s.swap_model("alt")
+    assert s.viz.vis_state["vis_flags"]["shadows"] is False
+
+
+# -- Fix round 1: failure safety, hidden self-state, and stale geom ids ------
+
+
+@pytest.mark.gl
+def test_swap_model_rolls_back_on_a_transient_failure(two_model_session, monkeypatch):
+    """A failure partway through the rebind must not leave the renderer null nor the
+    Visualizer half-migrated to the new model.
+
+    ``Visualizer.rebind_model`` sets ``self.model`` to the new model, THEN recomputes the
+    caches that read it (``_rebuild_model_derived_state``) -- so a failure in that second step
+    is exactly the scenario where ``self.viz.model`` can already be the new model while
+    everything else on the Session is still the old one. Patched to fail only on the first
+    call (the swap's own attempt) and succeed on the second (swap_model's own rollback), which
+    models a transient failure -- e.g. a one-off allocation error -- rather than a permanently
+    broken model, and is exactly the case the rollback exists to recover from.
+    """
+    import mujoco_visualizer.visualizer as viz_mod
+
+    s = two_model_session
+    primary_nq = s.model.nq
+    original = viz_mod.Visualizer._rebuild_model_derived_state
+    calls = {"n": 0}
+
+    def flaky(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("simulated transient rebind failure")
+        return original(self)
+
+    monkeypatch.setattr(viz_mod.Visualizer, "_rebuild_model_derived_state", flaky)
+
+    with pytest.raises(RuntimeError, match="simulated transient rebind failure"):
+        s.swap_model("alt")
+
+    assert calls["n"] == 2  # the swap's own attempt, then swap_model's rollback
+    assert s.active_model_name == "primary"
+    assert s.model.nq == primary_nq
+    assert s.viz.model is s.model
+    assert s.viz.data is s.data
+    frame = s.render()
+    assert frame.shape == (s.height, s.width, 3)
+    # The Session must still be fully usable afterwards, not just able to render once.
+    s.swap_model("alt")
+    assert s.active_model_name == "alt"
+    assert s.render().shape == (s.height, s.width, 3)
+
+
+@pytest.mark.gl
+def test_swap_model_keeps_the_old_renderer_live_if_the_new_one_fails_to_build(
+    two_model_session, monkeypatch
+):
+    """The literal bug this all started from: ``self._renderer`` must never be nulled before
+    the replacement exists, so a failure in :meth:`Visualizer.make_renderer` itself -- the
+    step most analogous to a GL-context hiccup during :meth:`Session.resize` -- must leave
+    ``render()`` still serving the last good frame instead of crashing on ``None``.
+    """
+    s = two_model_session
+
+    def boom(*a, **kw):
+        raise RuntimeError("simulated GL failure building the new renderer")
+
+    monkeypatch.setattr(s.viz, "make_renderer", boom)
+
+    with pytest.raises(RuntimeError, match="simulated GL failure"):
+        s.swap_model("alt")
+
+    assert s.active_model_name == "primary"
+    assert s._renderer is not None
+    frame = s.render()
+    assert frame.shape == (s.height, s.width, 3)
+
+
+def test_rebuild_model_derived_state_returns_rather_than_stashes(sess):
+    """Regression for the hidden self-state finding: __init__'s vis_state literal must not
+    depend on attributes a prior call happened to leave on ``self`` -- the floor/light
+    baseline is returned, not stashed, and nothing under that old name lingers on the
+    instance."""
+    result = sess.viz._rebuild_model_derived_state()
+    assert hasattr(result, "lights")
+    assert hasattr(result, "floor_rgb")
+    assert hasattr(result, "floor_alpha")
+    assert hasattr(result, "floor_mat_props")
+    for leaked_name in ("_init_lights", "_init_floor_rgb", "_init_floor_alpha",
+                        "_init_floor_mat_props"):
+        assert not hasattr(sess.viz, leaked_name)
+
+
+@pytest.mark.gl
+def test_swap_model_drops_geom_colors_that_do_not_exist_on_the_new_model(two_model_session):
+    """``geom_colors`` is keyed by geom id, and ids are model-specific: swapping from the
+    bigger model (2 geoms) to the smaller one (1 geom) must drop the id that no longer exists
+    rather than carry a dangling reference across -- while the still-valid id survives."""
+    s = two_model_session
+    s.swap_model("alt")  # alt (_TWO_BODY) has geom ids 0 and 1
+    assert s.model.ngeom == 2
+    s.apply_render({"geom_colors": {0: "#ff0000", 1: "#00ff00"}})
+    assert s.viz.vis_state["geom_colors"] == {0: "#ff0000", 1: "#00ff00"}
+
+    s.swap_model("primary")  # primary (_ONE_BODY) has only geom id 0
+
+    assert s.model.ngeom == 1
+    assert s.viz.vis_state["geom_colors"] == {0: "#ff0000"}
