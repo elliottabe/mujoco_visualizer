@@ -41,8 +41,9 @@ _SIM_CMDS = frozenset({"play", "pause", "step", "reset"})
 _MODES = frozenset({"absolute", "additive"})
 
 # Types whose messages fully supersede an earlier one of the same type: only the last
-# matters. ``ctrl``, ``ctrl_group``, ``replay`` and ``render`` are merged instead (see
-# :func:`coalesce`).
+# matters. ``ctrl``, ``ctrl_group``, ``replay``, ``lock`` and ``render`` are merged instead
+# (see :func:`coalesce`). Keep this list exhaustive: a half-updated enumeration reads as
+# current and is worse than a visibly stale one.
 #
 # ``replay`` is deliberately NOT here. Wholesale last-wins was correct when the command
 # carried only ``{load, frame, play}``; it now carries eight independent fields, and dropping
