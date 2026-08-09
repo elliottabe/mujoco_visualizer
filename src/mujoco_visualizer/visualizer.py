@@ -365,6 +365,7 @@ class Visualizer:
         attach_body: Optional[str] = None,
         suffix: str = '',
         model_transform: Optional[Callable] = None,
+        excluded_suffix: Optional[str] = None,
     ):
         """
         Args:
@@ -384,6 +385,8 @@ class Visualizer:
             model_transform: Optional callable ``MjSpec -> MjSpec`` applied
                              before compile. Use for domain-specific tweaks
                              (e.g. fly flight setup).
+            excluded_suffix: Geom-name suffix excluded from category colouring
+                             (see ``self.excluded_suffix`` below).
         """
         if sum(x is not None for x in (xml_path, model, spec)) > 1:
             raise ValueError("Provide only one of xml_path, model, or spec.")
@@ -391,6 +394,12 @@ class Visualizer:
         if not isinstance(anatomy, AnatomyConfig):
             anatomy = load_config(anatomy)
         self.anatomy: AnatomyConfig = anatomy
+
+        # Geoms whose name ends with this are excluded from category colouring and get the
+        # `ghost` tint/alpha instead. Passed in rather than hardcoded: this package must not
+        # know that the caller's second body is a "-ghost" fly. When None, nothing is excluded
+        # and behaviour is exactly as before.
+        self.excluded_suffix = excluded_suffix
 
         # --- Build the spec / model ---
         if joint_names is not None:
@@ -441,6 +450,10 @@ class Visualizer:
                             for cat in self.anatomy.category_names},
             'geom_colors': {},   # {geom_id (int): hex str} per-geom overrides
             'alpha': 1.0,
+            # Applied only to geoms matching `excluded_suffix`. alpha here REPLACES the global
+            # alpha for those geoms rather than multiplying with it, so the number a UI shows is
+            # the alpha that renders.
+            'ghost': {'tint': '#cccccc', 'alpha': 0.3},
             'vis_flags': {
                 'contact_points': False, 'contact_forces': False,
                 'actuators': False, 'joints': False, 'transparent': False,
@@ -531,10 +544,16 @@ class Visualizer:
         # Hide *_inertial helper geoms (e.g. wing_left_inertial bounding box).
         # Substring check catches MjSpec.attach_body(..., suffix=...) renames
         # such as wing_left_inertial_fly1.
+        # Also resolve which geoms are excluded from category colouring (see
+        # ``self.excluded_suffix`` in __init__), by geom name rather than category, since an
+        # excluded geom otherwise falls into the very same category as its non-excluded twin.
+        self._excluded_geom_ids: set = set()
         for gid in range(self.model.ngeom):
             gname = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, gid) or ''
             if '_inertial' in gname:
                 self.model.geom_rgba[gid, 3] = 0.0
+            if self.excluded_suffix and gname.endswith(self.excluded_suffix):
+                self._excluded_geom_ids.add(gid)
 
         # Refresh originals after baking
         self._orig_geom_rgba = self.model.geom_rgba.copy()
@@ -709,10 +728,20 @@ class Visualizer:
     def _apply_geom_colors(self) -> None:
         alpha = self.vis_state['alpha']
         geom_overrides = self.vis_state['geom_colors']
+        excluded_ids = self._excluded_geom_ids
+        ghost = self.vis_state['ghost']
+        ghost_rgb = _hex_to_rgb(ghost['tint'])
         for cat, idxs in self._geom_categories.items():
             cat_rgb = _hex_to_rgb(self.vis_state['colors'].get(cat, '#888888'))
             for i in idxs:
                 if self._orig_geom_rgba[i, 3] < 0.01:
+                    continue
+                if i in excluded_ids:
+                    # Excluded geoms (see `excluded_suffix`) never take the category colour or
+                    # per-geom override -- they get the ghost tint, and ghost.alpha REPLACES
+                    # rather than multiplies the global alpha here.
+                    self.model.geom_rgba[i, :3] = ghost_rgb
+                    self.model.geom_rgba[i,  3] = ghost['alpha']
                     continue
                 rgb = _hex_to_rgb(geom_overrides[i]) if i in geom_overrides else cat_rgb
                 self.model.geom_rgba[i, :3] = rgb
