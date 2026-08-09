@@ -30,7 +30,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from flask import Flask, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_sock import Sock
 
 from mujoco_visualizer.serve.loop import SimLoop
@@ -146,7 +146,7 @@ def _ws_loop(sock_conn, loop, session=None) -> None:
         loop.client_left()
 
 
-def create_app(loop, session, extra_static: Optional[Path] = None) -> Flask:
+def create_app(loop, session, extra_static: Optional[Path] = None, clip_info=None) -> Flask:
     """Build the Flask app around a running (or runnable) *loop* and *session*.
 
     *extra_static* lets a host project (e.g. vnc_explorer) serve its own panel JS from
@@ -156,6 +156,11 @@ def create_app(loop, session, extra_static: Optional[Path] = None) -> Flask:
     runs on a Flask request thread, and the Session belongs to the simulation thread (see
     ``_ws_loop``). Scene data comes from ``loop.scene()``, which the simulation thread
     publishes.
+
+    *clip_info*, when given, adds ``/api/clips`` and ``/api/series``. It must be READ-ONLY
+    and immutable: these routes run on Flask request threads, so a provider that lazily
+    read HDF5 or mutated a cache would be doing it concurrently with the simulation thread.
+    The fly launcher satisfies this by loading every metric into numpy at startup.
     """
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
     sock = Sock(app)
@@ -170,6 +175,27 @@ def create_app(loop, session, extra_static: Optional[Path] = None) -> Flask:
         # it answers before the first frame and keeps answering after Session.close() -- where
         # calling session.scene_message() would raise AttributeError on the dropped backend.
         return jsonify(loop.scene())
+
+    if clip_info is not None:
+
+        @app.get("/api/clips")
+        def clips():
+            return jsonify(clip_info.clips())
+
+        @app.get("/api/series")
+        def series():
+            raw_clip = request.args.get("clip", "")
+            key = request.args.get("key", "")
+            try:
+                clip = int(raw_clip)
+            except (TypeError, ValueError):
+                return jsonify({"error": f"clip must be an integer, got {raw_clip!r}"}), 400
+            try:
+                return jsonify(clip_info.series(clip, key))
+            except (KeyError, IndexError, ValueError) as exc:
+                # Named 400s rather than a 500 traceback: both are reachable from a URL a
+                # user can type or a stale client can send.
+                return jsonify({"error": str(exc)}), 400
 
     if extra_static is not None:
 

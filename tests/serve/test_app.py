@@ -252,3 +252,62 @@ def test_errors_and_frame_warnings_live_in_separate_dom_elements(client):
     # And the error branch no longer routes through the per-frame warning banner.
     assert "showWarn(`${msg.kind}" not in js
     assert "#errbanner" in css
+
+
+# -- /api/clips and /api/series -------------------------------------------------------
+
+
+class FakeLoop:
+    """Minimal loop stub for clip/series tests."""
+
+    def scene(self):
+        return {}
+
+
+class FakeClipInfo:
+    def clips(self):
+        return {"n_clips": 2, "columns": ["clip", "mean_reward"],
+                "rows": [{"clip": 0, "mean_reward": 3.5},
+                         {"clip": 1, "mean_reward": 3.9}]}
+
+    def series(self, clip, key):
+        if key not in ("reward", "joint_error"):
+            raise KeyError(f"unknown series key {key!r}")
+        if not 0 <= clip < 2:
+            raise IndexError(f"clip {clip} out of range")
+        return {"clip": clip, "key": key, "frames": [0, 1], "values": [0.1, 0.2],
+                "keys": ["reward", "joint_error"]}
+
+
+def test_api_clips_returns_the_provider_payload():
+    app = create_app(FakeLoop(), None, clip_info=FakeClipInfo())
+    resp = app.test_client().get("/api/clips")
+    assert resp.status_code == 200
+    assert resp.get_json()["n_clips"] == 2
+
+
+def test_api_series_returns_a_trace():
+    app = create_app(FakeLoop(), None, clip_info=FakeClipInfo())
+    resp = app.test_client().get("/api/series?clip=1&key=reward")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["clip"] == 1 and body["values"] == [0.1, 0.2]
+
+
+def test_api_series_rejects_a_bad_key_with_400():
+    app = create_app(FakeLoop(), None, clip_info=FakeClipInfo())
+    resp = app.test_client().get("/api/series?clip=0&key=nope")
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+def test_api_series_rejects_a_bad_clip_with_400():
+    app = create_app(FakeLoop(), None, clip_info=FakeClipInfo())
+    assert app.test_client().get("/api/series?clip=9&key=reward").status_code == 400
+    assert app.test_client().get("/api/series?clip=x&key=reward").status_code == 400
+
+
+def test_clip_routes_404_without_a_provider():
+    app = create_app(FakeLoop(), None)
+    assert app.test_client().get("/api/clips").status_code == 404
+    assert app.test_client().get("/api/series?clip=0&key=reward").status_code == 404
