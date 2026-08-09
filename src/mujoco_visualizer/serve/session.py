@@ -25,6 +25,7 @@ from mujoco_visualizer import Visualizer, list_available_settings
 from mujoco_visualizer.render_settings import PRESET_NAME_RE
 from mujoco_visualizer.serve.backends import CpuBackend, PhysicsBackend, UnknownKeyframe
 from mujoco_visualizer.serve.controls import actuator_group_map, build_control_tree
+from mujoco_visualizer.serve.locks import build_joint_qpos_map
 
 
 class Diverged(RuntimeError):
@@ -705,6 +706,15 @@ class Session:
             "nu": int(self.model.nu),
             "timestep": float(self.model.opt.timestep),
             "controls": self._tree,
+            # Ordered lockable joints -- rebuilt from the CURRENT model every call (cheap: one
+            # pass over njnt) rather than cached in __init__, so a swap_model() is reflected
+            # without a separate invalidation path. Without this a client only ever learns
+            # which joints are locked (frame_meta.locks), never which are lockable, so a lock
+            # panel could not be built.
+            "joints": [
+                {"name": name, "width": width}
+                for name, (_adr, width) in build_joint_qpos_map(self.model).items()
+            ],
             "cameras": self.viz.list_cameras(),
             "presets": self.viz.list_presets(),
             "settings": copy.deepcopy(self.viz.vis_state),

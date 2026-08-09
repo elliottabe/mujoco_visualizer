@@ -5,12 +5,83 @@ import contextlib
 import threading
 import time
 
+import mujoco
 import numpy as np
 import pytest
 
 from mujoco_visualizer.serve.loop import SimLoop
 from mujoco_visualizer.serve.replay import ArrayTrajectorySource
 from mujoco_visualizer.serve.session import Diverged
+
+# A tiny real model for the lock tests: three independent hinge DOFs (nq == 3, matching
+# make_source()'s default), so build_joint_qpos_map is exercised for real instead of a faked
+# map. "joint0" is left unlocked in every lock test (dof 0 already encodes the frame index, per
+# make_source below) and "joint1"/"joint2" are free to be locked without disturbing it.
+_LOCK_XML = """
+<mujoco>
+  <!-- timestep pinned to 1e-4: _physics_steps_per_control_step reads model.opt.timestep once
+       a session HAS a `.model` (which FakeSession now does, for build_joint_qpos_map), and
+       every controller-rate test in this file (e.g. RampSession) is written assuming exactly
+       the dt=1e-4 MuJoCo's own default (2e-3) would silently replace. -->
+  <option timestep="0.0001"/>
+  <worldbody>
+    <body name="b0"><joint name="joint0" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b1"><joint name="joint1" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b2"><joint name="joint2" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+  </worldbody>
+</mujoco>
+"""
+_LOCK_MODEL = mujoco.MjModel.from_xml_string(_LOCK_XML)
+
+# The "ghost" counterpart: same nq (3), but the middle joint is named as if it were a
+# suffixed reference copy -- proof that a loop's cached joint map is rebuilt from THIS model,
+# not the primary one, once a ghost swap lands (see
+# test_the_joint_map_rebuilds_after_a_ghost_model_swap).
+_LOCK_ALT_XML = """
+<mujoco>
+  <option timestep="0.0001"/>
+  <worldbody>
+    <body name="b0"><joint name="joint0" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b1"><joint name="joint1_ref" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b2"><joint name="joint2" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+  </worldbody>
+</mujoco>
+"""
+_LOCK_ALT_MODEL = mujoco.MjModel.from_xml_string(_LOCK_ALT_XML)
+
+# An nq-CHANGING ghost pair: primary's three joints kept at the SAME names/addresses (0, 1, 2),
+# plus a suffixed reference copy of each appended after them (3, 4, 5) -- the actual shape of a
+# real doubled ghost model (policy + suffixed reference), and the one shape review round 1
+# found the swap fixture above (which keeps nq == 3 throughout) could not exercise: a lock
+# resolved/expanded against the OLD (narrower) map or qpos and then addressed against the NEW
+# (wider) one is exactly what silently truncates via numpy's past-the-end slicing rather than
+# raising.
+_LOCK_WIDE_ALT_XML = """
+<mujoco>
+  <option timestep="0.0001"/>
+  <worldbody>
+    <body name="b0"><joint name="joint0" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b1"><joint name="joint1" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b2"><joint name="joint2" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b0r"><joint name="joint0_ref" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b1r"><joint name="joint1_ref" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b2r"><joint name="joint2_ref" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+  </worldbody>
+</mujoco>
+"""
+_LOCK_WIDE_ALT_MODEL = mujoco.MjModel.from_xml_string(_LOCK_WIDE_ALT_XML)
 
 
 class FakeSession:
@@ -37,6 +108,10 @@ class FakeSession:
         self.qpos_writes = []
         self.model_swaps = []
         self.pose = None
+        # For build_joint_qpos_map to exercise a real model. See _LOCK_MODEL/_LOCK_ALT_MODEL
+        # above; swap_model below actually switches this, mirroring the real Session so a
+        # ghost toggle is visible to SimLoop's own joint-map cache, not just recorded here.
+        self.model = _LOCK_MODEL
 
     # -- surface SimLoop uses --
     @property
@@ -102,6 +177,7 @@ class FakeSession:
 
     def swap_model(self, which):
         self.model_swaps.append(which)
+        self.model = _LOCK_ALT_MODEL if which == "alt" else _LOCK_MODEL
 
     def vis_state_snapshot(self):
         return {}
@@ -119,6 +195,17 @@ class FakeSession:
 
     def close(self):
         self.closed = True
+
+
+class WideGhostFakeSession(FakeSession):
+    """Swaps to ``_LOCK_WIDE_ALT_MODEL`` (nq changes 3 -> 6) instead of the nq-preserving
+    ``_LOCK_ALT_MODEL`` -- see review round 1: a fixture that keeps nq constant across every
+    swap cannot exercise the stale-width truncation bug (a lock resolved/expanded against one
+    map's addresses and then read against a different, WIDER map's ``qpos``)."""
+
+    def swap_model(self, which):
+        self.model_swaps.append(which)
+        self.model = _LOCK_WIDE_ALT_MODEL if which == "alt" else _LOCK_MODEL
 
 
 def wait_until(predicate, timeout=5.0):
@@ -570,8 +657,8 @@ def make_source(n_clips=2, n_frames=10, nq=3):
 
 
 @contextlib.contextmanager
-def running_replay_loop(source=None, **kw):
-    session = FakeSession()
+def running_replay_loop(source=None, session_cls=FakeSession, **kw):
+    session = session_cls()
     loop = SimLoop(session, source=source or make_source(), fps_cap=1000.0, idle_pause_s=None, **kw)
     thread = threading.Thread(target=loop.run, daemon=True)
     thread.start()
@@ -987,6 +1074,172 @@ def test_step_at_out_stays_at_out_when_not_looping():
         assert loop.playing is False
 
 
+# -- joint locks ---------------------------------------------------------------
+
+
+def test_locked_joint_holds_while_an_unlocked_neighbour_moves():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        loop.submit({"t": "replay", "play": True})
+        time.sleep(0.3)
+        loop.submit({"t": "replay", "play": False})
+        time.sleep(0.1)
+        writes = session.qpos_writes
+        assert len(writes) > 3
+        assert all(w[1] == 5.0 for w in writes[1:]), "the locked dof must hold"
+        assert len({w[0] for w in writes}) > 1, "an unlocked dof must still move"
+
+
+def test_null_lock_freezes_at_the_value_held_when_it_engaged():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 4})
+        time.sleep(0.15)
+        held = session.qpos_writes[-1][1]
+        loop.submit({"t": "lock", "set": {"joint1": None}})
+        loop.submit({"t": "replay", "frame": 8})
+        time.sleep(0.15)
+        assert session.qpos_writes[-1][1] == held
+
+
+def test_clear_releases_every_lock():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        time.sleep(0.1)
+        loop.submit({"t": "lock", "clear": True})
+        time.sleep(0.1)
+        assert loop.locks == {}
+        # Not just the bookkeeping: a fresh write after `clear` must be the RAW frame, not a
+        # stale locked array kept alive by something still holding the old value.
+        loop.submit({"t": "replay", "frame": 2})
+        time.sleep(0.15)
+        assert session.qpos_writes[-1][1] == make_source().qpos(0, 2)[1]
+
+
+def test_locks_ride_the_frame_meta():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        time.sleep(0.15)
+        got = loop.wait_for_frame(-1, timeout=1.0)
+        assert got is not None
+        assert got[2]["locks"] == {"joint1": [5.0]}
+
+
+def test_an_unknown_joint_reports_a_command_error_without_pausing():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "play": True})
+        time.sleep(0.1)
+        loop.submit({"t": "lock", "set": {"not_a_joint": 1.0}})
+        time.sleep(0.15)
+        err = loop.error
+        assert err is not None and err["kind"] == "command" and err["paused"] is False
+        assert loop.playing is True
+
+
+def test_the_joint_map_rebuilds_after_a_ghost_model_swap():
+    """``_LOCK_ALT_MODEL`` renames the middle joint from ``joint1`` to ``joint1_ref`` -- so
+    this only passes if the loop's cached joint map is actually rebuilt against the NEW
+    model, not reused from the primary one (which has no ``joint1_ref`` at all, and would
+    reject it as an unknown-joint command error just like the plain unknown-joint case
+    above)."""
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1_ref": 1.0}})
+        time.sleep(0.1)
+        assert loop.error is not None and loop.error["kind"] == "command"
+        assert loop.locks == {}, "a name only the (not yet active) alt model has must be rejected"
+
+        loop.submit({"t": "replay", "ghost": True})
+        time.sleep(0.15)
+        assert session.model_swaps == ["alt"]
+
+        loop.submit({"t": "lock", "set": {"joint1_ref": 9.0}})
+        # A `lock` command alone does not mark the playhead dirty (only a `replay` command
+        # does), so a scrub is needed here to force a fresh write to actually observe the
+        # lock take effect -- otherwise this would only be re-checking the write the ghost
+        # swap's own dirty flag already produced, before the lock existed.
+        loop.submit({"t": "replay", "frame": 5})
+        time.sleep(0.15)
+        assert loop.locks == {"joint1_ref": [9.0]}
+        assert session.qpos_writes[-1][1] == 9.0, "the lock took effect on the next write"
+
+
+# -- review round 1: locks must survive (or be safely dropped by) a model swap ------------
+
+
+def test_a_stale_lock_does_not_survive_a_swap_that_drops_its_name():
+    """Hole B (review round 1). ``joint1`` is locked, then a swap to ``_LOCK_ALT_MODEL``
+    renames it to ``joint1_ref`` -- the old model's ``joint1`` does not exist on the new one
+    at all. Before the fix the stale entry survived the swap, and the very next write's
+    ``apply_locks`` call raised ``KeyError`` for a joint that no longer exists -- escaping as a
+    PAUSED ``kind='replay'`` error that killed playback until the lock was cleared by hand.
+    The fix releases every lock on a swap, so the stale entry cannot outlive the model it was
+    resolved against."""
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        time.sleep(0.1)
+        assert loop.locks == {"joint1": [5.0]}
+
+        loop.submit({"t": "replay", "ghost": True})
+        time.sleep(0.15)
+        assert session.model_swaps == ["alt"]
+        assert loop.locks == {}, "a lock naming a joint the new model dropped must not survive"
+        assert loop.error is None or loop.error["kind"] != "replay", (
+            "a dropped-name lock must never surface as a paused replay error"
+        )
+
+        # And playback is not stuck: a fresh write must actually land.
+        writes_before = len(session.qpos_writes)
+        loop.submit({"t": "replay", "frame": 3})
+        assert wait_until(lambda: len(session.qpos_writes) > writes_before)
+
+
+def test_a_null_lock_and_ghost_toggle_in_one_batch_cannot_pause_playback():
+    """Hole A (review round 1). ``joint1`` is paired, via ``ghost_suffix``, with
+    ``joint1_ref`` -- which exists only on the WIDE alt model (nq 3 -> 6), not the primary one.
+    Submitting the ``ghost`` toggle and a ``None``-valued lock with no sleep between them is
+    intended to land both in the SAME drain batch, so ``_apply`` processes the swap (which
+    invalidates and lazily rebuilds the joint map) before ``_apply_lock`` runs.
+
+    At that point ``pair_with_suffix`` sees the NEW, wide map (so it also expands to
+    ``joint1_ref``), while ``self._last_written_qpos`` is still the frame written on the OLD,
+    narrow (nq=3) model -- exactly the mismatch that makes ``resolve_lock_values`` slice past
+    the end of the stale array and silently truncate to an empty list for ``joint1_ref``,
+    instead of raising. Before the fix that mis-width entry was stored anyway and only failed
+    later, inside the write path, as a PAUSED ``kind='replay'`` error. The fix (the width check
+    on the resolved value, applied before anything is committed) must catch it HERE instead, as
+    a non-pausing ``kind='command'`` error, with nothing partially locked.
+    """
+    with running_replay_loop(
+        session_cls=WideGhostFakeSession, ghost_suffix="_ref"
+    ) as (session, loop):
+        loop.submit({"t": "replay", "ghost": True})
+        loop.submit({"t": "lock", "set": {"joint1": None}})
+        time.sleep(0.2)
+
+        assert loop.error is not None, "the mis-width resolve must have been caught"
+        assert loop.error["kind"] == "command", (
+            f"a lock/swap interaction must never surface as kind='replay' (paused); "
+            f"got {loop.error}"
+        )
+        assert loop.error["paused"] is False
+        assert loop.locks == {}, "an all-or-nothing failure must not leave a partial lock"
+
+        # And the loop is not stuck: a later, unrelated write still succeeds.
+        writes_before = len(session.qpos_writes)
+        loop.submit({"t": "replay", "frame": 3})
+        assert wait_until(lambda: len(session.qpos_writes) > writes_before)
+
+
+def test_lock_set_is_all_or_nothing():
+    """One bad name among several good ones in the same ``set`` must commit NOTHING, not the
+    valid subset -- otherwise a UI toggling several joints in one message gets partial state
+    with no way to tell which half landed."""
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0, "not_a_joint": 1.0}})
+        time.sleep(0.1)
+        assert loop.error is not None and loop.error["kind"] == "command"
+        assert loop.locks == {}, "a partially-invalid lock.set must not commit the valid names"
+
+
 # -- export --------------------------------------------------------------------
 
 
@@ -1174,3 +1427,14 @@ def test_export_progress_rides_the_frame_meta():
         _seq, _jpeg, meta = got
         assert meta["export"]["state"] == "rendering"
         assert meta["export"]["total"] == 10
+
+
+def test_the_export_slice_is_locked_too():
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        time.sleep(0.1)
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "format": "mp4", "crf": 20})
+        time.sleep(0.2)
+        assert len(made) == 1
+        assert (made[0].frames[:, 1] == 5.0).all(), "export must inherit the locks"

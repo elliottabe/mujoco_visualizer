@@ -823,6 +823,61 @@ def test_swap_model_preserves_the_edited_look(two_model_session):
     assert s.viz.vis_state["vis_flags"]["shadows"] is False
 
 
+# -- lockable joint list (scene_message.joints) ------------------------------
+
+_PRIMARY_FOR_JOINTS = """
+<mujoco><worldbody>
+  <body name="b1"><joint name="hinge_a" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1"/></body>
+</worldbody></mujoco>
+"""
+
+_ALT_WITH_SUFFIXED_JOINT = """
+<mujoco><worldbody>
+  <body name="b1"><joint name="hinge_a" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1"/></body>
+  <body name="b2" pos="0 .5 0"><joint name="hinge_a_ref" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1" rgba=".8 .8 .8 .3"/></body>
+</worldbody></mujoco>
+"""
+
+
+@pytest.fixture
+def joints_session():
+    import mujoco
+
+    primary = mujoco.MjModel.from_xml_string(_PRIMARY_FOR_JOINTS)
+    alt = mujoco.MjModel.from_xml_string(_ALT_WITH_SUFFIXED_JOINT)
+    s = Session(model=primary, alt_model=alt, width=64, height=48)
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+@pytest.mark.gl
+def test_scene_message_publishes_the_lockable_joint_list(joints_session):
+    """Without this a client only ever learns which joints are ALREADY locked (from
+    frame_meta.locks), never which ones are lockable, so a lock panel could not be built at
+    all -- see .claude/../task-5-brief.md Step 3b."""
+    from mujoco_visualizer.serve.locks import build_joint_qpos_map
+
+    s = joints_session
+    msg = s.scene_message()
+    jmap = build_joint_qpos_map(s.model)
+    assert msg["joints"], "the lockable joint list must not be empty"
+    assert len(msg["joints"]) == len(jmap)
+    assert {j["name"] for j in msg["joints"]} == set(jmap)
+    assert all(isinstance(j["width"], int) for j in msg["joints"])
+
+    s.swap_model("alt")
+    swapped = s.scene_message()
+    swapped_jmap = build_joint_qpos_map(s.model)
+    assert len(swapped["joints"]) == len(swapped_jmap)
+    names = {j["name"] for j in swapped["joints"]}
+    assert "hinge_a_ref" in names, "the suffixed joint on the alt model must be listed too"
+
+
 # -- Fix round 1: failure safety, hidden self-state, and stale geom ids ------
 
 
