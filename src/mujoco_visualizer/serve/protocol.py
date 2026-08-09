@@ -48,6 +48,15 @@ _MODES = frozenset({"absolute", "additive"})
 # ``{ghost:true}`` followed by ``{frame:10}`` lost the ghost toggle with no error at all.
 _LAST_WINS = frozenset({"mode", "speed", "camera", "render", "settings", "stream"})
 
+# Roots that exist in Visualizer.vis_state. A `render.set` key outside these was previously
+# merged verbatim, creating a dead entry: the control appeared to do nothing and nothing said
+# why. Validated here so a typo is a named error rather than a silent no-op.
+_VIS_STATE_ROOTS = frozenset({
+    "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
+    "camera", "camera_presets", "lighting", "floor", "skybox", "ghost",
+    "geom_render_state",
+})
+
 
 class CommandError(ValueError):
     """A client command was malformed or out of range."""
@@ -162,6 +171,13 @@ def parse_command(raw) -> Dict:
         values = cmd.get("set")
         if not isinstance(values, dict):
             raise CommandError("'render' requires a 'set' object")
+        for dotted in values:
+            root = str(dotted).split(".")[0]
+            if root not in _VIS_STATE_ROOTS:
+                raise CommandError(
+                    f"'render.set' key {dotted!r} has unknown root {root!r}; "
+                    f"expected one of {', '.join(sorted(_VIS_STATE_ROOTS))}"
+                )
         return {"t": "render", "set": dict(values)}
 
     if kind == "settings":

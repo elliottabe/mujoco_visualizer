@@ -955,3 +955,34 @@ def test_a_wire_inserted_geom_color_key_does_not_break_a_model_swap(two_model_se
     s.swap_model("primary")  # geom id 1 does not exist here, so it must be DROPPED, not raise
     assert s.viz.vis_state["geom_colors"] == {}
     assert s.active_model_name == "primary"
+
+
+def test_apply_render_sets_a_list_element(sess):
+    before = list(sess.viz.vis_state["geom_groups"])
+    sess.apply_render({"geom_groups.3": not before[3]})
+    after = sess.viz.vis_state["geom_groups"]
+    assert after[3] is (not before[3])
+    assert after[:3] == before[:3] and after[4:] == before[4:], "only index 3 may change"
+    assert isinstance(after, list), "the list must stay a list, not become a dict"
+
+
+def test_apply_render_list_index_out_of_range_names_the_bound(sess):
+    n = len(sess.viz.vis_state["geom_groups"])
+    with pytest.raises(ValueError, match=rf"9.*{n}"):
+        sess.apply_render({"geom_groups.9": True})
+
+
+def test_apply_render_list_index_must_be_an_integer(sess):
+    with pytest.raises(ValueError, match="integer"):
+        sess.apply_render({"geom_groups.x": True})
+
+
+def test_apply_render_still_sets_nested_dict_keys(sess):
+    sess.apply_render({"floor.alpha": 0.25, "vis_flags.shadows": False})
+    assert sess.viz.vis_state["floor"]["alpha"] == 0.25
+    assert sess.viz.vis_state["vis_flags"]["shadows"] is False
+
+
+def test_apply_render_still_coerces_geom_colors_keys(sess):
+    sess.apply_render({"geom_colors.5": "#ff0000"})
+    assert 5 in sess.viz.vis_state["geom_colors"], "int coercion must survive this change"
