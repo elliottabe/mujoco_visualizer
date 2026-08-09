@@ -80,8 +80,17 @@ class SimLoop(threading.Thread):
         self._stride = 1
         self._loop_playback = True
         self._ghost = False
+        # The frame whose pose was actually last written by _advance_replay -- what
+        # replay_state()/_publish report. NOT the same as self._frame once playback has
+        # advanced past it: self._frame means "what the next tick will draw", and reporting
+        # that instead (as opposed to what is on screen right now) is exactly the bug this
+        # field exists to avoid. Seeded to match self._frame so a read before the first tick
+        # (nothing written yet) is still sane.
+        self._published_frame = 0
         # Set when a command moved the playhead while paused, so the tick renders the new
-        # pose once instead of waiting for Play.
+        # pose once instead of waiting for Play. Also seeded True here (whenever a source is
+        # attached) so the very first tick renders frame 0 immediately, before Play is ever
+        # pressed -- deliberate UX, not an incidental side effect of the paused-scrub case.
         self._replay_dirty = source is not None
 
     # -- public surface --------------------------------------------------------
@@ -107,10 +116,16 @@ class SimLoop(threading.Thread):
         return self._source is not None
 
     def replay_state(self) -> Dict:
-        """Snapshot of the replay playhead. Read from the sim thread and from _publish."""
+        """Snapshot of the replay playhead. Read from the sim thread and from _publish.
+
+        ``frame`` is ``self._published_frame`` -- the frame whose pose was last actually
+        written -- not ``self._frame``, which by the time playback has advanced past it means
+        "what the next tick will draw". A UI slider bound to this field must always match
+        what is on screen, in both the playing and paused/scrubbed cases.
+        """
         return {
             "clip": self._clip,
-            "frame": self._frame,
+            "frame": self._published_frame,
             "in": self._in,
             "out": self._out,
             "stride": self._stride,
@@ -316,6 +331,11 @@ class SimLoop(threading.Thread):
 
         if "trim" in cmd:
             lo, hi = cmd["trim"]
+            # protocol.py already enforces ordering and non-negativity before a command
+            # reaches this loop; this is defence-in-depth for callers that construct a
+            # replay command by hand (e.g. an export job) rather than through protocol.py.
+            if lo > hi:
+                raise ValueError(f"trim must be ordered [in, out]; got in={lo} > out={hi}")
             if hi >= length:
                 raise IndexError(
                     f"trim out={hi} past the end of clip {self._clip} (length {length})"
@@ -324,7 +344,12 @@ class SimLoop(threading.Thread):
             self._frame = min(max(self._frame, lo), hi)
 
         if "stride" in cmd:
-            self._stride = int(cmd["stride"])
+            stride = int(cmd["stride"])
+            # Same defence-in-depth rationale as trim above: protocol.py already enforces
+            # stride >= 1.
+            if stride < 1:
+                raise ValueError(f"stride must be >= 1, got {stride}")
+            self._stride = stride
 
         if "loop" in cmd:
             self._loop_playback = bool(cmd["loop"])
@@ -339,6 +364,15 @@ class SimLoop(threading.Thread):
 
         if "ghost" in cmd and bool(cmd["ghost"]) != self._ghost:
             self._ghost = bool(cmd["ghost"])
+            # The source and the model must flip together, in this same command
+            # application, so no tick can ever observe one without the other: a
+            # ghost-off-width source (e.g. 101 DOF) paired with the ghost-on model (e.g.
+            # 202 DOF, policy+reference concatenated) is exactly the mismatch that makes
+            # Session.set_qpos raise on the very next frame. Duck-typed, like
+            # `controller_rate_hz` above: a source with no `ghost` attribute (e.g. the
+            # generic ArrayTrajectorySource) is untouched and keeps working.
+            if hasattr(self._source, "ghost"):
+                self._source.ghost = self._ghost
             # ~400-560 ms: every mesh re-uploads. Coalescing means at most one per tick.
             self._session.swap_model("alt" if self._ghost else "primary")
 
@@ -350,8 +384,15 @@ class SimLoop(threading.Thread):
         self._replay_dirty = True
 
     def _advance_replay(self) -> None:
-        """Write the current frame, then move the playhead one stride if playing."""
+        """Write the current frame, then move the playhead one stride if playing.
+
+        ``self._published_frame`` is set to the frame just written, BEFORE ``self._frame``
+        potentially moves on to the next one below -- callers that read state after this
+        returns (i.e. ``_publish``) must see "what was drawn", not "what the cursor now
+        points at for next time".
+        """
         self._session.set_qpos(self._source.qpos(self._clip, self._frame))
+        self._published_frame = self._frame
         self._replay_dirty = False
         if not self._playing:
             return

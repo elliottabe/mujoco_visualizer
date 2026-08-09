@@ -615,13 +615,52 @@ def test_out_of_range_clip_reports_a_command_error_without_pausing():
 
 
 def test_ghost_toggle_swaps_the_model():
+    """``make_source()`` returns a plain ``ArrayTrajectorySource``, which has no ``ghost``
+    attribute -- this doubles as proof that a source lacking it is untouched and the toggle
+    still works end to end (no AttributeError from the ``hasattr`` guard in ``loop.py``)."""
     with running_replay_loop() as (session, loop):
+        assert not hasattr(loop._source, "ghost")
         loop.submit({"t": "replay", "ghost": True})
         time.sleep(0.15)
         assert session.model_swaps == ["alt"]
         loop.submit({"t": "replay", "ghost": False})
         time.sleep(0.15)
         assert session.model_swaps == ["alt", "primary"]
+
+
+class GhostAwareSource(ArrayTrajectorySource):
+    """Stands in for the real fly-side source, which exposes a ``ghost`` flag: off it returns
+    101-wide qpos, on it returns ``concat(policy, reference)`` at 202 wide. SimLoop must flip
+    this flag in lockstep with ``session.swap_model``, or a tick could observe a ghost-width
+    model paired with a non-ghost-width source -- exactly what makes ``Session.set_qpos``
+    raise on the next frame."""
+
+    def __init__(self, qpos):
+        super().__init__(qpos)
+        self.ghost = False
+
+
+def make_ghost_source(n_clips=2, n_frames=10, nq=3):
+    q = np.arange(n_clips * n_frames * nq, dtype=np.float32)
+    return GhostAwareSource(q.reshape(n_clips, n_frames, nq))
+
+
+def test_ghost_toggle_also_flips_a_source_that_supports_it():
+    session = FakeSession()
+    source = make_ghost_source()
+    loop = SimLoop(session, source=source, fps_cap=1000.0, idle_pause_s=None)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        loop.submit({"t": "replay", "ghost": True})
+        assert wait_until(lambda: session.model_swaps == ["alt"])
+        assert source.ghost is True, "the source's own ghost flag must flip too"
+        loop.submit({"t": "replay", "ghost": False})
+        assert wait_until(lambda: session.model_swaps == ["alt", "primary"])
+        assert source.ghost is False
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
 
 
 def test_frame_meta_carries_replay_state_and_rollout_time():
@@ -638,3 +677,66 @@ def test_frame_meta_carries_replay_state_and_rollout_time():
         assert meta["replay"]["frame"] == 250
         assert meta["replay"]["stride"] == 1
         assert meta["sim_time"] == pytest.approx(0.250)
+
+
+def test_reported_frame_matches_the_written_pose_while_playing():
+    """Regression for: ``_advance_replay`` writes ``qpos(frame)`` and THEN advances
+    ``self._frame`` to the next one before returning, so a naive ``_publish`` that re-reads
+    ``self._frame`` reports the frame the *next* tick will draw, one stride ahead of what is
+    actually on screen right now.
+
+    fps_cap is deliberately lower than the 1000 Hz helper default: the loop thread has to
+    drain/apply/advance/publish every tick, meaningfully more work than this thread's one
+    list read, so reading ``session.qpos_writes[-1]`` immediately after a freshly published
+    frame is not a coin flip -- it is checked over several samples below for good measure.
+    """
+    session = FakeSession()
+    loop = SimLoop(session, source=make_source(), fps_cap=200.0, idle_pause_s=None)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        loop.submit({"t": "replay", "frame": 0, "play": True})
+        seq = -1
+        checked = 0
+        deadline = time.time() + 2.0
+        while time.time() < deadline and checked < 5:
+            got = loop.wait_for_frame(seq, timeout=0.5)
+            if got is None:
+                continue
+            seq, _jpeg, meta = got
+            replay = meta.get("replay")
+            if replay is None or not replay["playing"]:
+                continue
+            written_frame = int(session.qpos_writes[-1][0] / 3)
+            assert replay["frame"] == written_frame, (
+                f"published frame {replay['frame']} != last-written frame {written_frame} "
+                "-- the report is racing ahead of the actual pose on screen"
+            )
+            checked += 1
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
+    assert checked >= 5, "never observed a published frame while playing"
+
+
+def test_step_nudges_the_playhead_by_one_stride_and_then_pauses():
+    """The forced-``playing`` branch in ``run()`` that services a ``sim step`` command while
+    in replay mode must advance the internal cursor by exactly one stride and leave
+    ``playing`` False afterwards -- and, per the write-then-advance invariant above, the
+    frame it reports/writes THIS tick is the one the cursor was AT when the step fired
+    (4), not the one it advanced to (6): that one is written whenever the next tick reads
+    the cursor.
+    """
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 4, "stride": 2})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 4)
+
+        loop.submit({"t": "sim", "cmd": "step", "n": 1})
+        assert wait_until(lambda: loop._frame == 6), "one step at stride 2 must advance by 2"
+        assert loop.playing is False
+
+        got = loop.wait_for_frame(-1, timeout=1.0)
+        assert got is not None
+        _seq, _jpeg, meta = got
+        written_frame = int(session.qpos_writes[-1][0] / 3)
+        assert meta["replay"]["frame"] == written_frame == 4
