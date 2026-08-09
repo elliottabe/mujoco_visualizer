@@ -165,3 +165,49 @@ def test_unwritable_destination_fails_the_job_not_the_process(tmp_path):
     prog = job.progress()
     assert prog["state"] == "failed"
     assert prog["error"]
+
+
+# --- fix round 1 regressions -------------------------------------------------------
+
+@pytest.mark.gl
+def test_sidecar_failure_does_not_hang_the_job(tmp_path, monkeypatch):
+    """A broken sidecar write must not leave progress() stuck reporting "rendering"."""
+    job = make_job(tmp_path, frames=2)
+    monkeypatch.setattr(
+        job, "_write_sidecar",
+        lambda: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    job.start()
+    job.join(timeout=120)
+    prog = job.progress()
+    assert prog["state"] != "rendering", prog
+    # The render itself succeeded and the video is on disk and usable, so a failed
+    # provenance write is surfaced as an error rather than flipping the whole job to
+    # "failed" -- see the comment in ExportJob.run().
+    assert prog["state"] == "done"
+    assert prog["error"] and "disk full" in prog["error"]
+    assert (tmp_path / "out.mp4").exists()
+
+
+@pytest.mark.gl
+def test_export_never_mutates_the_callers_model(tmp_path):
+    """_make_visualizer bumps the offscreen framebuffer size -- it must do so on the
+    job's own deep copy, never on the model object the caller passed in."""
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(_MODEL_XML)
+    orig_offwidth = model.vis.global_.offwidth
+    orig_offheight = model.vis.global_.offheight
+    assert (orig_offwidth, orig_offheight) == (640, 480)  # the default, and < requested below
+
+    qpos = np.linspace(0, 1, 2, dtype=np.float64).reshape(2, model.nq)
+    job = ExportJob(
+        model, None, {}, qpos,
+        path=tmp_path / "wide.mp4", width=800, height=600, fps=10,
+    )
+    job.start()
+    job.join(timeout=120)
+
+    assert job.progress()["state"] == "done"
+    assert model.vis.global_.offwidth == orig_offwidth
+    assert model.vis.global_.offheight == orig_offheight

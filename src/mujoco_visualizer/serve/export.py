@@ -7,11 +7,21 @@ slowdown from 6.2 ms solo). The spec's "one thread owns physics and rendering" r
 sharing ONE context, which this does not do.
 
 The job never reads the rollout file and never touches the preview's state: it is handed a
-plain qpos array, a deep-copied model, and a snapshot of ``vis_state``. That is what lets the
-user keep editing colours while a video renders with the look they pressed the button on.
+plain qpos array, a model, and a snapshot of ``vis_state``. That is what lets the user keep
+editing colours while a video renders with the look they pressed the button on. ``ExportJob``
+deep-copies the model itself in ``__init__`` -- it does not trust the caller to have done so
+-- because it mutates the copy's offscreen framebuffer size (see ``_make_visualizer``), and a
+mutation reaching a live preview model would corrupt the very thing this design is supposed
+to keep editable.
 
 Frames stream to the writer one at a time. ``Visualizer.render_video`` accumulates every
 frame and stacks them, which for 1588 frames at 3840x2160 is 39 GB.
+
+Directory contract differs by format, and it is deliberate, not an oversight: MP4 export
+requires ``path.parent`` to already exist (a missing one is reported as a failed job, not
+silently created -- see ``_render_mp4``); PNG-sequence export creates ``path`` itself as the
+sequence's own output directory, because that creation is inherent to what a sequence export
+is (see ``_render_png``).
 """
 
 import copy
@@ -65,7 +75,18 @@ def mp4_writer_kwargs(fps: float, crf: int = 20) -> Dict:
 
 
 class ExportJob(threading.Thread):
-    """Render *qpos_frames* to *path* at *width* x *height*, reporting progress."""
+    """Render *qpos_frames* to *path* at *width* x *height*, reporting progress.
+
+    Guarantees:
+
+    - The caller's ``model`` is never mutated. ``__init__`` deep-copies it immediately, so
+      even a caller that hands in its live preview model (rather than a copy) is safe --
+      this class owns the invariant rather than trusting every call site to uphold it.
+    - MP4 export requires ``path.parent`` to already exist; it is not created
+      automatically, and a missing one fails the job with ``state="failed"`` rather than
+      guessing where to make directories. PNG-sequence export is the opposite: ``path`` is
+      the sequence's own directory and IS created.
+    """
 
     def __init__(
         self,
@@ -85,7 +106,12 @@ class ExportJob(threading.Thread):
         meta: Optional[Dict] = None,
     ):
         super().__init__(name="ExportJob", daemon=True)
-        self._model = model
+        # Deep-copy rather than trust the caller: _make_visualizer mutates this model's
+        # offscreen framebuffer size, and a bare reference to a live preview model would
+        # let that mutation reach the thing this job exists to leave editable. Cheap next
+        # to the render itself, and it makes the no-mutation guarantee true unconditionally
+        # rather than "true if every caller remembers to copy first".
+        self._model = copy.deepcopy(model)
         self._anatomy = anatomy
         self._vis_state = vis_state
         self._frames = np.asarray(qpos_frames, dtype=np.float64)
@@ -95,6 +121,9 @@ class ExportJob(threading.Thread):
         self._camera = camera
         self._fmt = fmt
         self._crf = int(crf)
+        # Accepted but not yet consumed by any renderer here -- kept for forward
+        # compatibility with a later task's per-frame overlays (e.g. a timestamp drawn via
+        # modify_scene_fns), and recorded in the sidecar below since it's free provenance.
         self._frame_dt = float(frame_dt)
         self._meta = dict(meta or {})
 
@@ -132,13 +161,29 @@ class ExportJob(threading.Thread):
         except Exception as exc:  # noqa: BLE001 - a job must never kill the process
             self._fail(f"{type(exc).__name__}: {exc}")
             self._cleanup_partial()
-        else:
-            if self._cancel.is_set():
-                self._set_state("cancelled")
-                self._cleanup_partial()
-            else:
-                self._write_sidecar()
-                self._set_state("done")
+            return
+        # NOTE: a cancel() landing after the last frame has rendered but before this check
+        # runs is indistinguishable from "never cancelled" -- the job reports "cancelled"
+        # and deletes what is in fact a complete file. Harmless (the caller asked to
+        # cancel and gets no file, which is what cancelling means to them) but worth
+        # documenting rather than leaving as a silent surprise.
+        if self._cancel.is_set():
+            self._set_state("cancelled")
+            self._cleanup_partial()
+            return
+        # The render succeeded and the video/frames are already on disk and usable even if
+        # the sidecar write below fails (permission error, full disk, unwritable path).
+        # Marking a good export "failed" over a missing provenance .json would throw away
+        # more than it protects, so a sidecar failure is recorded as an error but the job
+        # still reaches "done" -- never left hanging in "rendering" (see Finding 1: without
+        # its own try/except, an exception here escaped both surrounding try/except blocks
+        # and left progress() reporting "rendering" forever).
+        sidecar_error = None
+        try:
+            self._write_sidecar()
+        except Exception as exc:  # noqa: BLE001 - see note above
+            sidecar_error = f"sidecar write failed: {type(exc).__name__}: {exc}"
+        self._finish_done(sidecar_error)
 
     def _make_visualizer(self):
         """Build the Visualizer on THIS thread: it creates the GL context.
@@ -155,6 +200,8 @@ class ExportJob(threading.Thread):
         # ValueError rather than resizing. A model that doesn't happen to declare a huge
         # buffer would otherwise reject any export above that default, including a 4K
         # export on an ordinary model. Bump it up (never down) to fit what was requested.
+        # Safe to mutate in place: self._model is this job's own deep copy (see __init__),
+        # never the caller's original object.
         if self._model.vis.global_.offwidth < self._width:
             self._model.vis.global_.offwidth = self._width
         if self._model.vis.global_.offheight < self._height:
@@ -212,6 +259,7 @@ class ExportJob(threading.Thread):
             "width": self._width,
             "height": self._height,
             "fps": self._fps,
+            "frame_dt": self._frame_dt,
             "format": self._fmt,
             "crf": self._crf,
             "n_frames": int(len(self._frames)),
@@ -240,3 +288,14 @@ class ExportJob(threading.Thread):
         with self._lock:
             self._state = "failed"
             self._error = message
+
+    def _finish_done(self, error: Optional[str]) -> None:
+        """Reach the terminal "done" state, optionally with a non-fatal *error* attached.
+
+        Used when the render itself succeeded but the sidecar write did not: the output
+        is real and usable, so the state is "done" rather than "failed", but the error is
+        still surfaced rather than swallowed.
+        """
+        with self._lock:
+            self._state = "done"
+            self._error = error
