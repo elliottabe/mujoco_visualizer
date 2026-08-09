@@ -442,6 +442,18 @@ class Session:
             node[parts[-1]] = value
 
     @property
+    def camera(self) -> Optional[str]:
+        """The named camera/preset currently selected, or ``None`` for the free camera.
+
+        Read-only, and deliberately public: an export job has to render with the camera the
+        user pressed the button on, so :func:`scripts.rollout_viewer.launch.build_export_factory`
+        needs this value. It read ``session._camera`` before this property existed, which
+        made a private attribute part of a cross-repo contract. Setting still goes through
+        :meth:`set_camera`, which is where the wire-name translation lives.
+        """
+        return self._camera
+
+    @property
     def active_model_name(self) -> str:
         return self._active_model
 

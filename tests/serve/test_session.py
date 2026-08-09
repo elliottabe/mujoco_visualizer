@@ -651,6 +651,23 @@ def test_named_camera_command_still_selects_the_named_camera(pose_xml):
         s.close()
 
 
+def test_camera_property_reports_what_render_will_use(pose_xml):
+    """``Session.camera`` is what an export job is handed, so it must track set_camera.
+
+    Exists so a host project (the fly rollout viewer's export factory) does not have to read
+    the private ``_camera`` to render its video with the camera the preview was showing.
+    """
+    s = Session(xml_path=pose_xml, width=64, height=64)
+    try:
+        assert s.camera is None                # free camera by default
+        s.set_camera(named="topcam")
+        assert s.camera == "topcam"
+        s.set_camera(az=45.0)                  # a drag returns to the free camera
+        assert s.camera is None
+    finally:
+        s.close()
+
+
 @pytest.mark.gl
 def test_rendered_pixels_follow_a_camera_drag(pose_xml):
     """The end-to-end claim: two different azimuths must produce different frames."""
