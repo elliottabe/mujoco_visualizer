@@ -91,3 +91,43 @@ def test_from_h5_without_lengths_uses_full_width(tmp_path):
         f.create_dataset("qpos", data=make_qpos(n_frames=7))
     src = ArrayTrajectorySource.from_h5(path)
     assert src.clip_length(0) == 7
+
+
+def test_qpos_returns_copy_not_view_for_float64_source():
+    """qpos() with float64 source is a copy: mutating returned array doesn't corrupt store."""
+    # Use float64 fixture to ensure we hit the same-dtype path that was untested.
+    q = np.arange(3 * 5 * 4, dtype=np.float64).reshape(3, 5, 4)
+    src = ArrayTrajectorySource(q)
+
+    # Get a frame and mutate it.
+    got = src.qpos(1, 2)
+    got[:] = 999.0  # Mutate the returned array in place.
+
+    # Verify the source and a second qpos() call are unchanged.
+    second_call = src.qpos(1, 2)
+    assert not np.allclose(got, second_call), "Mutated returned array affected the store"
+    np.testing.assert_array_equal(second_call, q[1, 2])
+
+
+def test_external_mutation_after_construction_does_not_affect_qpos():
+    """Mutating the array passed to constructor doesn't affect qpos() returns."""
+    q = make_qpos()
+    src = ArrayTrajectorySource(q)
+
+    # Get the expected value before mutation.
+    expected = src.qpos(1, 2)
+
+    # Mutate the original array passed to constructor.
+    q[1, 2] = 999.0
+
+    # Verify qpos() still returns the original value.
+    actual = src.qpos(1, 2)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_internal_qpos_array_is_frozen():
+    """self._qpos is not writable: attempted writes raise ValueError."""
+    src = ArrayTrajectorySource(make_qpos())
+
+    with pytest.raises(ValueError, match="read-only"):
+        src._qpos[0, 0, 0] = 999.0

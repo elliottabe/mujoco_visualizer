@@ -10,6 +10,7 @@ speed is irrelevant (a warm HDF5 chunk read was already 0.19 ms) and the thing w
 is not speed but *shareability*: an immutable numpy array needs no lock, so the render thread
 and a background export thread can both read it, which an h5py handle cannot offer -- h5py
 serialises on a global lock and is unsafe to interleave with other HDF5 C-library callers.
+Immutability is enforced: the internal array is frozen, and qpos() returns a copy per call.
 """
 
 from pathlib import Path
@@ -51,7 +52,9 @@ class ArrayTrajectorySource:
             raise ValueError(
                 f"qpos must be 3-D (n_clips, n_frames, nq); got shape {arr.shape}"
             )
-        self._qpos = arr
+        # Copy and freeze to enforce immutability: callers cannot mutate the shared store.
+        self._qpos = np.array(arr, copy=True)
+        self._qpos.setflags(write=False)
         n_clips, n_frames, _ = arr.shape
         if lengths is None:
             self._lengths = np.full(n_clips, n_frames, dtype=np.int64)
@@ -106,9 +109,11 @@ class ArrayTrajectorySource:
             raise IndexError(
                 f"frame {frame} out of range for clip {clip} (length {length})"
             )
-        # float64 because MjData.qpos is float64: converting here once beats an implicit
-        # per-frame upcast inside the render path.
-        return np.asarray(self._qpos[clip, frame], dtype=np.float64)
+        # Always copy to ensure callers cannot reach the shared store via in-place mutations.
+        # The per-call copy cost is invisible against a 5.4-41 ms render, and the gain is
+        # that a consumer writing in place (e.g. normalising before MjData assignment) cannot
+        # corrupt the trajectory every other thread reads.
+        return np.array(self._qpos[clip, frame], dtype=np.float64)
 
     def _check_clip(self, clip: int) -> None:
         if not 0 <= clip < self.n_clips:
