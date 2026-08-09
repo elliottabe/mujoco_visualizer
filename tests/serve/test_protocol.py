@@ -356,3 +356,120 @@ def test_render_still_accepts_a_bare_alpha_key():
     address and whole-root replacement is exactly what setting it means."""
     cmd = parse_command({"t": "render", "set": {"alpha": 0.5}})
     assert cmd["set"] == {"alpha": 0.5}
+
+
+# --- lock -----------------------------------------------------------------------
+
+def test_lock_accepts_scalar_list_and_null_values():
+    cmd = parse_command({"t": "lock", "set": {"hinge_a": 0.5, "root.quat": [1, 0, 0, 0],
+                                              "wing_yaw_left": None}})
+    assert cmd["set"]["hinge_a"] == [0.5]
+    assert cmd["set"]["root.quat"] == [1.0, 0.0, 0.0, 0.0]
+    assert cmd["set"]["wing_yaw_left"] is None, "None means freeze at the current value"
+
+
+def test_lock_clear_parses_alone():
+    assert parse_command({"t": "lock", "clear": True}) == {"t": "lock", "clear": True}
+
+
+def test_lock_needs_set_or_clear():
+    with pytest.raises(CommandError, match="set.*clear"):
+        parse_command({"t": "lock"})
+
+
+def test_lock_rejects_non_numeric_and_non_finite_values():
+    with pytest.raises(CommandError):
+        parse_command({"t": "lock", "set": {"hinge_a": "0.5"}})
+    with pytest.raises(CommandError, match="finite"):
+        parse_command({"t": "lock", "set": {"hinge_a": float("inf")}})
+
+
+def test_lock_rejects_a_boolean_value():
+    with pytest.raises(CommandError):
+        parse_command({"t": "lock", "set": {"hinge_a": True}})
+
+
+def test_lock_merges_key_by_key_rather_than_replacing():
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+        parse_command({"t": "lock", "set": {"b": 2.0}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["set"] == {"a": [1.0], "b": [2.0]}, "a group toggle sets many at once"
+
+
+def test_lock_later_value_wins_per_key():
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+        parse_command({"t": "lock", "set": {"a": 3.0}}),
+    ])
+    assert out[0]["set"] == {"a": [3.0]}
+
+
+def test_lock_clear_is_not_swallowed_by_a_later_set():
+    out = coalesce([
+        parse_command({"t": "lock", "clear": True}),
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+    ])
+    kinds = [(c.get("clear"), c.get("set")) for c in out]
+    assert any(c is True for c, _ in kinds), "a clear must not vanish into a later set"
+
+
+def test_lock_combined_set_and_clear_in_single_command():
+    """A single command with both set and clear must preserve both fields."""
+    out = coalesce([parse_command({"t": "lock", "set": {"a": 1.0}, "clear": True})])
+    assert len(out) == 1
+    assert out[0]["clear"] is True
+    assert out[0]["set"] == {"a": [1.0]}
+
+
+def test_lock_set_then_clear_yields_only_clear():
+    """After a clear, earlier set values are discarded."""
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+        parse_command({"t": "lock", "clear": True}),
+    ])
+    assert len(out) == 1
+    assert out[0] == {"t": "lock", "clear": True}
+
+
+def test_lock_clear_then_set_preserves_both():
+    """Clear resets the accumulator, then set merges onto the empty dict."""
+    out = coalesce([
+        parse_command({"t": "lock", "clear": True}),
+        parse_command({"t": "lock", "set": {"b": 2.0}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["clear"] is True
+    assert out[0]["set"] == {"b": [2.0]}
+
+
+def test_lock_combined_followed_by_set_only():
+    """Combined command followed by set-only: clear applies first, then both sets merge."""
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}, "clear": True}),
+        parse_command({"t": "lock", "set": {"b": 2.0}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["clear"] is True
+    assert out[0]["set"] == {"a": [1.0], "b": [2.0]}
+
+
+def test_lock_none_then_number_for_same_key():
+    """Number overwrites None for the same key in coalesce."""
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": None}}),
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["set"] == {"a": [1.0]}, "later number wins over None"
+
+
+def test_lock_number_then_none_for_same_key():
+    """None survives coalesce when it overwrites a number for the same key."""
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+        parse_command({"t": "lock", "set": {"a": None}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["set"]["a"] is None, "None must survive as None, not be coerced to [0.0]"

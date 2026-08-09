@@ -12,6 +12,7 @@ validating a filename is exactly a validation job.
 """
 
 import json
+import math
 from typing import Dict, List
 
 from mujoco_visualizer.render_settings import list_available_settings
@@ -30,6 +31,7 @@ COMMANDS = frozenset(
         "replay",
         "export",
         "export_cancel",
+        "lock",
         "ping",
     }
 )
@@ -316,6 +318,58 @@ def parse_command(raw) -> Dict:
     if kind == "export_cancel":
         return {"t": "export_cancel"}
 
+    if kind == "lock":
+        out = {"t": "lock"}
+        has_set = "set" in cmd
+        has_clear = "clear" in cmd
+        if not (has_set or has_clear):
+            raise CommandError("'lock' requires at least one of 'set' or 'clear'")
+        if has_set:
+            values = cmd.get("set")
+            if not isinstance(values, dict):
+                raise CommandError("'lock' requires a 'set' object")
+            normalized = {}
+            for name, value in values.items():
+                if value is None:
+                    # None means freeze at the current value when lock engages
+                    normalized[str(name)] = None
+                elif isinstance(value, (list, tuple)):
+                    # List of numbers
+                    converted = []
+                    for i, v in enumerate(value):
+                        if isinstance(v, bool) or not isinstance(v, (int, float)):
+                            raise CommandError(
+                                f"lock value for {name!r} element {i} must be a number, "
+                                f"got {type(v).__name__}"
+                            )
+                        float_val = float(v)
+                        if not math.isfinite(float_val):
+                            raise CommandError(
+                                f"lock value for {name!r} element {i} must be finite, got {float_val}"
+                            )
+                        converted.append(float_val)
+                    normalized[str(name)] = converted
+                else:
+                    # Scalar number
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        raise CommandError(
+                            f"lock value for {name!r} must be a number or None, "
+                            f"got {type(value).__name__}"
+                        )
+                    float_val = float(value)
+                    if not math.isfinite(float_val):
+                        raise CommandError(
+                            f"lock value for {name!r} must be finite, got {float_val}"
+                        )
+                    # Normalize scalar to list
+                    normalized[str(name)] = [float_val]
+            out["set"] = normalized
+        if has_clear:
+            if not isinstance(cmd.get("clear"), bool):
+                raise CommandError("'lock.clear' must be a boolean")
+            out["clear"] = cmd.get("clear")
+        return out
+
     return {"t": "ping"}
 
 
@@ -326,17 +380,30 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
     merge key-by-key with later values winning. ``ctrl_group`` keeps the last gain per group.
     ``sim`` messages are events (play/pause/step/reset) and are all preserved in order.
 
+    ``lock`` commands merge with special handling: ``clear`` is an ordered event that resets the
+    running set accumulator, and is preserved in output. When a message carries both ``set`` and
+    ``clear``, the ``clear`` applies first (resetting the accumulator) and then the ``set`` is
+    merged onto it. The final output carries both fields if they were ever set, omitting an
+    empty ``set`` and omitting ``clear`` if it was never encountered.
+
     ``replay`` merges rather than last-wins because its eight fields are independent knobs,
     not one value: a scrub drag emitting ``{frame:...}`` every few ms must still coalesce to a
     single seek (the reason it was collapsed in the first place), but a ``{ghost:true}`` that
     happens to share the tick must not vanish with the earlier frames. Later values still win
     per key, so the collapsed drag behaves exactly as before.
+
+    ``lock.set`` merges for the same reason: a UI that toggles multiple joints in quick
+    succession (e.g. a group checkbox covering nine legs) must apply all toggles, not just
+    the last one.
     """
     last_index: Dict[str, int] = {}
     merged_ctrl: Dict[str, float] = {}
     ctrl_index = None
     merged_replay: Dict = {}
     replay_index = None
+    merged_lock_set: Dict = {}
+    lock_clear_flag: bool = False
+    lock_index = None
     group_index: Dict[str, int] = {}
     keep = [True] * len(cmds)
 
@@ -358,6 +425,16 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             if replay_index is not None:
                 keep[replay_index] = False
             replay_index = i
+        elif kind == "lock":
+            # Process clear first (resets accumulator), then merge set values key-by-key
+            if cmd.get("clear"):
+                lock_clear_flag = True
+                merged_lock_set = {}
+            if "set" in cmd:
+                merged_lock_set.update(cmd["set"])
+            if lock_index is not None:
+                keep[lock_index] = False
+            lock_index = i
         elif kind == "ctrl_group":
             group = cmd["group"]
             if group in group_index:
@@ -372,6 +449,13 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             out.append({"t": "ctrl", "set": dict(merged_ctrl)})
         elif i == replay_index:
             out.append({"t": "replay", **merged_replay})
+        elif i == lock_index:
+            out_lock = {"t": "lock"}
+            if lock_clear_flag:
+                out_lock["clear"] = True
+            if merged_lock_set:
+                out_lock["set"] = dict(merged_lock_set)
+            out.append(out_lock)
         else:
             out.append(cmd)
     return out
