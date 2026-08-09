@@ -168,3 +168,92 @@ def test_settings_load_rejects_a_real_readable_file_outside_the_settings_dir(tmp
     victim.write_text('{"alpha": 1.0}')
     with pytest.raises(CommandError):
         parse_command({"t": "settings", "load": str(victim)})
+
+
+# --- replay -----------------------------------------------------------------------
+
+def test_replay_accepts_the_full_key_set():
+    cmd = parse_command(
+        {"t": "replay", "clip": 42, "frame": 412, "play": True,
+         "stride": 10, "trim": [120, 900], "loop": False, "ghost": True}
+    )
+    assert cmd == {"t": "replay", "clip": 42, "frame": 412, "play": True,
+                   "stride": 10, "trim": [120, 900], "loop": False, "ghost": True}
+
+
+def test_replay_needs_at_least_one_field():
+    with pytest.raises(CommandError, match="at least one"):
+        parse_command({"t": "replay"})
+
+
+def test_replay_stride_must_be_at_least_one():
+    with pytest.raises(CommandError, match="stride"):
+        parse_command({"t": "replay", "stride": 0})
+
+
+def test_replay_trim_must_be_two_ordered_ints():
+    with pytest.raises(CommandError, match="two"):
+        parse_command({"t": "replay", "trim": [5]})
+    with pytest.raises(CommandError, match="in .* out|ordered"):
+        parse_command({"t": "replay", "trim": [900, 120]})
+
+
+def test_replay_rejects_negative_frame():
+    with pytest.raises(CommandError):
+        parse_command({"t": "replay", "frame": -1})
+
+
+def test_replay_booleans_must_be_boolean():
+    with pytest.raises(CommandError, match="ghost"):
+        parse_command({"t": "replay", "ghost": "yes"})
+
+
+# --- export -----------------------------------------------------------------------
+
+def test_export_requires_size_and_fps():
+    with pytest.raises(CommandError, match="width"):
+        parse_command({"t": "export", "height": 1080, "fps": 30})
+
+
+def test_export_defaults_format_and_crf():
+    cmd = parse_command({"t": "export", "width": 1920, "height": 1080, "fps": 30})
+    assert cmd["format"] == "mp4"
+    assert cmd["crf"] == 20
+    assert cmd["width"] == 1920 and cmd["height"] == 1080 and cmd["fps"] == 30.0
+
+
+def test_export_rejects_unknown_format():
+    with pytest.raises(CommandError, match="format"):
+        parse_command({"t": "export", "width": 640, "height": 480, "fps": 30,
+                       "format": "avi"})
+
+
+def test_export_clamps_nothing_but_validates_range():
+    with pytest.raises(CommandError):
+        parse_command({"t": "export", "width": 8, "height": 480, "fps": 30})
+    with pytest.raises(CommandError):
+        parse_command({"t": "export", "width": 640, "height": 480, "fps": 0})
+
+
+def test_export_cancel_parses():
+    assert parse_command({"t": "export_cancel"}) == {"t": "export_cancel"}
+
+
+def test_export_commands_are_events_not_last_wins():
+    # Two exports queued in one tick must BOTH survive coalescing: the second is
+    # rejected by the loop with "one at a time", which is a different, visible outcome
+    # from silently discarding the first.
+    out = coalesce([
+        parse_command({"t": "export", "width": 640, "height": 480, "fps": 30}),
+        parse_command({"t": "export_cancel"}),
+    ])
+    assert [c["t"] for c in out] == ["export", "export_cancel"]
+
+
+def test_replay_still_last_wins_so_a_scrub_drag_applies_once():
+    out = coalesce([
+        parse_command({"t": "replay", "frame": 100}),
+        parse_command({"t": "replay", "frame": 200}),
+        parse_command({"t": "replay", "frame": 300}),
+    ])
+    assert out == [{"t": "replay", "frame": 300}]

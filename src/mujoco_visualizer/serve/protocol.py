@@ -28,6 +28,8 @@ COMMANDS = frozenset(
         "settings",
         "stream",
         "replay",
+        "export",
+        "export_cancel",
         "ping",
     }
 )
@@ -193,13 +195,80 @@ def parse_command(raw) -> Dict:
             if not isinstance(cmd["load"], str):
                 raise CommandError("'replay.load' must be a path string")
             out["load"] = cmd["load"]
+        if "clip" in cmd:
+            out["clip"] = int(_num(cmd, "clip", lo=0, hi=1e9))
         if "frame" in cmd:
             out["frame"] = int(_num(cmd, "frame", lo=0, hi=1e9))
-        if "play" in cmd:
-            out["play"] = bool(cmd["play"])
+        if "stride" in cmd:
+            out["stride"] = int(_num(cmd, "stride", lo=1, hi=100000))
+        if "trim" in cmd:
+            trim = cmd["trim"]
+            if not isinstance(trim, (list, tuple)) or len(trim) != 2:
+                raise CommandError("'replay.trim' must be two frame indices [in, out]")
+            values = []
+            for i, v in enumerate(trim):
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise CommandError(
+                        f"'replay.trim' element {i} must be a number, got "
+                        f"{type(v).__name__}"
+                    )
+                if v < 0:
+                    raise CommandError(f"'replay.trim' element {i} must be >= 0, got {v}")
+                values.append(int(v))
+            if values[0] > values[1]:
+                raise CommandError(
+                    f"'replay.trim' must be ordered [in, out]; got in={values[0]} > "
+                    f"out={values[1]}"
+                )
+            out["trim"] = values
+        for flag in ("play", "loop", "ghost"):
+            if flag in cmd:
+                if not isinstance(cmd[flag], bool):
+                    raise CommandError(f"'replay.{flag}' must be a boolean")
+                out[flag] = cmd[flag]
         if len(out) == 1:
-            raise CommandError("'replay' needs at least one of load/frame/play")
+            raise CommandError(
+                "'replay' needs at least one of load/clip/frame/play/stride/trim/loop/ghost"
+            )
         return out
+
+    if kind == "export":
+        # width/height/fps are required rather than defaulted: an export is a deliberate,
+        # minutes-long, file-producing act, and inheriting the preview's 640x480 by accident
+        # is a silently useless 4K-shaped request.
+        for key in ("width", "height", "fps"):
+            if key not in cmd:
+                raise CommandError(f"'export' requires {key!r}")
+        fmt = cmd.get("format", "mp4")
+        if fmt not in ("mp4", "png"):
+            raise CommandError(f"'export.format' must be 'mp4' or 'png', got {fmt!r}")
+        out = {
+            "t": "export",
+            "width": int(_num(cmd, "width", lo=16, hi=8192)),
+            "height": int(_num(cmd, "height", lo=16, hi=8192)),
+            "fps": _num(cmd, "fps", lo=1, hi=240),
+            "format": fmt,
+            "crf": int(_num(cmd, "crf", 20.0, lo=0, hi=51)),
+        }
+        if "stride" in cmd:
+            out["stride"] = int(_num(cmd, "stride", lo=1, hi=100000))
+        if "trim" in cmd:
+            # Same shape rules as replay.trim; reuse by re-parsing through this function so
+            # the two can never drift apart.
+            out["trim"] = parse_command({"t": "replay", "trim": cmd["trim"]})["trim"]
+        for flag in ("shadows", "tendons"):
+            if flag in cmd:
+                if not isinstance(cmd[flag], bool):
+                    raise CommandError(f"'export.{flag}' must be a boolean")
+                out[flag] = cmd[flag]
+        if "path" in cmd:
+            if not isinstance(cmd["path"], str) or not cmd["path"]:
+                raise CommandError("'export.path' must be a non-empty string")
+            out["path"] = cmd["path"]
+        return out
+
+    if kind == "export_cancel":
+        return {"t": "export_cancel"}
 
     return {"t": "ping"}
 
