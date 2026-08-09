@@ -7,6 +7,9 @@ Everything here runs headless: no GL, no jax/mjx.
 """
 
 import copy
+import json
+import os
+import re
 
 import pytest
 
@@ -64,6 +67,31 @@ def test_preset_name_pattern_accepts_well_formed_names(value):
 )
 def test_preset_name_pattern_rejects_paths_and_out_of_range_names(value):
     assert PRESET_NAME_RE.match(value) is None
+
+
+def test_bypassing_the_name_guard_would_let_the_write_target_escape_user_settings_dir(
+    tmp_path,
+):
+    """PRESET_NAME_RE is the ONLY thing standing between a preset name and an escaping write
+    target -- ``Session.save_settings_as`` builds ``dest`` as a single interpolation,
+    ``self.user_settings_dir / f"{name}.json"``, not a sanitised join, so nothing at the
+    filesystem layer would catch a name the regex let through. This test bypasses the regex
+    on purpose -- it builds the exact expression ``save_settings_as`` builds, for a name the
+    regex rejects -- so the containment argument rests on an assertion here, not narrative in
+    a report.
+    """
+    user_settings_dir = (tmp_path / "user_settings").resolve()
+    name = "../../escaped"
+    assert PRESET_NAME_RE.match(name) is None  # confirms this name never reaches this code
+    # for real: PRESET_NAME_RE.match is what stands between a caller and the line below.
+
+    dest = user_settings_dir / f"{name}.json"  # save_settings_as's own dest expression
+
+    escaped = dest.resolve()
+    assert not str(escaped).startswith(str(user_settings_dir) + os.sep), (
+        f"expected the unguarded write target to escape {user_settings_dir}, "
+        f"but it resolved to {escaped}, still inside it"
+    )
 
 
 # -- list_available_settings -----------------------------------------------------------------
@@ -168,21 +196,36 @@ def test_load_settings_still_refuses_an_unknown_name_with_a_user_dir_configured(
 def test_load_settings_prefers_the_user_preset_on_a_name_collision(sess):
     """Decision: on a name collision, LOADING resolves to the user's own save, not the
     bundled preset underneath it -- see Session.load_settings's docstring for the reasoning.
-    Distinguished from the bundled version by a marker only the saved-then-edited file has.
+
+    Pinned on a real, merged field ('alpha') the two files are made to genuinely diverge on --
+    not an inert '_marker' key, which Session.load_settings ignores (it isn't in
+    Visualizer.load_settings's explicit key tuple) and so proves nothing about which file was
+    actually read.
     """
+    from mujoco_visualizer.render_settings import _SETTINGS_DIR
+
     bundled_name = list_available_settings()[0]["name"]
-    sess.save_settings_as(bundled_name)
-    # Tag the just-saved user copy so we can tell which file actually got read.
-    user_path = sess.user_settings_dir / f"{bundled_name}.json"
-    import json
+    bundled_alpha = json.loads((_SETTINGS_DIR / f"{bundled_name}.json").read_text())["alpha"]
+    user_alpha = 0.0 if bundled_alpha != 0.0 else 1.0
+    assert user_alpha != bundled_alpha  # sanity: the two files really diverge on this field
 
-    data = json.loads(user_path.read_text())
-    data["_marker"] = "this-is-the-user-copy"
-    user_path.write_text(json.dumps(data))
+    sess.viz.vis_state["alpha"] = user_alpha
+    sess.save_settings_as(bundled_name)  # writes the user copy with alpha=user_alpha
 
-    sess.load_settings(bundled_name)  # must not raise, and must not explode on the extra key
+    # Perturb in-memory state to a THIRD value distinct from both files' alpha, so the
+    # assertion below can only pass if load_settings actually re-reads a file off disk --
+    # leftover memory from either file could not satisfy it by accident.
+    sess.viz.vis_state["alpha"] = -1.0
+
+    sess.load_settings(bundled_name)
+
+    assert sess.viz.vis_state["alpha"] == user_alpha
 
 
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores the write-permission bit chmod(0o500) relies on here",
+)
 def test_unwritable_user_dir_raises_and_leaves_no_partial_file(sess):
     sess.user_settings_dir.mkdir(parents=True, exist_ok=True)
     sess.user_settings_dir.chmod(0o500)  # read + execute, no write
@@ -219,8 +262,35 @@ def test_save_settings_as_atomically_replaces_no_partial_file_on_a_mid_write_fai
 
 # -- whole vis_state round trip (not a hand-picked subset of keys) ----------------------------
 
+_HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 
-def test_save_load_round_trips_the_whole_vis_state(sess):
+
+def _mutate(value):
+    """Diverge *value* from itself in a type-preserving, always-valid way: flip a bool,
+    bit-invert a '#RRGGBB' hex string (never a fixed point -- inverting a 24-bit value has no
+    solution to v == 0xFFFFFF - v), nudge a number, recurse into lists/dicts. Any other string
+    (camera 'mode'/'named'/'free_type'/'trackbody'/'fixedcamid', an enum-shaped value) is left
+    alone -- mutating those to something not on their real menu risks the applier code raising
+    for reasons unrelated to what this test is checking, and a sibling numeric/bool field in
+    the same dict already gives the group something to diverge on.
+    """
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, str):
+        if _HEX_RE.match(value):
+            n = int(value[1:], 16)
+            return f"#{(0xFFFFFF - n):06x}"
+        return value
+    if isinstance(value, (int, float)):
+        return value + 1
+    if isinstance(value, list):
+        return [_mutate(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _mutate(v) for k, v in value.items()}
+    return value
+
+
+def test_save_load_round_trips_the_whole_vis_state(xml, tmp_path):
     """Visualizer.save_settings/load_settings both enumerate top-level vis_state groups
     EXPLICITLY (colors, geom_colors, alpha, vis_flags, geom_groups, site_groups, camera,
     lighting, floor, skybox, camera_presets, ghost, ...). A group added to one list but not
@@ -228,20 +298,54 @@ def test_save_load_round_trips_the_whole_vis_state(sess):
     succeeds, and only the value is gone. This exact shape (four tests green while the thing
     they guarded was broken) is why this asserts on EVERY key present before the save, not a
     hand-picked few that already worked.
+
+    Uses two INDEPENDENT sessions (save from one, load into a freshly-built other), like
+    ``test_save_load_round_trip_catches_a_group_that_is_not_wired_into_either_list`` below --
+    reloading into the same live object that already holds the pre-save value in memory would
+    leave a dropped group looking "present" regardless of whether the file round-tripped it.
+
+    Two independent sessions are not enough on their own, though: a brand-new Session's
+    vis_state is a deterministic function of the model, so two freshly-built sessions already
+    have IDENTICAL vis_state before either one touches a file -- comparing them would pass
+    trivially even if a whole group were dropped from save_settings's output. ``_mutate``
+    diverges every leaf of the SAVER's state from that shared default first, so a value can
+    only match on the LOADER side by having actually been read off disk.
     """
-    before = copy.deepcopy(sess.viz.vis_state)
-    assert before  # sanity: there is something to compare
+    user_dir = tmp_path / "user_settings"
+    saver = Session(xml_path=xml, width=64, height=64, user_settings_dir=user_dir)
+    try:
+        for key, value in list(saver.viz.vis_state.items()):
+            saver.viz.vis_state[key] = _mutate(value)
+        # 'geom_colors' and 'camera_presets' default to {} on a fresh model -- _mutate has
+        # nothing to diverge in an empty dict, so give each a synthetic, valid entry.
+        saver.viz.vis_state["geom_colors"] = {0: "#abcdef"}
+        saver.viz.vis_state["camera_presets"] = {
+            "probe_preset": {
+                "azimuth": 12.3, "elevation": -5.0, "distance": 0.2,
+                "lookat": [0.0, 0.0, 0.0],
+            }
+        }
 
-    sess.save_settings_as("whole_state_probe")
-    sess.load_settings("whole_state_probe")
-    after = sess.viz.vis_state
+        before = copy.deepcopy(saver.viz.vis_state)
+        assert before  # sanity: there is something to compare
 
-    for key in before:
-        assert key in after, f"{key!r} was present before the round trip, missing after"
-        assert after[key] == before[key], (
-            f"{key!r} changed across a save -> load round trip: "
-            f"before={before[key]!r} after={after[key]!r}"
-        )
+        saver.save_settings_as("whole_state_probe")
+    finally:
+        saver.close()
+
+    loader = Session(xml_path=xml, width=64, height=64, user_settings_dir=user_dir)
+    try:
+        loader.load_settings("whole_state_probe")
+        after = loader.viz.vis_state
+
+        for key in before:
+            assert key in after, f"{key!r} was present before the round trip, missing after"
+            assert after[key] == before[key], (
+                f"{key!r} changed across a save -> load round trip: "
+                f"before={before[key]!r} after={after[key]!r}"
+            )
+    finally:
+        loader.close()
 
 
 def test_save_load_round_trip_catches_a_group_that_is_not_wired_into_either_list(xml, tmp_path):

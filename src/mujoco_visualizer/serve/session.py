@@ -683,10 +683,16 @@ class Session:
             # actually returns: this list goes straight to viewer.js as a dropdown's option
             # set (see static/viewer.js), which has always expected plain strings, and a
             # collision is not this wire message's problem to solve -- see load_settings for
-            # where that gets decided.
+            # where that gets decided. Kept as-is (additive change only) so this existing
+            # field's contract does not shift under viewer.js.
             "settings_available": sorted(
                 {d["name"] for d in list_available_settings(self.user_settings_dir)}
             ),
+            # The {"name", "origin"} shape list_available_settings() actually returns,
+            # untransformed -- so a later task's preset dropdown can tag each entry bundled
+            # vs. user (design spec §6) without reaching back into this module. Additive:
+            # "settings_available" above is untouched for existing/older clients.
+            "settings_catalog": list_available_settings(self.user_settings_dir),
             "has_controller": self._controller is not None,
             "ctrl_mode": self._mode,
             "width": self.width,
