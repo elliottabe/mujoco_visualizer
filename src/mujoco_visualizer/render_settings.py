@@ -307,6 +307,11 @@ def build_scene_option(settings: dict) -> mujoco.MjvOption:
     opt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = f.get('actuators', False)
     opt.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = f.get('joints', False)
     opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = f.get('transparent', False)
+    # Default True to match mjVIS_TENDON's own MjvOption() default, and to stay consistent
+    # with Visualizer._build_scene_option -- the two read the same vis_flags dicts (settings
+    # JSON files, vis_state) and a flag honoured by one and ignored by the other is how a
+    # settings preset ends up meaning different things on different render paths.
+    opt.flags[mujoco.mjtVisFlag.mjVIS_TENDON] = f.get('tendon', True)
 
     gg = settings.get('geom_groups', [True] * 6)
     sg = settings.get('site_groups', [False] * 6)

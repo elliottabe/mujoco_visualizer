@@ -445,6 +445,10 @@ class Visualizer:
                 'contact_points': False, 'contact_forces': False,
                 'actuators': False, 'joints': False, 'transparent': False,
                 'shadows': True, 'wireframe': False,
+                # True, not False, because mjVIS_TENDON defaults ON in a bare MjvOption():
+                # the fly renders 1449 scene geoms with tendons drawn and 802 without, so
+                # defaulting this to False would silently change every existing render path.
+                'tendon': True,
             },
             'geom_groups': [True, True, True, True, False, False],
             'site_groups':  [True, True, True, True, True,  False],
@@ -806,6 +810,11 @@ class Visualizer:
         opt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR]     = f.get('actuators',       False)
         opt.flags[mujoco.mjtVisFlag.mjVIS_JOINT]        = f.get('joints',          False)
         opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT]  = f.get('transparent',     False)
+        # Default True: mjVIS_TENDON is ON in a bare MjvOption(), so anything else here would
+        # change what every caller already renders. Wired at all because the serve layer's
+        # `export.tendons` field and the render-cost benchmark both set this key, and until
+        # this line existed both were writing to a flag nothing read.
+        opt.flags[mujoco.mjtVisFlag.mjVIS_TENDON]       = f.get('tendon',          True)
         gg = self.vis_state['geom_groups']
         sg = self.vis_state['site_groups']
         for k in range(min(6, len(opt.geomgroup))):
