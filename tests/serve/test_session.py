@@ -707,7 +707,7 @@ def test_load_settings_rejects_a_path_even_though_visualizer_accepts_one(sess, t
 def test_load_settings_accepts_a_bundled_preset_name(sess):
     from mujoco_visualizer import list_available_settings
 
-    sess.load_settings(list_available_settings()[0])  # must not raise
+    sess.load_settings(list_available_settings()[0]["name"])  # must not raise
 
 
 # -- vis_state_snapshot / swap_model ----------------------------------------

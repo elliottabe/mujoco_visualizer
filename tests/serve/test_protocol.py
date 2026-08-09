@@ -138,7 +138,7 @@ def test_round_trips_through_json():
 def test_settings_load_accepts_a_bundled_preset_name():
     from mujoco_visualizer import list_available_settings
 
-    name = list_available_settings()[0]
+    name = list_available_settings()[0]["name"]
     assert parse_command({"t": "settings", "load": name}) == {"t": "settings", "load": name}
 
 
@@ -168,6 +168,53 @@ def test_settings_load_rejects_a_real_readable_file_outside_the_settings_dir(tmp
     victim.write_text('{"alpha": 1.0}')
     with pytest.raises(CommandError):
         parse_command({"t": "settings", "load": str(victim)})
+
+
+def test_settings_load_consults_the_user_settings_dir_when_given(tmp_path):
+    """A name that exists only in the user directory is not in the bundled whitelist -- it
+    must still be accepted when that directory is passed in, and still rejected when it
+    isn't (e.g. a stale second connection with no per-session dir configured)."""
+    (tmp_path / "my_look.json").write_text("{}")
+
+    cmd = parse_command(
+        {"t": "settings", "load": "my_look"}, user_settings_dir=tmp_path
+    )
+    assert cmd == {"t": "settings", "load": "my_look"}
+
+    with pytest.raises(CommandError):
+        parse_command({"t": "settings", "load": "my_look"})  # no user_settings_dir given
+
+
+# -- settings.save is a NAME, checked against a pattern, never an existing-file whitelist ---
+
+
+def test_settings_save_accepts_a_wellformed_name():
+    cmd = parse_command({"t": "settings", "save": "my_fig-2"})
+    assert cmd == {"t": "settings", "save": "my_fig-2"}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../x",       # path traversal
+        "a/b",        # path separator
+        "",           # empty
+        "x.json",     # looks like a filename, not a name
+        "a" * 65,     # over the 64-char cap
+    ],
+)
+def test_settings_save_rejects_anything_that_is_not_a_bare_name(value):
+    with pytest.raises(CommandError) as exc:
+        parse_command({"t": "settings", "save": value})
+    # The rejection quotes the pattern itself, not just a generic "invalid name" -- so the
+    # error is actionable rather than requiring a source-code lookup to know what IS valid.
+    assert r"^[A-Za-z0-9_-]{1,64}$" in str(exc.value)
+
+
+def test_settings_save_accepts_the_boundary_lengths():
+    """1 char and 64 chars are both valid -- only 0 and 65+ are rejected."""
+    assert parse_command({"t": "settings", "save": "a"})["save"] == "a"
+    assert parse_command({"t": "settings", "save": "a" * 64})["save"] == "a" * 64
 
 
 # --- replay -----------------------------------------------------------------------

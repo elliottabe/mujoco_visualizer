@@ -864,7 +864,7 @@ class WidgetGUI:
 
     def _build_tab_settings(self):
         from mujoco_visualizer.render_settings import list_available_settings
-        presets = list_available_settings() or ['Default']
+        presets = [d['name'] for d in list_available_settings()] or ['Default']
         preset_dd = widgets.Dropdown(
             options=presets, value=presets[0],
             description='Preset:',
