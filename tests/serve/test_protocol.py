@@ -307,3 +307,52 @@ def test_the_replay_error_message_no_longer_advertises_load():
     with pytest.raises(CommandError) as excinfo:
         parse_command({"t": "replay"})
     assert "load" not in str(excinfo.value)
+
+
+def test_render_rejects_an_unknown_root():
+    with pytest.raises(CommandError, match="colours"):
+        parse_command({"t": "render", "set": {"colours.thorax": "#ff0000"}})
+
+
+def test_render_accepts_every_known_root():
+    from mujoco_visualizer.serve.protocol import _VIS_STATE_ROOTS
+    for root in sorted(_VIS_STATE_ROOTS):
+        cmd = parse_command({"t": "render", "set": {f"{root}.x": 1}})
+        assert cmd["set"] == {f"{root}.x": 1}
+
+
+def test_render_accepts_a_bare_key_whose_name_is_itself_a_known_root():
+    """``alpha`` is a scalar at the top of ``vis_state``, not a container to descend into, so
+    addressing it with no sub-key is legitimate -- exactly how ``apply_render`` already treats
+    it (``parts[:-1]`` is empty, so the whole dotted string becomes the key written straight
+    onto ``vis_state``). A single-segment key is therefore accepted whenever its name is
+    itself a known root; only a name that matches no root at all is a validation error (see
+    ``test_render_rejects_a_bare_key_with_no_root`` below)."""
+    cmd = parse_command({"t": "render", "set": {"alpha": 0.5}})
+    assert cmd["set"] == {"alpha": 0.5}
+
+
+def test_render_rejects_a_bare_key_with_no_root():
+    with pytest.raises(CommandError, match="bogus"):
+        parse_command({"t": "render", "set": {"bogus": 0.5}})
+
+
+def test_render_rejects_a_bare_geom_groups_key():
+    """``geom_groups`` is a fixed-length list; a bare key with no ``.<index>`` would replace
+    the whole list with whatever scalar the client sent. Unlike ``alpha`` (a scalar root),
+    whole-root replacement here is destructive, so it is rejected -- and the message names the
+    form the client should have sent instead."""
+    with pytest.raises(CommandError, match=r"geom_groups.*\.<index>"):
+        parse_command({"t": "render", "set": {"geom_groups": True}})
+
+
+def test_render_rejects_a_bare_site_groups_key():
+    with pytest.raises(CommandError, match=r"site_groups.*\.<index>"):
+        parse_command({"t": "render", "set": {"site_groups": True}})
+
+
+def test_render_still_accepts_a_bare_alpha_key():
+    """The list-root guard must not overreach into scalar roots: ``alpha`` has no index to
+    address and whole-root replacement is exactly what setting it means."""
+    cmd = parse_command({"t": "render", "set": {"alpha": 0.5}})
+    assert cmd["set"] == {"alpha": 0.5}

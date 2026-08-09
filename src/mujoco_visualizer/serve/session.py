@@ -462,7 +462,7 @@ class Session:
             node = self.viz.vis_state
             parts = dotted.split(".")
             for part in parts[:-1]:
-                node = node.setdefault(part, {})
+                node = self._descend(node, part, dotted)
             key = parts[-1]
             if parts[:-1] == ["geom_colors"]:
                 try:
@@ -471,7 +471,36 @@ class Session:
                     raise ValueError(
                         f"'geom_colors' is keyed by geom id; {key!r} is not an integer"
                     ) from None
-            node[key] = value
+            if isinstance(node, list):
+                node[self._list_index(node, key, dotted)] = value
+            else:
+                node[key] = value
+
+    @staticmethod
+    def _list_index(seq, key, dotted):
+        """Resolve a dotted path segment against a list, with an actionable error.
+
+        ``geom_groups``/``site_groups`` are fixed-length lists of booleans, so a wire key
+        addresses them by index. Silently ignoring a bad index would leave a UI control that
+        appears to do nothing; raising names the bound the client got wrong.
+        """
+        try:
+            idx = int(key)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{dotted!r}: {key!r} is not an integer index into a list of {len(seq)}"
+            ) from None
+        if not 0 <= idx < len(seq):
+            raise ValueError(
+                f"{dotted!r}: index {idx} out of range for a list of {len(seq)}"
+            )
+        return idx
+
+    @classmethod
+    def _descend(cls, node, part, dotted):
+        if isinstance(node, list):
+            return node[cls._list_index(node, part, dotted)]
+        return node.setdefault(part, {})
 
     @property
     def camera(self) -> Optional[str]:
