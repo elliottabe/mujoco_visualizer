@@ -719,24 +719,72 @@ def test_reported_frame_matches_the_written_pose_while_playing():
     assert checked >= 5, "never observed a published frame while playing"
 
 
-def test_step_nudges_the_playhead_by_one_stride_and_then_pauses():
-    """The forced-``playing`` branch in ``run()`` that services a ``sim step`` command while
-    in replay mode must advance the internal cursor by exactly one stride and leave
-    ``playing`` False afterwards -- and, per the write-then-advance invariant above, the
-    frame it reports/writes THIS tick is the one the cursor was AT when the step fired
-    (4), not the one it advanced to (6): that one is written whenever the next tick reads
-    the cursor.
+def test_step_advances_and_renders_the_next_frame():
+    """Regression for: a single ``sim step`` used to write the frame already on screen and
+    only silently move the cursor, so pressing Step produced no visible change at all. A
+    step's contract is "show me the next frame", so it must move the cursor BEFORE writing
+    -- the opposite order from continuous playback.
+
+    Checked against the actual POSE (``session.qpos_writes``), not just the reported state:
+    that is exactly the check whose absence let the original defect through review.
     """
     with running_replay_loop() as (session, loop):
         loop.submit({"t": "replay", "frame": 4, "stride": 2})
         assert wait_until(lambda: loop.replay_state()["frame"] == 4)
 
         loop.submit({"t": "sim", "cmd": "step", "n": 1})
-        assert wait_until(lambda: loop._frame == 6), "one step at stride 2 must advance by 2"
-        assert loop.playing is False
+        assert wait_until(lambda: int(session.qpos_writes[-1][0] / 3) == 6), (
+            "one step at stride 2 must WRITE frame 6, not just move an internal cursor to it"
+        )
+        assert loop.playing is False, "a step must not leave playback running"
 
         got = loop.wait_for_frame(-1, timeout=1.0)
         assert got is not None
         _seq, _jpeg, meta = got
         written_frame = int(session.qpos_writes[-1][0] / 3)
-        assert meta["replay"]["frame"] == written_frame == 4
+        assert meta["replay"]["frame"] == written_frame == 6
+
+
+def test_step_with_n_greater_than_one_advances_n_strides_and_writes_once():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 0, "stride": 1})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 0)
+        writes_before = len(session.qpos_writes)
+
+        loop.submit({"t": "sim", "cmd": "step", "n": 3})
+        assert wait_until(lambda: int(session.qpos_writes[-1][0] / 3) == 3)
+        # One tick, one publish -- n=3 must fold into a single write of the FINAL frame,
+        # never one write per intermediate stride.
+        assert len(session.qpos_writes) == writes_before + 1
+        assert loop.playing is False
+
+
+def test_step_at_out_wraps_to_in_when_looping():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "trim": [2, 5], "frame": 5, "loop": True})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 5)
+
+        loop.submit({"t": "sim", "cmd": "step", "n": 1})
+        assert wait_until(lambda: int(session.qpos_writes[-1][0] / 3) == 2)
+        assert loop.playing is False
+
+        got = loop.wait_for_frame(-1, timeout=1.0)
+        assert got is not None
+        _seq, _jpeg, meta = got
+        assert meta["replay"]["frame"] == 2
+
+
+def test_step_at_out_stays_at_out_when_not_looping():
+    """Already paused, so this is "nothing moves": no error, no advance past `out`, and the
+    same frame is simply re-rendered."""
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "trim": [2, 5], "frame": 5, "loop": False})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 5)
+        writes_before = len(session.qpos_writes)
+
+        loop.submit({"t": "sim", "cmd": "step", "n": 1})
+        assert wait_until(lambda: len(session.qpos_writes) == writes_before + 1)
+        assert int(session.qpos_writes[-1][0] / 3) == 5
+        assert loop.replay_state()["frame"] == 5
+        assert loop.error is None
+        assert loop.playing is False

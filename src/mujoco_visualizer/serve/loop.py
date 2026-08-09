@@ -383,27 +383,74 @@ class SimLoop(threading.Thread):
 
         self._replay_dirty = True
 
+    def _next_replay_frame(self, frame: int) -> Tuple[int, bool]:
+        """Where one stride sends ``frame``, and whether that ran past ``out`` with
+        ``loop=False`` -- the boundary at which advancing must stop.
+
+        Pure arithmetic, no side effects (in particular: does NOT touch ``self._playing``),
+        so both playback (:meth:`_advance_replay`) and a step
+        (:meth:`_step_replay`) go through this one place and the wrap/stop rule can never
+        drift between them.
+        """
+        nxt = frame + self._stride
+        if nxt > self._out:
+            if self._loop_playback:
+                return self._in, False
+            return self._out, True
+        return nxt, False
+
     def _advance_replay(self) -> None:
         """Write the current frame, then move the playhead one stride if playing.
 
-        ``self._published_frame`` is set to the frame just written, BEFORE ``self._frame``
-        potentially moves on to the next one below -- callers that read state after this
-        returns (i.e. ``_publish``) must see "what was drawn", not "what the cursor now
-        points at for next time".
+        Write-THEN-advance is correct here: a playing tick's frame has already been
+        rendered (or was just scrubbed to), so this writes it and only then moves the
+        cursor on for the tick after. ``self._published_frame`` is set to the frame just
+        written, BEFORE ``self._frame`` potentially moves on below -- callers that read
+        state after this returns (i.e. ``_publish``) must see "what was drawn", not "what
+        the cursor now points at for next time". Contrast :meth:`_step_replay`, which needs
+        the opposite order for the opposite reason.
         """
         self._session.set_qpos(self._source.qpos(self._clip, self._frame))
         self._published_frame = self._frame
         self._replay_dirty = False
         if not self._playing:
             return
-        nxt = self._frame + self._stride
-        if nxt > self._out:
-            if self._loop_playback:
-                nxt = self._in
-            else:
-                nxt = self._out
-                self._playing = False
+        nxt, stop = self._next_replay_frame(self._frame)
         self._frame = nxt
+        if stop:
+            self._playing = False
+
+    def _step_replay(self, n: int) -> None:
+        """Advance the cursor by ``n`` strides, THEN write and report the result --
+        deliberately the opposite order from :meth:`_advance_replay`.
+
+        A step means "show me the next frame": the frame currently on screen has already
+        been seen, so writing it again first (this used to reuse _advance_replay's
+        write-then-advance order) makes a single step press produce no visible change at
+        all -- the cursor moves internally but nothing new is ever rendered until some
+        later command happens to trigger another write. Moving first fixes that: exactly
+        one write, for the frame the cursor lands on.
+
+        ``n`` strides are folded into ONE cursor move and ONE write/publish (never one
+        write per intermediate stride, which the caller -- one publish per tick -- could
+        not represent anyway). If a non-looping advance hits ``out`` partway through,
+        further strides would just repeat ``out``, so the loop stops early rather than
+        spinning through them for nothing.
+
+        Does not touch ``self._playing``: a step is a paused-state operation by convention,
+        and it is already ``False`` in the ordinary case, so there is nothing to change.
+        Forcing it False here would also incorrectly override a `play` command coalesced
+        into the very same command batch.
+        """
+        frame = self._frame
+        for _ in range(max(1, int(n))):
+            frame, stop = self._next_replay_frame(frame)
+            if stop:
+                break
+        self._frame = frame
+        self._session.set_qpos(self._source.qpos(self._clip, self._frame))
+        self._published_frame = self._frame
+        self._replay_dirty = False
 
     def _publish_guarded(self, tick_started: float) -> None:
         """Publish, converting a render-side failure into a paused ``render`` error instead
@@ -522,14 +569,24 @@ class SimLoop(threading.Thread):
 
                     if self.replay_mode:
                         # Replay never steps physics: state comes from the file. `step`
-                        # commands nudge the playhead by one stride instead.
+                        # commands nudge the playhead by n strides instead (advance-then-
+                        # write -- see _step_replay's docstring for why that is the
+                        # opposite order from continuous playback below).
                         if self._pending_steps > 0:
+                            n = self._pending_steps
                             self._pending_steps = 0
-                            was_playing, self._playing = self._playing, True
                             try:
-                                self._advance_replay()
-                            finally:
-                                self._playing = was_playing
+                                self._step_replay(n)
+                            except Exception as exc:
+                                # The happy path leaves `playing` untouched (see
+                                # _step_replay's docstring), but an actual failure here is
+                                # exactly the diverged-state situation every other "paused":
+                                # True error in this file stops playback for.
+                                self._playing = False
+                                self._error = {
+                                    "t": "error", "kind": "replay",
+                                    "msg": str(exc), "paused": True,
+                                }
                         elif self._playing or self._replay_dirty:
                             try:
                                 self._advance_replay()
