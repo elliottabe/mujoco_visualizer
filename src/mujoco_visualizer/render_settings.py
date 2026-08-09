@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -50,6 +51,12 @@ _SETTINGS_DIR = Path(__file__).parent / 'settings'
 
 DEFAULT_SETTINGS = 'Default'
 
+# Whitelist for a settings preset NAME reaching this package from network-facing code
+# (mujoco_visualizer.serve). Deliberately excludes '/', '.', and everything else a path
+# needs -- see serve/protocol.py's 'settings' branch for why this has to be enforced before
+# the value ever reaches open()/json.load(), not after.
+PRESET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
 
 def _resolve_settings_path(name_or_path: str) -> Path:
     """Resolve a settings name (e.g. 'Earthy_V1') or path to a file."""
@@ -66,13 +73,41 @@ def _resolve_settings_path(name_or_path: str) -> Path:
         return candidate
     raise FileNotFoundError(
         f"Settings not found: '{name_or_path}'. "
-        f"Available: {list_available_settings()}"
+        f"Available: {[d['name'] for d in list_available_settings()]}"
     )
 
 
-def list_available_settings() -> List[str]:
-    """Return names of all available settings presets."""
-    return sorted(p.stem for p in _SETTINGS_DIR.glob('*.json'))
+def list_available_settings(
+    user_dir: Optional[Union[str, Path]] = None,
+) -> List[Dict[str, str]]:
+    """Return available settings presets as ``{"name", "origin"}`` entries.
+
+    ``origin`` is ``"bundled"`` for presets shipped inside the installed package
+    (this file's own ``settings/`` directory) and ``"user"`` for presets found in
+    *user_dir*, when one is given and exists.
+
+    A name present in BOTH is listed twice, once per origin -- this function never
+    lets one silently shadow the other. Callers that need a single preset for a
+    given name (loading) decide precedence themselves; see
+    ``mujoco_visualizer.serve.session.Session.load_settings`` for the policy this
+    package's own server uses (the user preset wins).
+
+    Bundled presets are always included, even when *user_dir* is None -- this keeps
+    the long-standing zero-argument call (predating per-session user directories)
+    returning exactly the set of presets it always did.
+    """
+    result = [
+        {"name": p.stem, "origin": "bundled"}
+        for p in sorted(_SETTINGS_DIR.glob('*.json'))
+    ]
+    if user_dir is not None:
+        user_dir = Path(user_dir)
+        if user_dir.is_dir():
+            result.extend(
+                {"name": p.stem, "origin": "user"}
+                for p in sorted(user_dir.glob('*.json'))
+            )
+    return result
 
 
 def load_settings(name_or_path: str) -> dict:

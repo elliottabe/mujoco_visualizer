@@ -5,17 +5,18 @@ instead of a half-applied state change. And coalescing, so a mouse drag that emi
 dozen camera messages while the loop was busy stepping applies once -- without it, a fast
 drag over a slow link builds a backlog of stale positions the camera then walks through.
 
-Otherwise pure data: the one exception is ``settings.load``, which is checked against
-``list_available_settings()`` (a directory listing). That whitelist has to live in front of
-the simulation rather than behind it, because the value reaches ``open()``/``json.load()`` and
-validating a filename is exactly a validation job.
+Otherwise pure data: the one exception is ``settings``, which is checked against
+``list_available_settings()`` (a directory listing) for ``load`` and against a name
+whitelist for ``save``. That validation has to live in front of the simulation rather than
+behind it, because a ``load`` value reaches ``open()``/``json.load()`` and a ``save`` value
+becomes a filename ``open(..., 'w')`` creates -- validating either is exactly a validation job.
 """
 
 import json
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from mujoco_visualizer.render_settings import list_available_settings
+from mujoco_visualizer.render_settings import PRESET_NAME_RE, list_available_settings
 
 COMMANDS = frozenset(
     {
@@ -91,8 +92,14 @@ def _num(cmd: Dict, key: str, default=None, lo=None, hi=None):
     return value
 
 
-def parse_command(raw) -> Dict:
+def parse_command(raw, user_settings_dir: Optional[str] = None) -> Dict:
     """Validate one client command. Accepts a JSON string or a dict.
+
+    *user_settings_dir*, when given, is consulted (alongside the bundled presets) to decide
+    whether a ``settings.load`` name is valid -- so a preset a user has actually saved via
+    ``settings.save`` is loadable, not just the ones shipped in the package. Omitting it
+    (the default) validates ``load`` against the bundled presets only, which is the same
+    behaviour this function always had before per-session user directories existed.
 
     Returns a normalised dict with defaults filled in. Raises :class:`CommandError`.
     """
@@ -200,20 +207,37 @@ def parse_command(raw) -> Dict:
         return {"t": "render", "set": dict(values)}
 
     if kind == "settings":
+        save_name = cmd.get("save")
+        if save_name is not None:
+            # A save name is never checked against an existing-file whitelist (there is
+            # nothing to whitelist against -- the whole point is creating a new preset). It
+            # is instead checked against a NAME PATTERN, for exactly the same reason
+            # 'load' is checked against a directory listing below: this value becomes a
+            # filename an `open(..., 'w')` on the server creates, so "../x", "a/b", and a
+            # bare "" or path-with-suffix must be rejected before they ever get near a
+            # filesystem call, not after.
+            if not isinstance(save_name, str) or not PRESET_NAME_RE.match(save_name):
+                raise CommandError(
+                    "'settings.save' name must match {0!r}; got {1!r}".format(
+                        PRESET_NAME_RE.pattern, save_name
+                    )
+                )
+            return {"t": "settings", "save": save_name}
+
         name = cmd.get("load")
         if not isinstance(name, str) or not name:
             raise CommandError("'settings' requires a 'load' name")
-        # Whitelisted by NAME against the bundled presets, never accepted as a path.
+        # Whitelisted by NAME against the bundled AND user presets, never accepted as a path.
         # Visualizer._resolve_settings_path's first branch is `if Path(x).is_file()`, which is
         # correct for its own callers (a user naming a settings file on the command line) but
         # means an unvalidated wire value makes the server open() and json.load() any path a
         # client names -- and then echo the whitelisted keys back in the scene message. The
         # bind address defaults to 127.0.0.1 but --host widens it.
-        available = list_available_settings()
+        available = {d["name"] for d in list_available_settings(user_settings_dir)}
         if name not in available:
             raise CommandError(
                 "'settings.load' must be one of the available settings presets; "
-                "{0!r} is not (available: {1})".format(name, ", ".join(available))
+                "{0!r} is not (available: {1})".format(name, ", ".join(sorted(available)))
             )
         return {"t": "settings", "load": name}
 

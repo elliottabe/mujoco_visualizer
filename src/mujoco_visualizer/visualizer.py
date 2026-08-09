@@ -666,9 +666,14 @@ class Visualizer:
         # model. The name-based colors/geom_colors path below is correct.
 
         # Merge settings into vis_state
+        # 'ghost' (tint/alpha for the translucent reference overlay) is included here so a
+        # preset written after it was added round-trips it too. A preset written BEFORE it
+        # existed simply has no 'ghost' key -- the `if key in settings` guard below means
+        # that case takes neither branch and self.vis_state['ghost'] is left at whatever
+        # default __init__ set, never an error and never a synthesized value.
         for key in ('colors', 'geom_colors', 'alpha', 'vis_flags',
                     'geom_groups', 'site_groups', 'camera', 'lighting',
-                    'floor', 'skybox'):
+                    'floor', 'skybox', 'ghost'):
             if key in settings:
                 if isinstance(settings[key], dict) and isinstance(self.vis_state.get(key), dict):
                     self.vis_state[key] = {**self.vis_state[key], **settings[key]}
@@ -722,6 +727,13 @@ class Visualizer:
             'skybox':            copy.deepcopy(self.vis_state['skybox']),
             'geom_render_state': geom_render_state,
             'camera_presets':    self.vis_state.get('camera_presets', {}),
+            # .get(..., {}), not ['ghost'], because this key was added after every existing
+            # vis_state literal and after all 17 bundled presets -- on a Visualizer built
+            # before it exists (or rebuilt from an old preset that never sets it), there is
+            # no 'ghost' entry to copy. Saving {} in that case is harmless: load_settings's
+            # `if 'ghost' in settings` guard treats an empty dict as "nothing to merge",
+            # same as the key being absent outright.
+            'ghost':             copy.deepcopy(self.vis_state.get('ghost', {})),
         }
         with open(json_path, 'w') as f:
             json.dump(data, f, indent=2)

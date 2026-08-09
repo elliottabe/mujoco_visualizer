@@ -357,6 +357,36 @@ def test_scene_message_lists_available_settings(sess):
     assert isinstance(msg["settings"], dict)
 
 
+def test_scene_message_settings_catalog_carries_origin_alongside_the_flat_list(xml, tmp_path):
+    """Design spec S6: the scene message's settings_available entries gain an origin tag, so
+    a later preset dropdown can mark each entry bundled or user. That must not change
+    "settings_available" itself -- viewer.js iterates it expecting plain strings -- so the
+    tagged shape is carried on a second, additive field, "settings_catalog", instead.
+    """
+    user_dir = tmp_path / "user_settings"
+    user_dir.mkdir()
+    (user_dir / "my_look.json").write_text("{}")
+
+    s = Session(xml_path=xml, width=64, height=64, user_settings_dir=user_dir)
+    try:
+        msg = s.scene_message()
+
+        # The pre-existing flat field is untouched: still a list of plain strings.
+        assert isinstance(msg["settings_available"], list)
+        assert all(isinstance(name, str) for name in msg["settings_available"])
+
+        # The new field carries list_available_settings()'s real, untransformed shape.
+        assert "settings_catalog" in msg
+        catalog = msg["settings_catalog"]
+        assert isinstance(catalog, list)
+        assert all(set(d) == {"name", "origin"} for d in catalog)
+        assert {d["origin"] for d in catalog} == {"bundled", "user"}
+        assert {"name": "my_look", "origin": "user"} in catalog
+        assert any(d["origin"] == "bundled" for d in catalog)
+    finally:
+        s.close()
+
+
 @pytest.mark.gl
 def test_render_and_encode_round_trip(sess):
     frame = sess.render()
@@ -707,7 +737,7 @@ def test_load_settings_rejects_a_path_even_though_visualizer_accepts_one(sess, t
 def test_load_settings_accepts_a_bundled_preset_name(sess):
     from mujoco_visualizer import list_available_settings
 
-    sess.load_settings(list_available_settings()[0])  # must not raise
+    sess.load_settings(list_available_settings()[0]["name"])  # must not raise
 
 
 # -- vis_state_snapshot / swap_model ----------------------------------------

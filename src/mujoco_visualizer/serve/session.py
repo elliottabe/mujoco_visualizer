@@ -14,6 +14,7 @@ touching this file.
 """
 
 import copy
+from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import mujoco
@@ -21,6 +22,7 @@ import numpy as np
 import simplejpeg
 
 from mujoco_visualizer import Visualizer, list_available_settings
+from mujoco_visualizer.render_settings import PRESET_NAME_RE
 from mujoco_visualizer.serve.backends import CpuBackend, PhysicsBackend, UnknownKeyframe
 from mujoco_visualizer.serve.controls import actuator_group_map, build_control_tree
 
@@ -119,8 +121,24 @@ class Session:
         jpeg_quality: int = 75,
         backend: Optional[PhysicsBackend] = None,
         alt_model: Optional[mujoco.MjModel] = None,
+        user_settings_dir: Optional[Path] = None,
         **viz_kwargs,
     ):
+        # Where `save_settings_as` writes named presets, and where `load_settings` looks for
+        # one beyond the bundled set -- NEVER the package's own `settings/` directory (see
+        # `save_settings_as`). None (the default) just means this session has nowhere of its
+        # own to save to yet; loading still works against the bundled presets.
+        # .resolve() (not just Path(...)): Visualizer.save_settings only redirects a BARE
+        # name into the package's bundled settings/ dir when the target path is relative
+        # with parent '.' -- a user_settings_dir passed in as exactly '.' would collapse to
+        # that same shape (`Path('.') / 'x.json'` normalises to `Path('x.json')`, parent
+        # '.') and hit that redirect. Resolving to an absolute path here removes the
+        # ambiguity once, rather than depending on every future caller happening to pass an
+        # already-absolute directory.
+        self.user_settings_dir = (
+            Path(user_settings_dir).resolve() if user_settings_dir is not None else None
+        )
+
         self.viz = Visualizer(
             xml_path=xml_path,
             model=model,
@@ -597,21 +615,68 @@ class Session:
         self._active_model = which
 
     def load_settings(self, name: str) -> None:
-        """Load a BUNDLED settings preset by name.
+        """Load a bundled OR user settings preset by name.
 
         Names only, never paths -- the same whitelist ``protocol.parse_command`` enforces, kept
         here too so the invariant does not depend on which entry point reached this method.
         ``Visualizer.load_settings`` deliberately still accepts paths for its own (local,
         non-networked) callers, which is why this guard lives in the serve layer.
+
+        On a name collision between a bundled and a user preset, the user's own save wins:
+        it is the more specific of the two, and a user who just saved a preset under a name
+        that happens to match a bundled one clearly means to get their own version back, not
+        silently keep loading the bundled default underneath it. ``list_available_settings``
+        itself takes no side on this -- it lists both, distinguished by origin -- so the
+        choice is made here, once, rather than left to whichever caller resolves the name.
         """
-        available = list_available_settings()
-        if name not in available:
+        available = list_available_settings(self.user_settings_dir)
+        matches = [d for d in available if d["name"] == name]
+        if not matches:
             raise ValueError(
                 "unknown settings preset {0!r}; available: {1}".format(
-                    name, ", ".join(available)
+                    name, ", ".join(sorted({d["name"] for d in available}))
                 )
             )
-        self.viz.load_settings(name)
+        if any(d["origin"] == "user" for d in matches):
+            self.viz.load_settings(str(self.user_settings_dir / f"{name}.json"))
+        else:
+            self.viz.load_settings(name)
+
+    def save_settings_as(self, name: str) -> Path:
+        """Save the current render settings as a NAMED preset in this session's
+        ``user_settings_dir`` -- never in the package's own bundled ``settings/`` directory
+        (that copy is read-only in some installs, is lost on reinstall, and is a tracked
+        submodule directory a save must not dirty).
+
+        *name* is checked against the same ``^[A-Za-z0-9_-]{1,64}$`` whitelist
+        ``protocol.parse_command`` enforces on the wire, so this method is safe to call
+        directly (from a test, a script, a future non-websocket caller) without depending on
+        that guard having already run.
+
+        Writes via a temp file in the same directory followed by an atomic replace, so a
+        failure partway through (an unwritable directory, a full disk) raises and leaves NO
+        partial preset file behind -- a half-written JSON silently accepted as a preset on a
+        later load would be worse than the save just failing loudly.
+        """
+        if self.user_settings_dir is None:
+            raise ValueError(
+                "save_settings_as requires this Session to have been built with a "
+                "user_settings_dir"
+            )
+        if not isinstance(name, str) or not PRESET_NAME_RE.match(name):
+            raise ValueError(
+                f"preset name must match {PRESET_NAME_RE.pattern!r}; got {name!r}"
+            )
+        self.user_settings_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.user_settings_dir / f"{name}.json"
+        tmp = self.user_settings_dir / f".{name}.json.tmp"
+        try:
+            self.viz.save_settings(str(tmp))
+            tmp.replace(dest)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
+        return dest
 
     # -- description -----------------------------------------------------------
 
@@ -643,7 +708,20 @@ class Session:
             "cameras": self.viz.list_cameras(),
             "presets": self.viz.list_presets(),
             "settings": copy.deepcopy(self.viz.vis_state),
-            "settings_available": list_available_settings(),
+            # Flat names, not the {"name", "origin"} dicts list_available_settings()
+            # actually returns: this list goes straight to viewer.js as a dropdown's option
+            # set (see static/viewer.js), which has always expected plain strings, and a
+            # collision is not this wire message's problem to solve -- see load_settings for
+            # where that gets decided. Kept as-is (additive change only) so this existing
+            # field's contract does not shift under viewer.js.
+            "settings_available": sorted(
+                {d["name"] for d in list_available_settings(self.user_settings_dir)}
+            ),
+            # The {"name", "origin"} shape list_available_settings() actually returns,
+            # untransformed -- so a later task's preset dropdown can tag each entry bundled
+            # vs. user (design spec §6) without reaching back into this module. Additive:
+            # "settings_available" above is untouched for existing/older clients.
+            "settings_catalog": list_available_settings(self.user_settings_dir),
             "has_controller": self._controller is not None,
             "ctrl_mode": self._mode,
             "width": self.width,

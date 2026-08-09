@@ -231,7 +231,10 @@ class SimLoop(threading.Thread):
         elif kind == "render":
             self._session.apply_render(cmd["set"])
         elif kind == "settings":
-            self._session.load_settings(cmd["load"])
+            if "save" in cmd:
+                self._session.save_settings_as(cmd["save"])
+            else:
+                self._session.load_settings(cmd["load"])
         elif kind == "stream":
             if "fps" in cmd:
                 self._fps_cap = cmd["fps"]

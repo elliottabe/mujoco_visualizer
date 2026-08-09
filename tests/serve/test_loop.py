@@ -25,6 +25,8 @@ class FakeSession:
         self.group_calls = []
         self.camera_calls = []
         self.render_calls = []
+        self.settings_loaded = []
+        self.settings_saved = []
         self.resizes = []
         self.resets = 0
         self.mode = None
@@ -82,7 +84,11 @@ class FakeSession:
         self.render_calls.append(settings)
 
     def load_settings(self, name):
-        pass
+        self.settings_loaded.append(name)
+
+    def save_settings_as(self, name):
+        self.settings_saved.append(name)
+        return f"/fake/user/settings/{name}.json"
 
     # -- added for replay mode --
     def set_qpos(self, qpos):
@@ -195,6 +201,42 @@ def test_reset_is_forwarded():
     loop = SimLoop(sess, fps_cap=60, substeps_per_frame=5, idle_pause_s=None)
     loop.submit({"t": "sim", "cmd": "reset", "n": 1})
     assert _run_briefly(loop, lambda: sess.resets >= 1)
+
+
+def test_settings_load_is_forwarded_to_the_session():
+    sess = FakeSession()
+    loop = SimLoop(sess, fps_cap=60, substeps_per_frame=5, idle_pause_s=None)
+    loop.submit({"t": "settings", "load": "Default"})
+    assert _run_briefly(loop, lambda: sess.settings_loaded == ["Default"])
+
+
+def test_settings_save_is_forwarded_to_the_session():
+    """protocol.parse_command can hand the loop {"t": "settings", "save": name} -- _apply
+    must route that to save_settings_as, not treat it as a load and KeyError on cmd["load"]."""
+    sess = FakeSession()
+    loop = SimLoop(sess, fps_cap=60, substeps_per_frame=5, idle_pause_s=None)
+    loop.submit({"t": "settings", "save": "my_look"})
+    assert _run_briefly(loop, lambda: sess.settings_saved == ["my_look"])
+    assert sess.settings_loaded == []
+
+
+def test_a_failed_settings_save_is_reported_not_fatal():
+    """save_settings_as raising (bad name reaching _apply somehow, unwritable dir, ...) must
+    surface as a command error like any other bad command -- not kill the sim thread."""
+    class ExplodingSession(FakeSession):
+        def save_settings_as(self, name):
+            raise OSError("disk full")
+
+    sess = ExplodingSession()
+    loop = SimLoop(sess, fps_cap=60, substeps_per_frame=5, idle_pause_s=None)
+    with running(loop):
+        loop.submit({"t": "settings", "save": "whatever"})
+        assert wait_until(lambda: loop.error is not None)
+        assert loop.error["kind"] == "command"
+        assert "disk full" in loop.error["msg"]
+        # The thread survived -- it can still take and apply further commands.
+        loop.submit({"t": "sim", "cmd": "step", "n": 1})
+        assert wait_until(lambda: sess.steps >= 1)
 
 
 def test_commands_are_coalesced_before_applying():
