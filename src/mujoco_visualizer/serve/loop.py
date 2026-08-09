@@ -17,6 +17,12 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from mujoco_visualizer.serve.locks import (
+    apply_locks,
+    build_joint_qpos_map,
+    pair_with_suffix,
+    resolve_lock_values,
+)
 from mujoco_visualizer.serve.protocol import coalesce
 from mujoco_visualizer.serve.session import Diverged
 
@@ -35,6 +41,7 @@ class SimLoop(threading.Thread):
         source=None,
         frame_dt: float = 1e-3,
         export_factory=None,
+        ghost_suffix: Optional[str] = None,
     ):
         super().__init__(name="SimLoop", daemon=True)
         self._session = session
@@ -96,6 +103,21 @@ class SimLoop(threading.Thread):
         # pressed -- deliberate UX, not an incidental side effect of the paused-scrub case.
         self._replay_dirty = source is not None
 
+        # -- lock state. Names are already expanded through pair_with_suffix (so a doubled
+        # model's suffixed counterpart is included) and any None (freeze-at-engage) request
+        # is resolved to concrete floats the moment the lock command lands -- self._locks
+        # never carries a None. Built lazily from self._session.model (see _jmap) so a
+        # session with no joints at all (most physics-mode tests) never pays for it, and
+        # invalidated on a ghost model swap since that changes nq and the joint set.
+        self._ghost_suffix = ghost_suffix
+        self._joint_map: Optional[Dict[str, Tuple[int, int]]] = None
+        self._locks: Dict[str, List[float]] = {}
+        # The qpos last handed to Session.set_qpos by _write_replay_qpos (post-lock, i.e. what
+        # is actually on screen) -- what a None lock resolves against. Not the same as
+        # self._session.data.qpos: FakeSession (and a future device-resident backend) need not
+        # expose one, and this is exactly the value that was drawn, not some other snapshot.
+        self._last_written_qpos: Optional[np.ndarray] = None
+
         # Injected so the loop is testable with no GL: production passes a factory that
         # builds a real ExportJob (see serve/app.py and the fly launcher).
         self._export_factory = export_factory
@@ -122,6 +144,17 @@ class SimLoop(threading.Thread):
     @property
     def replay_mode(self) -> bool:
         return self._source is not None
+
+    @property
+    def locks(self) -> Dict[str, List[float]]:
+        """The currently active locks: ``{joint name: value}``.
+
+        Values are always concrete floats -- a ``None`` (freeze-at-engage) request is resolved
+        against the frame last written the moment the ``lock`` command lands (see
+        ``_apply_lock``), so ``None`` never survives into this dict. A copy, like every other
+        snapshot accessor here: callers must not be able to reach into live loop state.
+        """
+        return dict(self._locks)
 
     def replay_state(self) -> Dict:
         """Snapshot of the replay playhead. Read from the sim thread and from _publish.
@@ -248,6 +281,8 @@ class SimLoop(threading.Thread):
         elif kind == "export_cancel":
             if self._export_job is not None:
                 self._export_job.cancel()
+        elif kind == "lock":
+            self._apply_lock(cmd)
         elif kind == "sim":
             action = cmd["cmd"]
             if action == "play":
@@ -275,6 +310,62 @@ class SimLoop(threading.Thread):
                     # effect in replay mode is therefore that the rest pose is replaced by the
                     # current frame again on the next tick.
                     self._replay_dirty = True
+
+    def _jmap(self) -> Dict[str, Tuple[int, int]]:
+        """``{joint name: (qpos address, width)}`` for the model currently attached to the
+        session, built once and cached. Invalidated (set back to ``None``) by ``_apply_replay``
+        on a ghost model swap -- the swap changes ``nq`` and adds/removes suffixed joints, so a
+        stale map would offer (or resolve) addresses that no longer describe this model.
+        """
+        if self._joint_map is None:
+            self._joint_map = build_joint_qpos_map(self._session.model)
+        return self._joint_map
+
+    def _apply_lock(self, cmd: Dict) -> None:
+        """Apply one (possibly coalesced) ``lock`` command.
+
+        ``clear`` is applied BEFORE ``set``, so a coalesced command carrying both means
+        "release everything, then lock exactly these" -- per ``coalesce``'s own contract.
+
+        Every name in ``set`` is validated against the joint map (via ``pair_with_suffix`` +
+        membership) HERE, synchronously, before anything is written anywhere -- not deferred to
+        the next frame write. An unknown joint therefore raises straight out of this method,
+        which the caller (``_apply``, called from ``run()``'s per-command loop) reports as a
+        ``kind='command'`` error that does NOT pause playback, exactly like a bad ``ctrl``/
+        ``camera``/etc. name. Deferring the check to ``apply_locks`` at write time would instead
+        raise inside ``_advance_replay``/``_step_replay``, which run() reports as ``kind=
+        'replay'`` and pauses -- the wrong treatment for what is a client-input mistake, not
+        evidence the physics state is untrustworthy.
+
+        A ``None`` value ("freeze at the value held when it engages") is resolved immediately
+        against ``self._last_written_qpos`` -- the last frame this loop actually wrote -- via
+        ``resolve_lock_values``, so ``self._locks`` never stores a ``None``.
+        """
+        jmap = self._jmap()
+        if cmd.get("clear"):
+            self._locks = {}
+        for name, value in cmd.get("set", {}).items():
+            for expanded in pair_with_suffix([name], jmap, self._ghost_suffix):
+                if expanded not in jmap:
+                    raise KeyError(f"no joint {expanded!r} in this model")
+                if value is None:
+                    if self._last_written_qpos is None:
+                        raise ValueError(
+                            f"cannot freeze {expanded!r}: no frame has been written yet"
+                        )
+                    self._locks.update(
+                        resolve_lock_values(self._last_written_qpos, [expanded], jmap)
+                    )
+                    continue
+                adr, width = jmap[expanded]
+                vals = [float(v) for v in value] if isinstance(value, (list, tuple)) else [
+                    float(value)
+                ]
+                if len(vals) != width:
+                    raise ValueError(
+                        f"joint {expanded!r} expects {width} value(s), got {len(vals)}"
+                    )
+                self._locks[expanded] = vals
 
     def _physics_steps_per_control_step(self) -> Optional[float]:
         """Physics steps covered by one control step, or None when there is no controller.
@@ -406,6 +497,11 @@ class SimLoop(threading.Thread):
             # re-uploads. Coalescing means at most one call per tick either way.
             self._session.swap_model("alt" if new_ghost else "primary")
             self._ghost = new_ghost
+            # The swapped-to model has a different nq and joint set (e.g. a suffixed reference
+            # copy that only exists in the ghost model) -- invalidate so the next lock-related
+            # access (a `lock` command, or the next write) rebuilds it from the new model
+            # rather than resolving/writing against stale addresses.
+            self._joint_map = None
             # The source and the model must agree on qpos width in every tick from here
             # on: a ghost-off-width source (e.g. 101 DOF) paired with the ghost-on model
             # (e.g. 202 DOF, policy+reference concatenated) is exactly the mismatch that
@@ -466,7 +562,14 @@ class SimLoop(threading.Thread):
                 f"export trim out={hi} past the end of clip {self._clip} (length {length})"
             )
         indices = list(range(lo, hi + 1, stride))
-        frames = np.stack([self._source.qpos(self._clip, i) for i in indices])
+        # Locked exactly like the live tick, and through the same apply_locks call against the
+        # same self._locks -- an export must show what the viewer showed, not the raw file, or
+        # a locked-wings preview would export flapping wings with no way to notice until the
+        # file is opened.
+        frames = np.stack(
+            [apply_locks(self._source.qpos(self._clip, i), self._locks, self._jmap())
+             for i in indices]
+        )
         self._export_job = self._export_factory(
             frames, dict(cmd, clip=self._clip, trim=[lo, hi], stride=stride)
         )
@@ -488,6 +591,21 @@ class SimLoop(threading.Thread):
             return self._out, True
         return nxt, False
 
+    def _write_replay_qpos(self, frame: int) -> None:
+        """The ONE place a replay frame becomes the thing handed to ``Session.set_qpos``.
+
+        Both ``_advance_replay`` (write-then-advance) and ``_step_replay`` (advance-then-write)
+        call this instead of ``self._session.set_qpos`` directly, so locks apply to whichever
+        path is live without a second ``apply_locks`` call anywhere -- the frame-semantics
+        ordering each of those two methods owns is untouched; only where the write itself lands
+        moved, into here. ``apply_locks`` always returns a copy, so the source's frozen array is
+        never touched, locked or not.
+        """
+        raw = self._source.qpos(self._clip, frame)
+        qpos = apply_locks(raw, self._locks, self._jmap())
+        self._last_written_qpos = qpos
+        self._session.set_qpos(qpos)
+
     def _advance_replay(self) -> None:
         """Write the current frame, then move the playhead one stride if playing.
 
@@ -499,7 +617,7 @@ class SimLoop(threading.Thread):
         the cursor now points at for next time". Contrast :meth:`_step_replay`, which needs
         the opposite order for the opposite reason.
         """
-        self._session.set_qpos(self._source.qpos(self._clip, self._frame))
+        self._write_replay_qpos(self._frame)
         self._published_frame = self._frame
         self._replay_dirty = False
         if not self._playing:
@@ -537,7 +655,7 @@ class SimLoop(threading.Thread):
             if stop:
                 break
         self._frame = frame
-        self._session.set_qpos(self._source.qpos(self._clip, self._frame))
+        self._write_replay_qpos(self._frame)
         self._published_frame = self._frame
         self._replay_dirty = False
 
@@ -580,6 +698,7 @@ class SimLoop(threading.Thread):
             # must be called exactly once per frame -- here.
             "warn": self._session.new_warnings(),
             "readout": self._session.readout(),
+            "locks": dict(self._locks),
         }
         if replay is not None:
             # rtf stays 0 in replay mode: nothing advances data.time, and reporting a

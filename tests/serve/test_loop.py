@@ -5,12 +5,55 @@ import contextlib
 import threading
 import time
 
+import mujoco
 import numpy as np
 import pytest
 
 from mujoco_visualizer.serve.loop import SimLoop
 from mujoco_visualizer.serve.replay import ArrayTrajectorySource
 from mujoco_visualizer.serve.session import Diverged
+
+# A tiny real model for the lock tests: three independent hinge DOFs (nq == 3, matching
+# make_source()'s default), so build_joint_qpos_map is exercised for real instead of a faked
+# map. "joint0" is left unlocked in every lock test (dof 0 already encodes the frame index, per
+# make_source below) and "joint1"/"joint2" are free to be locked without disturbing it.
+_LOCK_XML = """
+<mujoco>
+  <!-- timestep pinned to 1e-4: _physics_steps_per_control_step reads model.opt.timestep once
+       a session HAS a `.model` (which FakeSession now does, for build_joint_qpos_map), and
+       every controller-rate test in this file (e.g. RampSession) is written assuming exactly
+       the dt=1e-4 MuJoCo's own default (2e-3) would silently replace. -->
+  <option timestep="0.0001"/>
+  <worldbody>
+    <body name="b0"><joint name="joint0" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b1"><joint name="joint1" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b2"><joint name="joint2" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+  </worldbody>
+</mujoco>
+"""
+_LOCK_MODEL = mujoco.MjModel.from_xml_string(_LOCK_XML)
+
+# The "ghost" counterpart: same nq (3), but the middle joint is named as if it were a
+# suffixed reference copy -- proof that a loop's cached joint map is rebuilt from THIS model,
+# not the primary one, once a ghost swap lands (see
+# test_the_joint_map_rebuilds_after_a_ghost_model_swap).
+_LOCK_ALT_XML = """
+<mujoco>
+  <option timestep="0.0001"/>
+  <worldbody>
+    <body name="b0"><joint name="joint0" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b1"><joint name="joint1_ref" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+    <body name="b2"><joint name="joint2" type="hinge" axis="0 0 1"/>
+      <geom type="sphere" size="0.01"/></body>
+  </worldbody>
+</mujoco>
+"""
+_LOCK_ALT_MODEL = mujoco.MjModel.from_xml_string(_LOCK_ALT_XML)
 
 
 class FakeSession:
@@ -35,6 +78,10 @@ class FakeSession:
         self.qpos_writes = []
         self.model_swaps = []
         self.pose = None
+        # For build_joint_qpos_map to exercise a real model. See _LOCK_MODEL/_LOCK_ALT_MODEL
+        # above; swap_model below actually switches this, mirroring the real Session so a
+        # ghost toggle is visible to SimLoop's own joint-map cache, not just recorded here.
+        self.model = _LOCK_MODEL
 
     # -- surface SimLoop uses --
     @property
@@ -96,6 +143,7 @@ class FakeSession:
 
     def swap_model(self, which):
         self.model_swaps.append(which)
+        self.model = _LOCK_ALT_MODEL if which == "alt" else _LOCK_MODEL
 
     def vis_state_snapshot(self):
         return {}
@@ -945,6 +993,89 @@ def test_step_at_out_stays_at_out_when_not_looping():
         assert loop.playing is False
 
 
+# -- joint locks ---------------------------------------------------------------
+
+
+def test_locked_joint_holds_while_an_unlocked_neighbour_moves():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        loop.submit({"t": "replay", "play": True})
+        time.sleep(0.3)
+        loop.submit({"t": "replay", "play": False})
+        time.sleep(0.1)
+        writes = session.qpos_writes
+        assert len(writes) > 3
+        assert all(w[1] == 5.0 for w in writes[1:]), "the locked dof must hold"
+        assert len({w[0] for w in writes}) > 1, "an unlocked dof must still move"
+
+
+def test_null_lock_freezes_at_the_value_held_when_it_engaged():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 4})
+        time.sleep(0.15)
+        held = session.qpos_writes[-1][1]
+        loop.submit({"t": "lock", "set": {"joint1": None}})
+        loop.submit({"t": "replay", "frame": 8})
+        time.sleep(0.15)
+        assert session.qpos_writes[-1][1] == held
+
+
+def test_clear_releases_every_lock():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        time.sleep(0.1)
+        loop.submit({"t": "lock", "clear": True})
+        time.sleep(0.1)
+        assert loop.locks == {}
+
+
+def test_locks_ride_the_frame_meta():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        time.sleep(0.15)
+        got = loop.wait_for_frame(-1, timeout=1.0)
+        assert got is not None
+        assert got[2]["locks"] == {"joint1": [5.0]}
+
+
+def test_an_unknown_joint_reports_a_command_error_without_pausing():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "play": True})
+        time.sleep(0.1)
+        loop.submit({"t": "lock", "set": {"not_a_joint": 1.0}})
+        time.sleep(0.15)
+        err = loop.error
+        assert err is not None and err["kind"] == "command" and err["paused"] is False
+        assert loop.playing is True
+
+
+def test_the_joint_map_rebuilds_after_a_ghost_model_swap():
+    """``_LOCK_ALT_MODEL`` renames the middle joint from ``joint1`` to ``joint1_ref`` -- so
+    this only passes if the loop's cached joint map is actually rebuilt against the NEW
+    model, not reused from the primary one (which has no ``joint1_ref`` at all, and would
+    reject it as an unknown-joint command error just like the plain unknown-joint case
+    above)."""
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "lock", "set": {"joint1_ref": 1.0}})
+        time.sleep(0.1)
+        assert loop.error is not None and loop.error["kind"] == "command"
+        assert loop.locks == {}, "a name only the (not yet active) alt model has must be rejected"
+
+        loop.submit({"t": "replay", "ghost": True})
+        time.sleep(0.15)
+        assert session.model_swaps == ["alt"]
+
+        loop.submit({"t": "lock", "set": {"joint1_ref": 9.0}})
+        # A `lock` command alone does not mark the playhead dirty (only a `replay` command
+        # does), so a scrub is needed here to force a fresh write to actually observe the
+        # lock take effect -- otherwise this would only be re-checking the write the ghost
+        # swap's own dirty flag already produced, before the lock existed.
+        loop.submit({"t": "replay", "frame": 5})
+        time.sleep(0.15)
+        assert loop.locks == {"joint1_ref": [9.0]}
+        assert session.qpos_writes[-1][1] == 9.0, "the lock took effect on the next write"
+
+
 # -- export --------------------------------------------------------------------
 
 
@@ -1132,3 +1263,14 @@ def test_export_progress_rides_the_frame_meta():
         _seq, _jpeg, meta = got
         assert meta["export"]["state"] == "rendering"
         assert meta["export"]["total"] == 10
+
+
+def test_the_export_slice_is_locked_too():
+    with replay_loop_with_export() as (loop, made):
+        loop.submit({"t": "lock", "set": {"joint1": 5.0}})
+        time.sleep(0.1)
+        loop.submit({"t": "export", "width": 64, "height": 48, "fps": 30,
+                     "format": "mp4", "crf": 20})
+        time.sleep(0.2)
+        assert len(made) == 1
+        assert (made[0].frames[:, 1] == 5.0).all(), "export must inherit the locks"
