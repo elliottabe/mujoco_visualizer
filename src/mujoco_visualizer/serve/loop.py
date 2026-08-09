@@ -151,10 +151,13 @@ class SimLoop(threading.Thread):
 
         Values are always concrete floats -- a ``None`` (freeze-at-engage) request is resolved
         against the frame last written the moment the ``lock`` command lands (see
-        ``_apply_lock``), so ``None`` never survives into this dict. A copy, like every other
-        snapshot accessor here: callers must not be able to reach into live loop state.
+        ``_apply_lock``), so ``None`` never survives into this dict. DEEPLY copied -- ``dict()``
+        alone only copies the outer mapping, leaving the inner value lists aliased to
+        ``self._locks``'s own, so a caller mutating a returned list in place (``loop.locks
+        ["j"][0] = 999.0``) would otherwise reach directly into live loop state despite this
+        looking like a snapshot.
         """
-        return dict(self._locks)
+        return {name: list(values) for name, values in self._locks.items()}
 
     def replay_state(self) -> Dict:
         """Snapshot of the replay playhead. Read from the sim thread and from _publish.
@@ -339,33 +342,50 @@ class SimLoop(threading.Thread):
 
         A ``None`` value ("freeze at the value held when it engages") is resolved immediately
         against ``self._last_written_qpos`` -- the last frame this loop actually wrote -- via
-        ``resolve_lock_values``, so ``self._locks`` never stores a ``None``.
+        ``resolve_lock_values``, so ``self._locks`` never stores a ``None``. That resolve is
+        NOT trustworthy on its own: it slices ``self._last_written_qpos`` by address, and a
+        numpy slice past the end of the array silently truncates rather than raising -- reachable
+        whenever a ``ghost`` toggle (which rebuilds the joint map against a wider/narrower model,
+        see ``_apply_replay``) lands in the SAME drain batch as this command, before the next
+        write has caught ``self._last_written_qpos`` up to the new model's width. So the same
+        ``len(vals) != width`` check applied to an explicit value below is applied to a resolved
+        one too -- the width check is what turns that truncation into a synchronous, non-pausing
+        ``kind='command'`` error here, instead of a ``ValueError`` escaping from ``apply_locks``
+        inside the write path later (``kind='replay'``, paused) once the mis-width entry is
+        actually applied.
+
+        Names are collected into a local ``pending`` dict and only merged into ``self._locks``
+        at the very end, so a ``set`` with one bad name among several good ones (e.g. a UI
+        toggling several joints in one message) commits NOTHING rather than the valid subset --
+        the same all-or-nothing guarantee ``clear`` itself already has by construction.
         """
         jmap = self._jmap()
         if cmd.get("clear"):
             self._locks = {}
+        pending: Dict[str, List[float]] = {}
         for name, value in cmd.get("set", {}).items():
             for expanded in pair_with_suffix([name], jmap, self._ghost_suffix):
                 if expanded not in jmap:
                     raise KeyError(f"no joint {expanded!r} in this model")
+                _adr, width = jmap[expanded]
                 if value is None:
                     if self._last_written_qpos is None:
                         raise ValueError(
-                            f"cannot freeze {expanded!r}: no frame has been written yet"
+                            f"cannot freeze {expanded!r}: replay has not written a frame yet "
+                            "(locks only take effect in replay mode)"
                         )
-                    self._locks.update(
-                        resolve_lock_values(self._last_written_qpos, [expanded], jmap)
-                    )
-                    continue
-                adr, width = jmap[expanded]
-                vals = [float(v) for v in value] if isinstance(value, (list, tuple)) else [
-                    float(value)
-                ]
+                    resolved = resolve_lock_values(self._last_written_qpos, [expanded], jmap)
+                    vals = resolved[expanded]
+                elif isinstance(value, (list, tuple)):
+                    vals = [float(v) for v in value]
+                else:
+                    vals = [float(value)]
                 if len(vals) != width:
                     raise ValueError(
                         f"joint {expanded!r} expects {width} value(s), got {len(vals)}"
                     )
-                self._locks[expanded] = vals
+                pending[expanded] = vals
+        self._locks.update(pending)
 
     def _physics_steps_per_control_step(self) -> Optional[float]:
         """Physics steps covered by one control step, or None when there is no controller.
@@ -502,6 +522,18 @@ class SimLoop(threading.Thread):
             # access (a `lock` command, or the next write) rebuilds it from the new model
             # rather than resolving/writing against stale addresses.
             self._joint_map = None
+            # RELEASE every lock on a swap, rather than re-resolving/pruning them against the
+            # new map. Chosen over re-resolving because a lock's address (and, for a None
+            # value, the frozen number itself) was computed against the model that is now
+            # gone: re-resolving an explicit value at the SAME address on a different model
+            # can silently repoint it at a different joint's dof if the address happens to
+            # still be in range, and a None (freeze-at-engage) value has no sane new frame to
+            # fall back to -- the one it froze at may not even have a same-width counterpart
+            # on the new model. A lock resolved against a different model's addresses is not
+            # meaningfully "the same lock", so dropping it and letting the client re-lock
+            # deliberately against what it can now see (scene_message's own "joints" list)
+            # is the only choice that cannot silently lock the wrong thing.
+            self._locks = {}
             # The source and the model must agree on qpos width in every tick from here
             # on: a ghost-off-width source (e.g. 101 DOF) paired with the ghost-on model
             # (e.g. 202 DOF, policy+reference concatenated) is exactly the mismatch that
@@ -698,7 +730,10 @@ class SimLoop(threading.Thread):
             # must be called exactly once per frame -- here.
             "warn": self._session.new_warnings(),
             "readout": self._session.readout(),
-            "locks": dict(self._locks),
+            # Deeply copied like the `locks` property (see its docstring): this dict reaches
+            # request threads verbatim via latest()/wait_for_frame(), so an aliased inner list
+            # would let a reader mutate published, supposedly-immutable loop state in place.
+            "locks": {name: list(values) for name, values in self._locks.items()},
         }
         if replay is not None:
             # rtf stays 0 in replay mode: nothing advances data.time, and reporting a
