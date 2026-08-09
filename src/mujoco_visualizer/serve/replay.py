@@ -4,8 +4,10 @@ This is the seam that makes replay symmetric with physics. ``Session`` already s
 owns *stepping and state* (``backend``) from who owns *rendering and description*
 (``Session``); a saved rollout is simply a different answer to the first question.
 
-Everything is held in RAM on purpose. Measured on an 8.25 GB rollout: all 198 clips of qpos
-is 127 MB and loads in 0.53 s, while a single rendered frame costs 5.4-41 ms. So per-access
+Everything is held in RAM on purpose. Measured on an 8.25 GB rollout: all 198 clips of policy
+qpos is 127 MB and loads in 0.53 s, while a single rendered frame costs 5.4-41 ms. A viewer
+with a reference overlay holds a second array of the same shape, so the resident total is
+~254 MB, both frozen for the life of the process. So per-access
 speed is irrelevant (a warm HDF5 chunk read was already 0.19 ms) and the thing worth buying
 is not speed but *shareability*: an immutable numpy array needs no lock, so the render thread
 and a background export thread can both read it, which an h5py handle cannot offer -- h5py

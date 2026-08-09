@@ -66,17 +66,30 @@ def _carry_vis_state_across_swap(vis_state: Dict, model: mujoco.MjModel) -> Dict
 
     Category colours, lighting, floor, flags and camera are all model-agnostic and carry
     across a swap unchanged. ``geom_colors`` is the one exception: it is keyed by geom id, and
-    ids are model-specific -- on the real reference-ghost pair the policy model has 274 geoms
-    and the ghost has 547, so a ghost->policy swap would otherwise leave ids >= 274 pointing at
-    geoms that no longer exist on the smaller model (wrong at best, an index error at worst).
-    Going the other way (policy->ghost) every existing id is still a valid prefix, so nothing
-    is dropped.
+    ids are model-specific -- on a real overlay pair the second model has roughly twice the
+    geoms of the first. Swapping from a model with more geoms to one with fewer would
+    otherwise leave ids past the smaller model's ``ngeom`` pointing at geoms that no longer
+    exist (wrong at best, an index error at worst). Going the other way every existing id is
+    still a valid prefix, so nothing is dropped.
+
+    Keys are coerced with ``int()`` rather than compared as-is. ``load_settings`` produces int
+    keys, but ``apply_render`` walks dotted keys verbatim, so a wire command
+    ``{"t":"render","set":{"geom_colors.5":"#f00"}}`` inserts the *string* ``"5"`` -- and
+    ``"5" < model.ngeom`` raises TypeError, which surfaced as the ghost toggle failing rather
+    than as anything to do with colours. A key that is not an int at all is dropped rather
+    than raising: it cannot name a geom, so it can only be junk.
     """
     geom_colors = vis_state.get("geom_colors")
     if geom_colors:
-        vis_state["geom_colors"] = {
-            gid: hexcolor for gid, hexcolor in geom_colors.items() if gid < model.ngeom
-        }
+        kept = {}
+        for gid, hexcolor in geom_colors.items():
+            try:
+                index = int(gid)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < model.ngeom:
+                kept[index] = hexcolor
+        vis_state["geom_colors"] = kept
     return vis_state
 
 
@@ -433,22 +446,41 @@ class Session:
             cam["mode"] = "free"
 
     def apply_render(self, settings: Dict) -> None:
-        """Merge flat render-setting keys into ``vis_state`` (e.g. ``floor.alpha``)."""
+        """Merge flat render-setting keys into ``vis_state`` (e.g. ``floor.alpha``).
+
+        ``geom_colors`` is the one sub-dict whose keys are not strings: every other producer
+        (``load_settings``, the GUIs) keys it by INT geom id, and both consumers agree --
+        ``Visualizer._apply_geom_colors`` tests ``if i in geom_overrides`` with an int, and
+        ``_carry_vis_state_across_swap`` compares the key against ``model.ngeom``. A dotted
+        wire key arrives as text, so writing it through verbatim inserted the string ``"5"``:
+        the colour then never applied (the int lookup missed) and the next model swap raised
+        ``TypeError: '<' not supported between 'str' and 'int'``, surfacing as the ghost
+        toggle failing. Coerced here, at the one place wire keys enter, rather than papered
+        over in each consumer.
+        """
         for dotted, value in settings.items():
             node = self.viz.vis_state
             parts = dotted.split(".")
             for part in parts[:-1]:
                 node = node.setdefault(part, {})
-            node[parts[-1]] = value
+            key = parts[-1]
+            if parts[:-1] == ["geom_colors"]:
+                try:
+                    key = int(key)
+                except ValueError:
+                    raise ValueError(
+                        f"'geom_colors' is keyed by geom id; {key!r} is not an integer"
+                    ) from None
+            node[key] = value
 
     @property
     def camera(self) -> Optional[str]:
         """The named camera/preset currently selected, or ``None`` for the free camera.
 
         Read-only, and deliberately public: an export job has to render with the camera the
-        user pressed the button on, so :func:`scripts.rollout_viewer.launch.build_export_factory`
-        needs this value. It read ``session._camera`` before this property existed, which
-        made a private attribute part of a cross-repo contract. Setting still goes through
+        user pressed the button on, so whatever builds that job needs this value. Export
+        factories read ``session._camera`` before this property existed, which made a private
+        attribute part of an out-of-package contract. Setting still goes through
         :meth:`set_camera`, which is where the wire-name translation lives.
         """
         return self._camera

@@ -895,3 +895,63 @@ def test_swap_model_drops_geom_colors_that_do_not_exist_on_the_new_model(two_mod
 
     assert s.model.ngeom == 1
     assert s.viz.vis_state["geom_colors"] == {0: "#ff0000"}
+
+
+def test_a_dotted_geom_color_key_lands_as_an_int_geom_id(sess):
+    """``geom_colors`` is keyed by INT geom id everywhere else in this package.
+
+    ``apply_render`` walks dotted keys verbatim, so a wire command
+    ``{"t":"render","set":{"geom_colors.0":"#f00"}}`` inserted the STRING ``"0"``. Two
+    consequences: ``Visualizer._apply_geom_colors`` tests ``if i in geom_overrides`` with an
+    int, so the colour never applied at all; and the next model swap compared ``"0" <
+    model.ngeom`` and raised TypeError, surfacing as the ghost toggle failing.
+    """
+    sess.apply_render({"geom_colors.0": "#ff0000"})
+    assert sess.viz.vis_state["geom_colors"] == {0: "#ff0000"}
+    assert all(isinstance(k, int) for k in sess.viz.vis_state["geom_colors"])
+
+
+def test_a_dotted_geom_color_key_that_is_not_a_geom_id_is_refused(sess):
+    """A non-integer key cannot name a geom, so it is a client error -- reported as a bad
+    command (which does not pause the shared session) rather than stored to break a later
+    swap."""
+    with pytest.raises(ValueError, match="keyed by geom id"):
+        sess.apply_render({"geom_colors.floor": "#ff0000"})
+    assert "floor" not in sess.viz.vis_state["geom_colors"]
+
+
+def test_other_dotted_keys_are_still_written_verbatim(sess):
+    """Only geom_colors is coerced: every other sub-dict really is keyed by name."""
+    sess.apply_render({"floor.alpha": 0.25, "vis_flags.shadows": False})
+    assert sess.viz.vis_state["floor"]["alpha"] == 0.25
+    assert sess.viz.vis_state["vis_flags"]["shadows"] is False
+
+
+def test_carrying_geom_colors_tolerates_a_non_int_key_directly():
+    """``_carry_vis_state_across_swap``'s own coercion, tested at the function.
+
+    ``Session.apply_render`` now normalises wire keys before they are ever stored, so the GL
+    swap test below no longer reaches this branch -- it would pass with the coercion removed.
+    Testing the function directly is what keeps the defence from becoming a line nothing
+    constrains: this is the last barrier for any future producer of string keys.
+    """
+    from mujoco_visualizer.serve.session import _carry_vis_state_across_swap
+
+    model = type("M", (), {"ngeom": 3})()
+    state = {"geom_colors": {"1": "#a", 2: "#b", "9": "#c", 5: "#d", -1: "#e", "x": "#f"}}
+    _carry_vis_state_across_swap(state, model)
+    # "1" survives as int 1; 2 stays; out-of-range ("9", 5), negative and non-numeric go.
+    assert state["geom_colors"] == {1: "#a", 2: "#b"}
+
+
+@pytest.mark.gl
+def test_a_wire_inserted_geom_color_key_does_not_break_a_model_swap(two_model_session):
+    """The end-to-end shape of the bug: colour a geom through the wire path, then toggle the
+    ghost. Before the coercion this raised ``TypeError: '<' not supported between instances of
+    'str' and 'int'`` out of ``_carry_vis_state_across_swap`` and the swap failed."""
+    s = two_model_session
+    s.swap_model("alt")
+    s.apply_render({"geom_colors.1": "#00ff00"})
+    s.swap_model("primary")  # geom id 1 does not exist here, so it must be DROPPED, not raise
+    assert s.viz.vis_state["geom_colors"] == {}
+    assert s.active_model_name == "primary"
