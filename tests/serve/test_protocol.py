@@ -413,3 +413,63 @@ def test_lock_clear_is_not_swallowed_by_a_later_set():
     ])
     kinds = [(c.get("clear"), c.get("set")) for c in out]
     assert any(c is True for c, _ in kinds), "a clear must not vanish into a later set"
+
+
+def test_lock_combined_set_and_clear_in_single_command():
+    """A single command with both set and clear must preserve both fields."""
+    out = coalesce([parse_command({"t": "lock", "set": {"a": 1.0}, "clear": True})])
+    assert len(out) == 1
+    assert out[0]["clear"] is True
+    assert out[0]["set"] == {"a": [1.0]}
+
+
+def test_lock_set_then_clear_yields_only_clear():
+    """After a clear, earlier set values are discarded."""
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+        parse_command({"t": "lock", "clear": True}),
+    ])
+    assert len(out) == 1
+    assert out[0] == {"t": "lock", "clear": True}
+
+
+def test_lock_clear_then_set_preserves_both():
+    """Clear resets the accumulator, then set merges onto the empty dict."""
+    out = coalesce([
+        parse_command({"t": "lock", "clear": True}),
+        parse_command({"t": "lock", "set": {"b": 2.0}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["clear"] is True
+    assert out[0]["set"] == {"b": [2.0]}
+
+
+def test_lock_combined_followed_by_set_only():
+    """Combined command followed by set-only: clear applies first, then both sets merge."""
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}, "clear": True}),
+        parse_command({"t": "lock", "set": {"b": 2.0}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["clear"] is True
+    assert out[0]["set"] == {"a": [1.0], "b": [2.0]}
+
+
+def test_lock_none_then_number_for_same_key():
+    """Number overwrites None for the same key in coalesce."""
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": None}}),
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["set"] == {"a": [1.0]}, "later number wins over None"
+
+
+def test_lock_number_then_none_for_same_key():
+    """None survives coalesce when it overwrites a number for the same key."""
+    out = coalesce([
+        parse_command({"t": "lock", "set": {"a": 1.0}}),
+        parse_command({"t": "lock", "set": {"a": None}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["set"]["a"] is None, "None must survive as None, not be coerced to [0.0]"

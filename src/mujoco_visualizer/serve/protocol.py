@@ -12,6 +12,7 @@ validating a filename is exactly a validation job.
 """
 
 import json
+import math
 from typing import Dict, List
 
 from mujoco_visualizer.render_settings import list_available_settings
@@ -342,7 +343,7 @@ def parse_command(raw) -> Dict:
                                 f"got {type(v).__name__}"
                             )
                         float_val = float(v)
-                        if not (float_val == float_val and float_val != float('inf') and float_val != float('-inf')):
+                        if not math.isfinite(float_val):
                             raise CommandError(
                                 f"lock value for {name!r} element {i} must be finite, got {float_val}"
                             )
@@ -356,7 +357,7 @@ def parse_command(raw) -> Dict:
                             f"got {type(value).__name__}"
                         )
                     float_val = float(value)
-                    if not (float_val == float_val and float_val != float('inf') and float_val != float('-inf')):
+                    if not math.isfinite(float_val):
                         raise CommandError(
                             f"lock value for {name!r} must be finite, got {float_val}"
                         )
@@ -378,7 +379,12 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
     ``_LAST_WINS`` types keep only their final message. ``ctrl`` sets and ``replay`` commands
     merge key-by-key with later values winning. ``ctrl_group`` keeps the last gain per group.
     ``sim`` messages are events (play/pause/step/reset) and are all preserved in order.
-    ``lock.clear`` is an event (always preserved); ``lock.set`` merges key-by-key.
+
+    ``lock`` commands merge with special handling: ``clear`` is an ordered event that resets the
+    running set accumulator, and is preserved in output. When a message carries both ``set`` and
+    ``clear``, the ``clear`` applies first (resetting the accumulator) and then the ``set`` is
+    merged onto it. The final output carries both fields if they were ever set, omitting an
+    empty ``set`` and omitting ``clear`` if it was never encountered.
 
     ``replay`` merges rather than last-wins because its eight fields are independent knobs,
     not one value: a scrub drag emitting ``{frame:...}`` every few ms must still coalesce to a
@@ -396,7 +402,8 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
     merged_replay: Dict = {}
     replay_index = None
     merged_lock_set: Dict = {}
-    lock_set_index = None
+    lock_clear_flag: bool = False
+    lock_index = None
     group_index: Dict[str, int] = {}
     keep = [True] * len(cmds)
 
@@ -419,13 +426,15 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
                 keep[replay_index] = False
             replay_index = i
         elif kind == "lock":
-            # Merge set values key-by-key, but keep clear commands as separate events
+            # Process clear first (resets accumulator), then merge set values key-by-key
+            if cmd.get("clear"):
+                lock_clear_flag = True
+                merged_lock_set = {}
             if "set" in cmd:
                 merged_lock_set.update(cmd["set"])
-                if lock_set_index is not None:
-                    keep[lock_set_index] = False
-                lock_set_index = i
-            # clear is an event; keep it
+            if lock_index is not None:
+                keep[lock_index] = False
+            lock_index = i
         elif kind == "ctrl_group":
             group = cmd["group"]
             if group in group_index:
@@ -440,8 +449,13 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             out.append({"t": "ctrl", "set": dict(merged_ctrl)})
         elif i == replay_index:
             out.append({"t": "replay", **merged_replay})
-        elif i == lock_set_index:
-            out.append({"t": "lock", "set": dict(merged_lock_set)})
+        elif i == lock_index:
+            out_lock = {"t": "lock"}
+            if lock_clear_flag:
+                out_lock["clear"] = True
+            if merged_lock_set:
+                out_lock["set"] = dict(merged_lock_set)
+            out.append(out_lock)
         else:
             out.append(cmd)
     return out
