@@ -127,6 +127,25 @@ def test_coalesce_is_stable_for_unrelated_types():
     assert coalesce(cmds) == cmds
 
 
+def test_coalesce_merges_render_sets_key_by_key_rather_than_replacing():
+    """render's payload is a {key: value} delta, not a whole state -- a settings panel with
+    forty controls must not lose an earlier tick's key to a later tick's unrelated key."""
+    out = coalesce([
+        parse_command({"t": "render", "set": {"colors.thorax": "#ff0000"}}),
+        parse_command({"t": "render", "set": {"alpha": 0.5}}),
+    ])
+    assert len(out) == 1
+    assert out[0]["set"] == {"colors.thorax": "#ff0000", "alpha": 0.5}
+
+
+def test_coalesce_render_later_value_wins_per_key():
+    out = coalesce([
+        parse_command({"t": "render", "set": {"alpha": 0.2}}),
+        parse_command({"t": "render", "set": {"alpha": 0.9}}),
+    ])
+    assert out[0]["set"] == {"alpha": 0.9}
+
+
 def test_round_trips_through_json():
     original = {"t": "render", "set": {"floor.alpha": 0.5}}
     assert parse_command(json.dumps(original))["set"] == {"floor.alpha": 0.5}
