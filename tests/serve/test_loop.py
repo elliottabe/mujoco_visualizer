@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from mujoco_visualizer.serve.loop import SimLoop
+from mujoco_visualizer.serve.replay import ArrayTrajectorySource
 from mujoco_visualizer.serve.session import Diverged
 
 
@@ -31,6 +32,8 @@ class FakeSession:
         self.controller_rate_hz = None
         self._diverge_after = diverge_after
         self._time = 0.0
+        self.qpos_writes = []
+        self.model_swaps = []
 
     # -- surface SimLoop uses --
     @property
@@ -80,8 +83,15 @@ class FakeSession:
     def load_settings(self, name):
         pass
 
+    # -- added for replay mode --
     def set_qpos(self, qpos):
-        pass
+        self.qpos_writes.append(np.asarray(qpos).copy())
+
+    def swap_model(self, which):
+        self.model_swaps.append(which)
+
+    def vis_state_snapshot(self):
+        return {}
 
     def reset(self):
         self.resets += 1
@@ -499,3 +509,132 @@ def test_stop_closes_the_session():
     loop = SimLoop(sess, fps_cap=60, substeps_per_frame=1, idle_pause_s=None)
     _run_briefly(loop, lambda: sess.renders >= 1)
     assert sess.closed is True
+
+
+# -- replay mode --------------------------------------------------------------
+
+
+def make_source(n_clips=2, n_frames=10, nq=3):
+    q = np.arange(n_clips * n_frames * nq, dtype=np.float32)
+    return ArrayTrajectorySource(q.reshape(n_clips, n_frames, nq))
+
+
+@contextlib.contextmanager
+def running_replay_loop(source=None, **kw):
+    session = FakeSession()
+    loop = SimLoop(session, source=source or make_source(), fps_cap=1000.0, idle_pause_s=None, **kw)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        yield session, loop
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
+
+
+def test_replay_mode_is_detected_from_the_source():
+    session = FakeSession()
+    assert SimLoop(session).replay_mode is False
+    assert SimLoop(session, source=make_source()).replay_mode is True
+
+
+def test_replay_never_steps_physics():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "play": True})
+        time.sleep(0.2)
+        assert session.steps == 0, "replay mode must not call session.step()"
+        assert len(session.qpos_writes) > 1, "replay mode must write qpos each tick"
+
+
+def test_scrub_writes_that_exact_frame_without_playing():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 7})
+        time.sleep(0.15)
+        assert loop.replay_state()["frame"] == 7
+        expected = make_source().qpos(0, 7)
+        np.testing.assert_array_equal(session.qpos_writes[-1], expected)
+        assert loop.playing is False
+
+
+def test_playback_advances_by_stride():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 0, "stride": 3, "play": True})
+        time.sleep(0.3)
+        loop.submit({"t": "replay", "play": False})
+        time.sleep(0.1)
+        frames = [int(w[0] / 3) for w in session.qpos_writes]  # dof0 encodes frame index
+        deltas = {b - a for a, b in zip(frames, frames[1:]) if b > a}
+        assert deltas == {3}, f"expected stride-3 advance, saw deltas {deltas}"
+
+
+def test_playback_loops_within_trim_when_loop_is_true():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "trim": [2, 5], "frame": 2, "loop": True, "play": True})
+        # Thread.start() blocks until the child thread has begun running, so the loop's very
+        # first tick -- with the constructor's initial `_replay_dirty` -- can write frame 0
+        # before this command is even drained. Wait for the trim to actually land, then only
+        # look at writes from that point on: what this test cares about is playback staying
+        # in bounds, not the one-off startup frame that precedes any command.
+        assert wait_until(lambda: loop.replay_state()["in"] == 2)
+        start = len(session.qpos_writes)
+        time.sleep(0.4)
+        st = loop.replay_state()
+        assert 2 <= st["frame"] <= 5
+        assert all(2 <= int(w[0] / 3) <= 5 for w in session.qpos_writes[start:])
+
+
+def test_playback_stops_at_out_when_loop_is_false():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "trim": [0, 3], "frame": 0, "loop": False, "play": True})
+        time.sleep(0.4)
+        assert loop.replay_state()["frame"] == 3
+        assert loop.playing is False, "reaching `out` with loop=False must pause"
+
+
+def test_changing_clip_clamps_frame_and_resets_trim():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "frame": 9})
+        time.sleep(0.1)
+        loop.submit({"t": "replay", "clip": 1})
+        time.sleep(0.1)
+        st = loop.replay_state()
+        assert st["clip"] == 1
+        assert st["out"] == 9, "a new clip resets the trim to its full length"
+
+
+def test_out_of_range_clip_reports_a_command_error_without_pausing():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "play": True})
+        time.sleep(0.1)
+        loop.submit({"t": "replay", "clip": 99})
+        time.sleep(0.15)
+        err = loop.error
+        assert err is not None and err["kind"] == "command"
+        assert err["paused"] is False
+        assert loop.playing is True, "a bad command must not stop playback for everyone"
+
+
+def test_ghost_toggle_swaps_the_model():
+    with running_replay_loop() as (session, loop):
+        loop.submit({"t": "replay", "ghost": True})
+        time.sleep(0.15)
+        assert session.model_swaps == ["alt"]
+        loop.submit({"t": "replay", "ghost": False})
+        time.sleep(0.15)
+        assert session.model_swaps == ["alt", "primary"]
+
+
+def test_frame_meta_carries_replay_state_and_rollout_time():
+    # make_source()'s default clip is only 10 frames long, so frame 250 needs a bigger
+    # source here -- 10 frames would make frame 250 out of range and raise, never landing
+    # in replay_state().
+    big_source = make_source(n_frames=300)
+    with running_replay_loop(source=big_source, frame_dt=1e-3) as (session, loop):
+        loop.submit({"t": "replay", "frame": 250})
+        time.sleep(0.15)
+        got = loop.wait_for_frame(-1, timeout=1.0)
+        assert got is not None
+        _seq, _jpeg, meta = got
+        assert meta["replay"]["frame"] == 250
+        assert meta["replay"]["stride"] == 1
+        assert meta["sim_time"] == pytest.approx(0.250)

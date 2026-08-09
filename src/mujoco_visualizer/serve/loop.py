@@ -30,6 +30,8 @@ class SimLoop(threading.Thread):
         substeps_per_frame: int = 260,
         idle_pause_s: Optional[float] = 60.0,
         max_queue: int = 4096,
+        source=None,
+        frame_dt: float = 1e-3,
     ):
         super().__init__(name="SimLoop", daemon=True)
         self._session = session
@@ -66,6 +68,22 @@ class SimLoop(threading.Thread):
         # Starts at 0 so the first tick advances the controller before its first physics step.
         self._ctrl_countdown = 0.0
 
+        # -- replay state. All frame indices are ORIGINAL rollout frames, never strided
+        # ones: if `stride` changed what `in`/`out` meant, the trim handles would move
+        # under the user every time they changed the slow-motion factor.
+        self._source = source
+        self._frame_dt = float(frame_dt)
+        self._clip = 0
+        self._frame = 0
+        self._in = 0
+        self._out = (source.clip_length(0) - 1) if source is not None else 0
+        self._stride = 1
+        self._loop_playback = True
+        self._ghost = False
+        # Set when a command moved the playhead while paused, so the tick renders the new
+        # pose once instead of waiting for Play.
+        self._replay_dirty = source is not None
+
     # -- public surface --------------------------------------------------------
 
     @property
@@ -83,6 +101,25 @@ class SimLoop(threading.Thread):
     @property
     def error(self) -> Optional[Dict]:
         return self._error
+
+    @property
+    def replay_mode(self) -> bool:
+        return self._source is not None
+
+    def replay_state(self) -> Dict:
+        """Snapshot of the replay playhead. Read from the sim thread and from _publish."""
+        return {
+            "clip": self._clip,
+            "frame": self._frame,
+            "in": self._in,
+            "out": self._out,
+            "stride": self._stride,
+            "playing": self._playing,
+            "loop": self._loop_playback,
+            "ghost": self._ghost,
+            "n_clips": 0 if self._source is None else self._source.n_clips,
+            "length": 0 if self._source is None else self._source.clip_length(self._clip),
+        }
 
     def submit(self, cmd: Dict) -> None:
         """Queue a validated command. Silently drops past ``max_queue`` -- an unbounded
@@ -176,6 +213,8 @@ class SimLoop(threading.Thread):
             height = cmd.get("height", self._session.height)
             if (width, height) != (self._session.width, self._session.height):
                 self._session.resize(width, height)
+        elif kind == "replay":
+            self._apply_replay(cmd)
         elif kind == "sim":
             action = cmd["cmd"]
             if action == "play":
@@ -248,12 +287,112 @@ class SimLoop(threading.Thread):
             self._ctrl_countdown -= chunk
             remaining -= chunk
 
+    def _apply_replay(self, cmd: Dict) -> None:
+        """Move the playhead / retarget the source. Raises on out-of-range values.
+
+        Raising is what gets this reported as an ``error`` with ``kind='command'`` and
+        ``paused=False`` by ``run()``'s per-command handler -- the same treatment every other
+        bad command gets, and deliberately not a pause.
+        """
+        if self._source is None:
+            raise ValueError("this session has no trajectory source; replay is unavailable")
+
+        if "clip" in cmd:
+            clip = int(cmd["clip"])
+            if not 0 <= clip < self._source.n_clips:
+                raise IndexError(
+                    f"clip {clip} out of range (have {self._source.n_clips} clips)"
+                )
+            if clip != self._clip:
+                self._clip = clip
+                # A new clip has its own length, so a trim from the previous one is
+                # meaningless -- and a stale `out` past this clip's end would raise on the
+                # very next advance.
+                self._in = 0
+                self._out = self._source.clip_length(clip) - 1
+                self._frame = min(self._frame, self._out)
+
+        length = self._source.clip_length(self._clip)
+
+        if "trim" in cmd:
+            lo, hi = cmd["trim"]
+            if hi >= length:
+                raise IndexError(
+                    f"trim out={hi} past the end of clip {self._clip} (length {length})"
+                )
+            self._in, self._out = lo, hi
+            self._frame = min(max(self._frame, lo), hi)
+
+        if "stride" in cmd:
+            self._stride = int(cmd["stride"])
+
+        if "loop" in cmd:
+            self._loop_playback = bool(cmd["loop"])
+
+        if "frame" in cmd:
+            frame = int(cmd["frame"])
+            if not 0 <= frame < length:
+                raise IndexError(
+                    f"frame {frame} out of range for clip {self._clip} (length {length})"
+                )
+            self._frame = frame
+
+        if "ghost" in cmd and bool(cmd["ghost"]) != self._ghost:
+            self._ghost = bool(cmd["ghost"])
+            # ~400-560 ms: every mesh re-uploads. Coalescing means at most one per tick.
+            self._session.swap_model("alt" if self._ghost else "primary")
+
+        if "play" in cmd:
+            self._playing = bool(cmd["play"])
+            if self._playing:
+                self._error = None
+
+        self._replay_dirty = True
+
+    def _advance_replay(self) -> None:
+        """Write the current frame, then move the playhead one stride if playing."""
+        self._session.set_qpos(self._source.qpos(self._clip, self._frame))
+        self._replay_dirty = False
+        if not self._playing:
+            return
+        nxt = self._frame + self._stride
+        if nxt > self._out:
+            if self._loop_playback:
+                nxt = self._in
+            else:
+                nxt = self._out
+                self._playing = False
+        self._frame = nxt
+
+    def _publish_guarded(self, tick_started: float) -> None:
+        """Publish, converting a render-side failure into a paused ``render`` error instead
+        of letting it escape the tick. Shared by the physics and replay paths so both get
+        the same failure handling. ``tick_started`` is unused by the body; it is kept in the
+        signature for symmetry with the caller's own timing use of it.
+        """
+        try:
+            self._publish()
+        except Exception as exc:
+            self._playing = False
+            self._error = {
+                "t": "error",
+                "kind": "render",
+                "msg": str(exc),
+                "paused": True,
+            }
+
     def _publish(self) -> None:
         frame = self._session.render()
         jpeg = self._session.encode(frame)
+        if self.replay_mode:
+            replay = self.replay_state()
+            sim_time = replay["frame"] * self._frame_dt
+        else:
+            replay = None
+            sim_time = float(self._session.data.time)
         meta = {
             "t": "frame_meta",
-            "sim_time": float(self._session.data.time),
+            "sim_time": sim_time,
             "rtf": round(self._rtf, 3),
             "w": self._session.width,
             "h": self._session.height,
@@ -265,6 +404,10 @@ class SimLoop(threading.Thread):
             "warn": self._session.new_warnings(),
             "readout": self._session.readout(),
         }
+        if replay is not None:
+            # rtf stays 0 in replay mode: nothing advances data.time, and reporting a
+            # real-time factor for a file scrub would be a made-up number.
+            meta["replay"] = replay
         # Snapshotted on this thread, next to the frame it describes, for the same reason the
         # frame is: request threads must never reach into live Session state.
         scene = self._session.scene_message()
@@ -336,6 +479,32 @@ class SimLoop(threading.Thread):
 
                     self._maybe_idle_pause()
 
+                    if self.replay_mode:
+                        # Replay never steps physics: state comes from the file. `step`
+                        # commands nudge the playhead by one stride instead.
+                        if self._pending_steps > 0:
+                            self._pending_steps = 0
+                            was_playing, self._playing = self._playing, True
+                            try:
+                                self._advance_replay()
+                            finally:
+                                self._playing = was_playing
+                        elif self._playing or self._replay_dirty:
+                            try:
+                                self._advance_replay()
+                            except Exception as exc:
+                                self._playing = False
+                                self._error = {
+                                    "t": "error", "kind": "replay",
+                                    "msg": str(exc), "paused": True,
+                                }
+                        self._publish_guarded(tick_started)
+                        fps_cap = self._fps_cap if self._fps_cap > 0 else 1.0
+                        slack = (1.0 / fps_cap) - (time.monotonic() - tick_started)
+                        if slack > 0:
+                            self._stop_event.wait(slack)
+                        continue
+
                     n_steps = 0
                     if self._pending_steps > 0:
                         n_steps = self._substeps * self._pending_steps
@@ -369,16 +538,7 @@ class SimLoop(threading.Thread):
                             # EMA so the reported factor is readable rather than jittery
                             self._rtf = 0.8 * self._rtf + 0.2 * (advanced / elapsed)
 
-                    try:
-                        self._publish()
-                    except Exception as exc:
-                        self._playing = False
-                        self._error = {
-                            "t": "error",
-                            "kind": "render",
-                            "msg": str(exc),
-                            "paused": True,
-                        }
+                    self._publish_guarded(tick_started)
 
                     fps_cap = self._fps_cap if self._fps_cap > 0 else 1.0
                     budget = 1.0 / fps_cap
