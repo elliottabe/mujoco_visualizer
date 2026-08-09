@@ -986,3 +986,34 @@ def test_apply_render_still_sets_nested_dict_keys(sess):
 def test_apply_render_still_coerces_geom_colors_keys(sess):
     sess.apply_render({"geom_colors.5": "#ff0000"})
     assert 5 in sess.viz.vis_state["geom_colors"], "int coercion must survive this change"
+
+
+def test_a_rejected_bare_list_key_never_reaches_vis_state(sess):
+    """End-to-end shape of the destructive case ``protocol._LIST_VALUED_ROOTS`` guards
+    against: a wire command naming ``geom_groups`` with no ``.<index>`` must be rejected by
+    ``parse_command`` BEFORE ``apply_render`` ever runs, so ``vis_state['geom_groups']`` is
+    still the same list -- not a bool, and not even a same-length copy standing in for the
+    original.
+
+    Deliberately NOT written as a bare ``pytest.raises`` around both calls: if the guard were
+    ever removed, ``parse_command`` would return normally and ``apply_render`` WOULD run
+    inside that block, corrupting ``vis_state`` -- but ``pytest.raises`` would report only
+    "DID NOT RAISE", never showing that corruption. Running both calls in a plain ``try`` and
+    asserting on the resulting state afterwards means a missing guard shows up as
+    ``geom_groups`` having become a bool, which is the actual consequence this guards
+    against -- not just a missing exception.
+    """
+    from mujoco_visualizer.serve.protocol import CommandError, parse_command
+
+    before = sess.viz.vis_state["geom_groups"]
+    before_len = len(before)
+    raised = False
+    try:
+        cmd = parse_command({"t": "render", "set": {"geom_groups": True}})
+        sess.apply_render(cmd["set"])
+    except CommandError:
+        raised = True
+    after = sess.viz.vis_state["geom_groups"]
+    assert isinstance(after, list), f"geom_groups must stay a list; got {after!r}"
+    assert after is before and len(after) == before_len, "apply_render must never have run"
+    assert raised, "parse_command must reject the bare list key"

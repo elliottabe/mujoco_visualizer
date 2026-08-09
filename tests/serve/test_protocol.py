@@ -335,3 +335,24 @@ def test_render_accepts_a_bare_key_whose_name_is_itself_a_known_root():
 def test_render_rejects_a_bare_key_with_no_root():
     with pytest.raises(CommandError, match="bogus"):
         parse_command({"t": "render", "set": {"bogus": 0.5}})
+
+
+def test_render_rejects_a_bare_geom_groups_key():
+    """``geom_groups`` is a fixed-length list; a bare key with no ``.<index>`` would replace
+    the whole list with whatever scalar the client sent. Unlike ``alpha`` (a scalar root),
+    whole-root replacement here is destructive, so it is rejected -- and the message names the
+    form the client should have sent instead."""
+    with pytest.raises(CommandError, match=r"geom_groups.*\.<index>"):
+        parse_command({"t": "render", "set": {"geom_groups": True}})
+
+
+def test_render_rejects_a_bare_site_groups_key():
+    with pytest.raises(CommandError, match=r"site_groups.*\.<index>"):
+        parse_command({"t": "render", "set": {"site_groups": True}})
+
+
+def test_render_still_accepts_a_bare_alpha_key():
+    """The list-root guard must not overreach into scalar roots: ``alpha`` has no index to
+    address and whole-root replacement is exactly what setting it means."""
+    cmd = parse_command({"t": "render", "set": {"alpha": 0.5}})
+    assert cmd["set"] == {"alpha": 0.5}

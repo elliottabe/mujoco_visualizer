@@ -50,12 +50,23 @@ _LAST_WINS = frozenset({"mode", "speed", "camera", "render", "settings", "stream
 
 # Roots that exist in Visualizer.vis_state. A `render.set` key outside these was previously
 # merged verbatim, creating a dead entry: the control appeared to do nothing and nothing said
-# why. Validated here so a typo is a named error rather than a silent no-op.
+# why. Validated here so a typo is a named error rather than a silent no-op. ``ghost`` is an
+# exception: it does not exist in vis_state yet -- reserved here for a sibling task that adds
+# it, so that task's keys are not rejected as unknown roots before it lands.
 _VIS_STATE_ROOTS = frozenset({
     "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
     "camera", "camera_presets", "lighting", "floor", "skybox", "ghost",
     "geom_render_state",
 })
+
+# Roots that are fixed-length lists in vis_state (geom_groups/site_groups are boolean lists
+# indexed by group id; build_scene_option reads them positionally). A BARE key naming one of
+# these -- "geom_groups" with no ".<index>" -- would replace the whole list with whatever
+# scalar the client sent, silently turning a list into e.g. a bool the next time anything reads
+# it positionally. Scalar roots (alpha) and dict roots (floor, camera, ...) both survive
+# whole-root replacement; these do not, so bare access to them is rejected here rather than at
+# the write site, before it ever reaches vis_state.
+_LIST_VALUED_ROOTS = frozenset({"geom_groups", "site_groups"})
 
 
 class CommandError(ValueError):
@@ -172,11 +183,17 @@ def parse_command(raw) -> Dict:
         if not isinstance(values, dict):
             raise CommandError("'render' requires a 'set' object")
         for dotted in values:
-            root = str(dotted).split(".")[0]
+            parts = str(dotted).split(".")
+            root = parts[0]
             if root not in _VIS_STATE_ROOTS:
                 raise CommandError(
                     f"'render.set' key {dotted!r} has unknown root {root!r}; "
                     f"expected one of {', '.join(sorted(_VIS_STATE_ROOTS))}"
+                )
+            if len(parts) == 1 and root in _LIST_VALUED_ROOTS:
+                raise CommandError(
+                    f"'render.set' key {dotted!r} would replace the whole list at {root!r}; "
+                    f"address an element as {root}.<index>, not {root!r} bare"
                 )
         return {"t": "render", "set": dict(values)}
 
