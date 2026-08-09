@@ -20,7 +20,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple, Union
+from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import mujoco
 import numpy as np
@@ -311,6 +311,21 @@ def _save_image(frame: np.ndarray, output_path: str) -> None:
             )
 
 
+class _ModelInitVisuals(NamedTuple):
+    """The floor/light initial-state snapshot ``__init__`` needs to seed ``vis_state``.
+
+    Returned by :meth:`Visualizer._rebuild_model_derived_state` rather than stashed on
+    ``self``: ``__init__``'s ``vis_state`` literal is the only reader, so its correctness
+    should not depend on attributes a prior call happened to leave behind. ``rebind_model``
+    calls the same method and simply discards this -- ``vis_state`` already exists by the
+    time a rebind happens and is deliberately left alone.
+    """
+    lights: list
+    floor_rgb: list
+    floor_alpha: float
+    floor_mat_props: dict
+
+
 # ---------------------------------------------------------------------------
 # Main class
 # ---------------------------------------------------------------------------
@@ -418,7 +433,7 @@ class Visualizer:
 
         # Save originals for reset / color baking
         self._orig_geom_rgba = self.model.geom_rgba.copy()
-        self._rebuild_model_derived_state()
+        _init_visuals = self._rebuild_model_derived_state()
 
         # Initialize vis_state (mirrors notebook vis_state)
         self.vis_state: dict = {
@@ -440,7 +455,7 @@ class Visualizer:
                 'free_type': 'free', 'trackbody': '', 'fixedcamid': '',
             },
             'lighting': {
-                'lights': self._init_lights,
+                'lights': _init_visuals.lights,
                 'use_dual_lighting':   False,
                 'use_scale_lights':    False,
                 'scale_lights_factor': 1.25,
@@ -452,13 +467,13 @@ class Visualizer:
                 },
             },
             'floor': {
-                'color':       _rgb_to_hex(self._init_floor_rgb),
-                'alpha':       self._init_floor_alpha,
-                'texrepeat_x': self._init_floor_mat_props['texrepeat'][0],
-                'texrepeat_y': self._init_floor_mat_props['texrepeat'][1],
-                'reflectance': self._init_floor_mat_props['reflectance'],
-                'shininess':   self._init_floor_mat_props['shininess'],
-                'emission':    self._init_floor_mat_props['emission'],
+                'color':       _rgb_to_hex(_init_visuals.floor_rgb),
+                'alpha':       _init_visuals.floor_alpha,
+                'texrepeat_x': _init_visuals.floor_mat_props['texrepeat'][0],
+                'texrepeat_y': _init_visuals.floor_mat_props['texrepeat'][1],
+                'reflectance': _init_visuals.floor_mat_props['reflectance'],
+                'shininess':   _init_visuals.floor_mat_props['shininess'],
+                'emission':    _init_visuals.floor_mat_props['emission'],
             },
             'skybox': {
                 'show':    True,
@@ -471,7 +486,7 @@ class Visualizer:
         if settings_json is not None:
             self.load_settings(settings_json)
 
-    def _rebuild_model_derived_state(self) -> None:
+    def _rebuild_model_derived_state(self) -> _ModelInitVisuals:
         """(Re)compute everything derived purely from ``self.model``: baked colors, geom
         categories, floor/skybox/light detection, and per-category default hex.
 
@@ -482,6 +497,11 @@ class Visualizer:
 
         Callers must set ``self._orig_geom_rgba = self.model.geom_rgba.copy()`` before calling
         this, since baking below reads it as the pre-bake original.
+
+        Returns the floor/light initial-state snapshot (see :class:`_ModelInitVisuals`) so
+        ``__init__`` can fold it straight into its ``vis_state`` literal without depending on
+        instance attributes this method happens to leave behind; ``rebind_model`` calls this
+        for its side effects alone and discards the return value.
         """
         self._orig_mat_rgba  = self.model.mat_rgba.copy()
 
@@ -589,13 +609,12 @@ class Visualizer:
                 'specular': list(map(float, self.model.light_specular[li])),
                 'dir_az': az, 'dir_el': el,
             })
-        # Stash the per-model init snapshots so a caller that DOES want fresh floor/light
-        # values (rather than carrying vis_state across) can read them; __init__ folds these
-        # straight into vis_state below, but rebind_model callers reach them via these attrs.
-        self._init_floor_rgb = _floor_rgb
-        self._init_floor_alpha = _floor_alpha
-        self._init_floor_mat_props = _floor_mat_props
-        self._init_lights = _init_lights
+        return _ModelInitVisuals(
+            lights=_init_lights,
+            floor_rgb=_floor_rgb,
+            floor_alpha=_floor_alpha,
+            floor_mat_props=_floor_mat_props,
+        )
 
     # ── Settings I/O ─────────────────────────────────────────────────────────
 
