@@ -652,6 +652,14 @@ class SimLoop(threading.Thread):
         Anything escaping this method instead gets ``_advance_replay``'s/``_step_replay``'s own
         ``kind='replay'``, paused treatment -- the wrong one for a bad ctrl width, exactly the
         misclassification ``_apply_lock``'s docstring already describes for a bad lock width.
+
+        The retry explicitly ZEROES ctrl first (:meth:`Session.zero_ctrl`) rather than leaving
+        it at whatever the last successfully-applied frame left behind. "We could not apply
+        this frame's commands" must render as NO commands, not the previous frame's: once
+        anything downstream reads ``data.ctrl`` directly (tendon colour/thickness, force arrows
+        computed from the real command -- both planned, not yet built), a frozen-but-plausible
+        stale value would be a confident, WRONG picture with no visible sign anything failed,
+        where zeroed activation is an honest, noticeable one.
         """
         raw = self._source.qpos(self._clip, frame)
         qpos = apply_locks(raw, self._locks, self._jmap())
@@ -665,6 +673,7 @@ class SimLoop(threading.Thread):
             self._session.set_qpos(qpos, ctrl)
         except CtrlWidthMismatch as exc:
             self._error = {"t": "error", "kind": "command", "msg": str(exc), "paused": False}
+            self._session.zero_ctrl()
             self._session.set_qpos(qpos)
 
     def _advance_replay(self) -> None:

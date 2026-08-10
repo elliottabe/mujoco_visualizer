@@ -371,6 +371,17 @@ def test_set_qpos_rejects_a_wrong_width_ctrl(sess):
         sess.set_qpos(target, ctrl=[0.1, 0.2, 0.3])  # sess's model has only 2 actuators
 
 
+def test_zero_ctrl_zeros_data_ctrl_directly(sess):
+    """SimLoop's replay write path calls this when a ctrl vector is REJECTED, so "we could
+    not apply this frame's commands" renders as no commands rather than the previous frame's
+    -- see _write_replay_qpos's own comment for why leaving it at the stale value would be a
+    confident, wrong picture once anything downstream (tendon colour, force arrows) reads it."""
+    sess.set_qpos(sess.model.qpos0.copy(), ctrl=[0.4, -0.6])
+    assert sess.data.ctrl[0] != 0.0  # sanity: something non-zero is actually there first
+    sess.zero_ctrl()
+    np.testing.assert_array_equal(sess.data.ctrl, [0.0, 0.0])
+
+
 # Two models whose actuator NAMES overlap but whose actuator ORDER is deliberately scrambled
 # between them, plus a suffixed "_ref" half on the alt model standing in for the doubled
 # reference-ghost pair's un-driven overlay. A positional slice (ctrl[i] -> data.ctrl[i]) would

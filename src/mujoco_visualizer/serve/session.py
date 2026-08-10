@@ -486,6 +486,21 @@ class Session:
         mujoco.mj_forward(self.model, self.data)
         self._snapshot()
 
+    def zero_ctrl(self) -> None:
+        """Zero ``data.ctrl`` directly. No qpos write, no ``mj_forward`` of its own -- a
+        caller that needs the zeroed value to actually reach the solve must still write qpos
+        (and so trigger ``mj_forward``) afterwards, e.g. via a bare :meth:`set_qpos` call.
+
+        Used by ``SimLoop._write_replay_qpos`` when a replay ctrl vector is REJECTED
+        (:class:`CtrlWidthMismatch`): "we could not apply this frame's commands" must render
+        as NO commands, not as whatever the last successfully-applied frame left in
+        ``data.ctrl``. Leaving it untouched would be a confident, plausible-looking, WRONG
+        picture the moment anything downstream reads ctrl directly (tendon colour/thickness,
+        force arrows computed from the real command) -- frozen-but-plausible activation gives
+        no visible sign anything failed, where zeroed activation does.
+        """
+        self.data.ctrl[:] = 0.0
+
     def reset(self) -> None:
         """Reset to the fly's rest pose, then sync that state from the backend.
 

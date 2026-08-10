@@ -107,6 +107,7 @@ class FakeSession:
         self._time = 0.0
         self.qpos_writes = []
         self.ctrl_writes = []
+        self.zero_ctrl_calls = 0
         self.model_swaps = []
         self.pose = None
         # For build_joint_qpos_map to exercise a real model. See _LOCK_MODEL/_LOCK_ALT_MODEL
@@ -179,6 +180,12 @@ class FakeSession:
         # point) is untouched; recorded (not just the latest) so a test can tell "never
         # passed" apart from "passed None on this particular tick".
         self.ctrl_writes.append(None if ctrl is None else np.asarray(ctrl).copy())
+
+    def zero_ctrl(self):
+        """Base tracking only (a call count); subclasses that need to prove WHAT got zeroed
+        (as opposed to merely that this was called) track their own state -- see
+        CtrlTrackingFakeSession below."""
+        self.zero_ctrl_calls += 1
 
     def swap_model(self, which):
         self.model_swaps.append(which)
@@ -876,6 +883,68 @@ def test_ctrl_width_mismatch_reports_a_command_error_without_pausing():
         # The pose itself must still have been written (via the fallback retry with no ctrl) --
         # a width problem with the ctrl channel is not a reason to freeze the picture.
         assert len(session.qpos_writes) > 0
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
+
+
+class CtrlTrackingFakeSession(FakeSession):
+    """Tracks a fake ``ctrl_state`` mimicking ``data.ctrl`` (start it wherever the fixture
+    likes, then applied/zeroed exactly like the real thing) -- lets a test tell "the previous
+    frame's ctrl is still sitting there" apart from "it was actually zeroed" without a real
+    MjModel/MjData. ``expected_width`` starts matching the source so an initial good frame is
+    accepted; a test can change it afterwards to force a later mismatch, standing in for a
+    source/model disagreement that persists rather than resolving on the next tick."""
+
+    def __init__(self, expected_width):
+        super().__init__()
+        self.expected_width = expected_width
+        self.ctrl_state = np.zeros(expected_width)
+
+    def set_qpos(self, qpos, ctrl=None):
+        if ctrl is not None:
+            if len(ctrl) != self.expected_width:
+                raise CtrlWidthMismatch(
+                    f"ctrl has {len(ctrl)} entries, expected {self.expected_width}"
+                )
+            self.ctrl_state = np.asarray(ctrl, dtype=np.float64).copy()
+        super().set_qpos(qpos, ctrl)
+
+    def zero_ctrl(self):
+        super().zero_ctrl()
+        self.ctrl_state[:] = 0.0
+
+
+def test_ctrl_width_mismatch_zeroes_ctrl_rather_than_leaving_the_stale_value():
+    """"We could not apply this frame's commands" must render as NO commands, not the
+    previous frame's -- once tendon colour/force rendering reads ctrl (an upcoming task), a
+    stale-but-plausible value would be a confident, wrong picture with no visible sign
+    anything failed. Also confirms the zeroing does NOT change the error classification: still
+    a non-pausing 'command' error with playback running, exactly like the width-mismatch test
+    above."""
+    good = np.full((2, 10, 3), 7.0, dtype=np.float32)
+    source = ArrayTrajectorySource(
+        np.arange(2 * 10 * 3, dtype=np.float32).reshape(2, 10, 3), ctrl=good
+    )
+    session = CtrlTrackingFakeSession(expected_width=3)
+    loop = SimLoop(session, source=source, fps_cap=1000.0, idle_pause_s=None)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        loop.submit({"t": "replay", "frame": 0})
+        assert wait_until(lambda: np.all(session.ctrl_state == 7.0)), (
+            "the good frame's ctrl must have been applied first"
+        )
+
+        # Now every subsequent write mismatches -- e.g. a post-swap disagreement that does
+        # not resolve on its own.
+        session.expected_width = 5
+        loop.submit({"t": "replay", "play": True})
+        assert wait_until(lambda: loop.playing and loop.error is not None)
+        assert loop.error["kind"] == "command"
+        assert loop.error["paused"] is False
+        assert loop.playing is True
+        np.testing.assert_array_equal(session.ctrl_state, np.zeros(3))
     finally:
         loop.stop()
         thread.join(timeout=2.0)
