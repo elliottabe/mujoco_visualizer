@@ -122,6 +122,37 @@ _CTRL_DOUBLED_ALT_XML = """
 </mujoco>
 """
 
+# Export-side twin of tests/serve/test_session.py's own
+# _CTRL_PRIMARY_WITH_UNMATCHED_XML/_CTRL_ALT_ONE_ACTUATOR_XML pair: "m_missing" is a PRIMARY
+# actuator name with no counterpart on this model at all. Ordered so the unmatched one is NOT
+# first (mirrors the Session fixture's own reasoning), and driving a real tendon so the guard
+# test below can observe the SCATTERED result (not just inspect the map), the same way the
+# tendon pixel tests above do.
+_CTRL_PRIMARY_NAMES_WITH_UNMATCHED = ["m_real", "m_missing"]
+
+_CTRL_MODEL_ONE_REAL_ACTUATOR_WITH_TENDON_XML = """
+<mujoco>
+  <worldbody>
+    <light pos="0 0 2"/>
+    <geom name="floor" type="plane" size="1 1 0.1"/>
+    <site name="anchor_r" pos="-0.2 0 0.4" size="0.01"/>
+    <body name="box_r" pos="-0.2 0 0.6">
+      <joint name="slide_r" type="slide" axis="0 0 1"/>
+      <geom name="box_r_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_r" pos="0 0 0" size="0.01"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="t_r" width="0.003" rgba="1 0 0 1">
+      <site site="anchor_r"/><site site="tip_r"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="m_real" tendon="t_r" ctrlrange="-1 1"/>
+  </actuator>
+</mujoco>
+"""
+
 
 def probe(path):
     out = subprocess.run(
@@ -414,6 +445,7 @@ def test_tendon_activation_reaches_exported_pixels(tmp_path):
         qpos,
         path=on_dir, fmt="png", width=128, height=96, fps=10,
         ctrl_frames=np.array([[1.0]]),
+        primary_actuator_names=["m_a"],
     )
     on.start()
     on.join(timeout=120)
@@ -450,6 +482,7 @@ def test_export_never_mutates_the_callers_model_tendon_state(tmp_path):
         qpos,
         path=tmp_path / "out.mp4", width=64, height=48, fps=10,
         ctrl_frames=np.array([[1.0]]),
+        primary_actuator_names=["m_a"],
     )
     job.start()
     job.join(timeout=120)
@@ -528,6 +561,7 @@ def test_ctrl_frames_row_width_mismatch_raises_at_construction(tmp_path):
             model, None, {}, qpos,
             path=tmp_path / "out.mp4", width=64, height=48, fps=10,
             ctrl_frames=np.zeros((4, 3)),
+            primary_actuator_names=["m1", "m2"],
         )
 
 
@@ -539,6 +573,22 @@ def test_ctrl_frames_must_be_two_dimensional(tmp_path):
             model, None, {}, qpos,
             path=tmp_path / "out.mp4", width=64, height=48, fps=10,
             ctrl_frames=np.zeros(4),
+        )
+
+
+def test_ctrl_frames_without_primary_actuator_names_raises_at_construction(tmp_path):
+    """Fix round 1: there is no safe default for ``primary_actuator_names`` -- a model whose
+    ``nu`` happens to match the primary's but whose actuator order genuinely differs (e.g.
+    ``ctrl_frames`` recorded against a different model version with the same actuator count
+    but reordered names) cannot be detected from shape alone, so it must be supplied
+    explicitly whenever ``ctrl_frames`` is."""
+    model = mujoco.MjModel.from_xml_string(_ACTUATED_MODEL_XML)  # nu == 2
+    qpos = np.linspace(0, 1, 4 * model.nq, dtype=np.float64).reshape(4, model.nq)
+    with pytest.raises(ValueError, match="ctrl_frames requires primary_actuator_names"):
+        ExportJob(
+            model, None, {}, qpos,
+            path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+            ctrl_frames=np.zeros((4, 2)),
         )
 
 
@@ -572,6 +622,51 @@ def test_ctrl_frames_are_matched_by_name_not_position_on_a_doubled_export_model(
     ]
 
 
+@pytest.mark.gl
+def test_ctrl_frames_skip_an_unmatched_primary_name_rather_than_misassigning(tmp_path):
+    """Export-side twin of ``tests/serve/test_session.py::
+    test_ctrl_map_skips_an_unmatched_primary_name_rather_than_wrapping_onto_the_last_actuator``
+    -- this task's whole premise is that ``Session`` and ``ExportJob`` apply the SAME matching
+    rule, so an unmatched primary name must be handled identically on both paths. ``m_missing``
+    has no actuator on this model at all, so ``_ctrl_map``'s entry for it must be -1 and must
+    be SKIPPED when scattering ``ctrl_frames`` into this model's own actuator order -- never
+    wrapped via numpy's negative-index behaviour onto ``m_real``'s slot, and never a shape
+    mismatch either (dropping the mask on the RHS of the scatter assignment, rather than only
+    the LHS, makes the LHS index array and the RHS values array different lengths whenever a
+    -1 is actually present -- which is exactly the "forgot the mask on one side" slip
+    ``build_ctrl_name_map``'s own docstring warns about). Runs a REAL job end to end and reads
+    back the job's own tendon width (not the stored map) so either kind of slip is caught:
+    a wrong value if regressed some other way, or an outright job failure for this specific
+    slip, which a bare ``_ctrl_map`` inspection could not distinguish from success."""
+    model = mujoco.MjModel.from_xml_string(_CTRL_MODEL_ONE_REAL_ACTUATOR_WITH_TENDON_XML)
+    assert model.nu == 1  # only "m_real" -- "m_missing" has no actuator on this model at all
+    qpos = model.qpos0.copy().reshape(1, -1)
+
+    job = ExportJob(
+        model, None,
+        _vis_state_with_tendons(model, {
+            "enabled": True, "max_width": 0.05, "min_width": 0.001,
+            "min_alpha": 0.05, "baseline": 0.0, "ctrl_full_scale": 1.0,
+        }),
+        qpos,
+        path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+        ctrl_frames=np.array([[1.0, 2.0]]),  # m_real=1.0, m_missing=2.0 (unmatched)
+        primary_actuator_names=_CTRL_PRIMARY_NAMES_WITH_UNMATCHED,
+    )
+    assert list(job._ctrl_map) == [0, -1]
+
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+
+    t_r = mujoco.mj_name2id(job._model, mujoco.mjtObj.mjOBJ_TENDON, "t_r")
+    assert job._model.tendon_width[t_r] == pytest.approx(0.05), (
+        "m_real's own ctrl_frames value (1.0, full scale) did not drive its tendon to "
+        "max_width -- either m_missing's unmatched value corrupted the scatter, or this "
+        "silently did not raise the way a dropped RHS mask would"
+    )
+
+
 # --- sidecar provenance: what overlays were actually applied --------------------------------
 
 
@@ -592,6 +687,7 @@ def test_sidecar_records_tendon_activation_and_scene_modifier_provenance(tmp_pat
         qpos,
         path=tmp_path / "out.mp4", width=64, height=48, fps=10,
         ctrl_frames=np.zeros((2, model.nu)),
+        primary_actuator_names=["m1", "m2"],
         modify_scene_fns=[modifier, modifier],
     )
     job.start()
@@ -617,6 +713,7 @@ def test_sidecar_tendon_activation_applied_is_false_when_tendons_disabled(tmp_pa
         qpos,
         path=tmp_path / "out.mp4", width=64, height=48, fps=10,
         ctrl_frames=np.zeros((2, model.nu)),
+        primary_actuator_names=["m1", "m2"],
     )
     job.start()
     job.join(timeout=120)

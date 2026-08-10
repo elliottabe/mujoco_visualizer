@@ -28,6 +28,7 @@ from mujoco_visualizer.serve.controls import actuator_group_map, build_control_t
 from mujoco_visualizer.serve.locks import build_joint_qpos_map
 from mujoco_visualizer.visualizer import (
     _apply_forces_vis,
+    actuator_names,
     apply_tendon_activation,
     build_actuator_tendon_map,
     build_ctrl_name_map,
@@ -458,14 +459,13 @@ class Session:
 
     @staticmethod
     def _actuator_names(model: mujoco.MjModel) -> list:
-        """Every actuator name on *model*, in id order. Mirrors
-        ``locks.build_joint_qpos_map``'s own id2name fallback: an unnamed actuator gets a
-        placeholder rather than ``None``, so it can still occupy a slot in the map below
-        without ever matching a real name (and therefore never gets written to)."""
-        return [
-            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or f"actuator{i}"
-            for i in range(model.nu)
-        ]
+        """Every actuator name on *model*, in id order. Delegates to the module-level
+        :func:`~mujoco_visualizer.visualizer.actuator_names` (task 15c fix round 1 collapsed
+        three copies of this idiom -- this one, ``build_ctrl_name_map``'s own, and a private
+        one in serve/export.py -- into that single shared implementation); kept as a
+        ``Session`` method since callers throughout this class already call it as
+        ``self._actuator_names(...)``."""
+        return actuator_names(model)
 
     def _build_ctrl_map(self) -> np.ndarray:
         """``{index into a primary-ordered replay ctrl vector -> index into data.ctrl on the

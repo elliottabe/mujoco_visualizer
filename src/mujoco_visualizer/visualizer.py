@@ -233,6 +233,22 @@ def build_actuator_tendon_map(
     return act_to_ten, base_rgba
 
 
+def actuator_names(model: mujoco.MjModel) -> List[str]:
+    """Every actuator name on *model*, in id order.
+
+    A single shared implementation of an idiom that had drifted into three separate copies
+    (this one, ``Session._actuator_names`` in serve/session.py, and a private one in
+    serve/export.py) -- both serve-layer modules already import from this module, so this is
+    where it belongs. An unnamed actuator gets a placeholder rather than ``None``, so it can
+    still occupy a slot in :func:`build_ctrl_name_map`'s name lists without ever matching a
+    real name.
+    """
+    return [
+        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or f"actuator{i}"
+        for i in range(model.nu)
+    ]
+
+
 def build_ctrl_name_map(
     primary_names: Sequence[str],
     active_model: mujoco.MjModel,
@@ -259,11 +275,7 @@ def build_ctrl_name_map(
     never rely on numpy's negative-index wraparound to skip it (see
     ``test_ctrl_map_skips_an_unmatched_primary_name_rather_than_wrapping_onto_the_last_actuator``).
     """
-    active_names = [
-        mujoco.mj_id2name(active_model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or f"actuator{i}"
-        for i in range(active_model.nu)
-    ]
-    active_id_of = {name: i for i, name in enumerate(active_names)}
+    active_id_of = {name: i for i, name in enumerate(actuator_names(active_model))}
     return np.array(
         [active_id_of.get(name, -1) for name in primary_names],
         dtype=np.int64,

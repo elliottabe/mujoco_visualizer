@@ -41,20 +41,6 @@ import numpy as np
 __all__ = ["even_dims", "mp4_writer_kwargs", "ExportJob"]
 
 
-def _actuator_names(model: mujoco.MjModel) -> List[str]:
-    """Every actuator name on *model*, in id order. Mirrors ``Session._actuator_names`` (serve/
-    session.py) -- duplicated rather than imported, because importing ``serve.session`` here
-    would pull in ``Session`` (and its ``simplejpeg``/backend/controls dependencies) for a
-    thread that, by design (see the module docstring), never touches a ``Session`` at all.
-    An unnamed actuator gets a placeholder rather than ``None``, so it can still occupy a slot
-    in :func:`~mujoco_visualizer.visualizer.build_ctrl_name_map`'s name lists without ever
-    matching a real name."""
-    return [
-        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or f"actuator{i}"
-        for i in range(model.nu)
-    ]
-
-
 def even_dims(width: int, height: int) -> Tuple[int, int, Optional[str]]:
     """Round *width*/*height* down to even, returning a note when anything changed.
 
@@ -170,10 +156,10 @@ class ExportJob(threading.Thread):
         #
         # Fail loudly at construction, not partway through a render: a job that discovers a
         # shape mismatch on frame 400 of 1000 would have already written 400 frames of a file
-        # a caller then has to know to distrust or clean up. Two distinct checks, both against
-        # what the caller actually supplied wrong (row count vs qpos_frames; row width vs the
-        # primary actuator names), so the message names the real mismatch rather than a single
-        # generic "shape wrong".
+        # a caller then has to know to distrust or clean up. Three distinct checks, each
+        # against what the caller actually supplied wrong (row count vs qpos_frames;
+        # primary_actuator_names required at all; row width vs the primary actuator names),
+        # so the message names the real mismatch rather than a single generic "shape wrong".
         if ctrl_frames is not None:
             ctrl_arr = np.asarray(ctrl_frames, dtype=np.float64)
             if ctrl_arr.ndim != 2:
@@ -186,22 +172,29 @@ class ExportJob(threading.Thread):
                     f"ExportJob: ctrl_frames has {len(ctrl_arr)} rows but qpos_frames has "
                     f"{len(self._frames)} -- they must be parallel, one row per exported frame"
                 )
-            # The order a ctrl_frames row is assumed to arrive in: PRIMARY-actuator order,
-            # exactly like Session._primary_actuator_names -- never this job's own (possibly
-            # doubled, differently-ordered) self._model. Defaults to self._model's own
-            # actuator names for the common case of exporting from a model that IS the
-            # primary model (no reference-ghost overlay active), where "primary order" and
-            # "this model's order" are the same thing by construction.
-            primary_names = (
-                list(primary_actuator_names)
-                if primary_actuator_names is not None
-                else _actuator_names(self._model)
-            )
+            # primary_actuator_names is REQUIRED whenever ctrl_frames is given -- there is no
+            # safe default. The obvious-looking one (fall back to self._model's own actuator
+            # names) only fails loudly in the ghost-overlay case, because that always changes
+            # nu and the width check above already catches it. The genuinely dangerous case
+            # is narrower and silent: a model whose nu happens to match the primary's but
+            # whose actuator ORDER differs (e.g. ctrl_frames recorded against a different
+            # model version with the same actuator count but reordered names) -- nothing
+            # about that is visible from shape alone, so guessing here would risk exactly the
+            # positional-assignment corruption this whole feature exists to avoid. Every real
+            # caller has a Session on hand with self._primary_actuator_names already computed
+            # (see Session.__init__), so this costs nothing to supply.
+            if primary_actuator_names is None:
+                raise ValueError(
+                    "ExportJob: ctrl_frames requires primary_actuator_names -- there is no "
+                    "safe default (a model with the same nu as the primary but reordered "
+                    "actuator names would silently mismatch); pass the primary model's own "
+                    "actuator names (e.g. Session._primary_actuator_names)"
+                )
+            primary_names = list(primary_actuator_names)
             if ctrl_arr.shape[1] != len(primary_names):
                 raise ValueError(
                     f"ExportJob: ctrl_frames rows have width {ctrl_arr.shape[1]}, expected "
-                    f"{len(primary_names)} (len(primary_actuator_names) if given, else this "
-                    "model's own actuator count)"
+                    f"{len(primary_names)} (len(primary_actuator_names))"
                 )
             from mujoco_visualizer.visualizer import build_ctrl_name_map
 
@@ -420,6 +413,16 @@ class ExportJob(threading.Thread):
         ['enabled']`` was true in the snapshot this job rendered with -- ctrl_frames alone
         (tendons left disabled) applied nothing, and this field says exactly that.
         """
+        # Reads the RAW constructor argument self._vis_state, not viz.vis_state (the
+        # deep-copied, defaults-filled-in dict _make_visualizer actually renders with). Safe
+        # to read either today: _make_visualizer only ever REPLACES viz.vis_state wholesale
+        # with a deep copy of this same self._vis_state (see its own body) -- it never merges
+        # partial keys into a separately-defaulted dict -- so the two agree on 'tendons' by
+        # construction, and self._vis_state avoids requiring _write_sidecar to run only after
+        # a render thread has built viz. A future refactor that has _make_visualizer MERGE
+        # self._vis_state onto Visualizer's own defaults (rather than replacing wholesale)
+        # would break this equivalence silently; re-derive from viz.vis_state instead if that
+        # ever happens.
         tendons_enabled = bool((self._vis_state or {}).get("tendons", {}).get("enabled", False))
         payload = dict(self._meta)
         payload.update({
