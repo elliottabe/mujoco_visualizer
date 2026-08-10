@@ -20,7 +20,7 @@ from typing import Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 
-__all__ = ["TrajectorySource", "ArrayTrajectorySource"]
+__all__ = ["TrajectorySource", "CtrlTrajectorySource", "ArrayTrajectorySource"]
 
 
 @runtime_checkable
@@ -37,18 +37,34 @@ class TrajectorySource(Protocol):
     def qpos(self, clip: int, frame: int) -> np.ndarray:
         ...
 
+
+@runtime_checkable
+class CtrlTrajectorySource(TrajectorySource, Protocol):
+    """A :class:`TrajectorySource` that can ALSO supply a per-frame ctrl vector.
+
+    Deliberately a SEPARATE, derived protocol rather than two more members bolted directly
+    onto :class:`TrajectorySource` itself. ``TrajectorySource`` is ``@runtime_checkable``, and
+    ``isinstance`` against a runtime-checkable ``Protocol`` requires structural presence of
+    EVERY declared member -- so putting ``has_ctrl``/``ctrl`` there would make them MANDATORY
+    for ``isinstance(src, TrajectorySource)`` to hold at all, silently narrowing what counts as
+    a valid ``TrajectorySource`` past what an optional channel should ever require (a legacy
+    three-member source would stop satisfying its own protocol). Consumers never assert
+    ``isinstance(src, CtrlTrajectorySource)`` either: ``SimLoop`` checks availability with
+    ``getattr(source, "has_ctrl", False)`` (see ``loop.py``), a plain attribute probe that
+    works identically whether or not a source's class happens to be declared against this
+    protocol. This type exists to NAME the richer shape for typing/documentation, not to gate
+    anything at runtime.
+    """
+
     @property
     def has_ctrl(self) -> bool:
         """Whether this source can supply a per-frame ctrl vector via :meth:`ctrl`.
 
         An explicit query, checked by a consumer BEFORE ever calling :meth:`ctrl` -- never
         discovered by calling it and catching whatever a ctrl-less source raises, which could
-        not be told apart from a real bug in a source that DOES claim to have ctrl. Defaults
-        to False here so a source that overrides neither this nor :meth:`ctrl` (every source
-        that predates this channel) is still a complete, valid ``TrajectorySource`` --
-        see :class:`ArrayTrajectorySource`'s own default of the same shape.
+        not be told apart from a real bug in a source that DOES claim to have ctrl.
         """
-        return False
+        ...
 
     def ctrl(self, clip: int, frame: int) -> np.ndarray:
         """The actuator command recorded for this frame. Only ever called when

@@ -386,10 +386,31 @@ def test_ctrl_width_mismatch_carries_the_expected_width(sess):
 
 def test_set_qpos_has_no_zero_ctrl_style_sibling_that_bypasses_the_solve(sess):
     """A rejected ctrl must only ever be clearable BY writing qpos (and so calling
-    mj_forward) in the same call -- confirms no separately-callable method exists that could
-    zero data.ctrl without immediately pushing that zero through the solve."""
-    assert not hasattr(sess, "zero_ctrl")
-    assert not hasattr(sess, "clear_ctrl")
+    mj_forward) in the same call. A name-specific check (``not hasattr(sess, "zero_ctrl")``)
+    only guards against THAT exact name coming back -- a ``reset_ctrl``-shaped reinstatement
+    would slip straight past it -- so this scans every public member for anything that even
+    LOOKS like a ctrl-mutating method, and only allows the ones that are legitimately
+    unrelated to the replay ctrl channel this task guards:
+
+    - ``set_ctrl``/``set_ctrl_mode`` are the pre-existing INTERACTIVE-slider entry points
+      (composed via ``_compose_ctrl`` and applied on the next :meth:`Session.step`, not
+      written directly to ``data.ctrl`` the way replay's ctrl channel is).
+    - ``set_qpos`` is not a "sibling" of a zero-only method -- it IS the seam: the one place
+      that writes ``ctrl`` (when given one) and always follows with the qpos write and
+      ``mj_forward`` that make it real, in the same call.
+
+    Anything else with "ctrl" in its name is exactly the shape of method this task removed
+    (``zero_ctrl``) and must not have reappeared under a different name.
+    """
+    ctrl_named_members = {
+        name for name in dir(sess)
+        if not name.startswith("_") and "ctrl" in name.lower()
+    }
+    allowed = {"set_ctrl", "set_ctrl_mode", "set_qpos"}
+    suspicious = ctrl_named_members - allowed
+    assert not suspicious, (
+        f"found ctrl-mutating-looking member(s) with no accompanying solve: {suspicious}"
+    )
 
 
 # Two models whose actuator NAMES overlap but whose actuator ORDER is deliberately scrambled
@@ -473,6 +494,11 @@ def test_ctrl_maps_by_name_not_position_on_the_scrambled_doubled_model(ctrl_map_
     on the CURRENTLY ACTIVE model -- and the un-driven '_ref' half must stay untouched."""
     s = ctrl_map_session
     s.swap_model("alt")
+    # Seed data.ctrl with an obviously-wrong value BEFORE the write below. A freshly-swapped
+    # MjData already starts at ctrl == 0, so without this the three `m_*_ref == 0.0`
+    # assertions below would pass whether or not set_qpos's own zero-fill (`self.data.ctrl[:]
+    # = 0.0`) ever ran -- there would be nothing non-zero for it to have cleared.
+    s.data.ctrl[:] = 5.0
     qpos = s.model.qpos0.copy()
     s.set_qpos(qpos, ctrl=[1.0, 2.0, 3.0])  # still primary-ordered: m_a=1, m_b=2, m_c=3
     assert _force_by_name(s.model, s.data, "m_a") == pytest.approx(1.0)
@@ -513,6 +539,74 @@ def test_ctrl_map_rebuilds_on_swap_back_even_when_the_forward_map_would_be_out_o
     assert _force_by_name(s.model, s.data, "m_a") == pytest.approx(1.0)
     assert _force_by_name(s.model, s.data, "m_b") == pytest.approx(2.0)
     assert _force_by_name(s.model, s.data, "m_c") == pytest.approx(3.0)
+
+
+# Every ctrl-map fixture above has an alt model containing EVERY primary actuator name, so
+# `_ctrl_map` can never actually contain a -1 there -- the `valid = self._ctrl_map >= 0` filter
+# in set_qpos has no way to be exercised by any of them. This pair deliberately omits one
+# primary name from the alt model, and orders the primary actuators so the unmatched one is
+# NOT first, so a numpy negative-index wraparound (writing at data.ctrl[-1] instead of
+# skipping) would visibly corrupt an earlier, otherwise-correct write rather than landing
+# somewhere the test can't see.
+_CTRL_PRIMARY_WITH_UNMATCHED_XML = """
+<mujoco><worldbody>
+  <body name="br"><joint name="jr" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bm"><joint name="jm" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+</worldbody>
+<actuator>
+  <motor name="m_real" joint="jr"/>
+  <motor name="m_missing" joint="jm"/>
+</actuator>
+</mujoco>
+"""
+
+_CTRL_ALT_ONE_ACTUATOR_XML = """
+<mujoco><worldbody>
+  <body name="br"><joint name="jr" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+</worldbody>
+<actuator>
+  <motor name="m_real" joint="jr"/>
+</actuator>
+</mujoco>
+"""
+
+
+@pytest.fixture
+def ctrl_map_session_with_unmatched_name():
+    primary = mujoco.MjModel.from_xml_string(_CTRL_PRIMARY_WITH_UNMATCHED_XML)
+    alt = mujoco.MjModel.from_xml_string(_CTRL_ALT_ONE_ACTUATOR_XML)
+    s = Session(model=primary, alt_model=alt, width=64, height=48)
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+def test_ctrl_map_skips_an_unmatched_primary_name_rather_than_wrapping_onto_the_last_actuator(
+    ctrl_map_session_with_unmatched_name,
+):
+    """The alt model here has no actuator named ``m_missing`` at all, so ``_ctrl_map``'s entry
+    for it must be -1 -- and ``set_qpos`` must SKIP that entry rather than let numpy's
+    negative-index wraparound write ``m_missing``'s value into whatever actuator sits LAST on
+    this model. Here that is ``m_real`` itself (id 0 on a single-actuator alt model, so
+    ``data.ctrl[-1]`` IS ``data.ctrl[0]``): without the ``valid = self._ctrl_map >= 0`` filter,
+    ``m_missing``'s value (2.0) would overwrite ``m_real``'s correct one (1.0), because it is
+    scattered SECOND in ``self._ctrl_map``'s own primary order. No other ctrl-map fixture in
+    this file can ever produce a -1 (their alt models contain every primary name), so this one
+    exists specifically to give that filter something to guard."""
+    s = ctrl_map_session_with_unmatched_name
+    s.swap_model("alt")
+    m_missing_index = list(s._primary_actuator_names).index("m_missing")
+    assert s._ctrl_map[m_missing_index] == -1
+
+    qpos = s.model.qpos0.copy()
+    s.set_qpos(qpos, ctrl=[1.0, 2.0])  # m_real=1.0, m_missing=2.0 (unmatched)
+    assert _force_by_name(s.model, s.data, "m_real") == pytest.approx(1.0), (
+        "m_missing's value must not have wrapped around via data.ctrl[-1] onto m_real's slot"
+    )
 
 
 def test_scene_message_describes_the_model(sess):

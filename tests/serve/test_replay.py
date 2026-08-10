@@ -154,11 +154,45 @@ def test_source_with_no_ctrl_reports_has_ctrl_false():
     assert src.has_ctrl is False
 
 
-def test_source_with_no_ctrl_still_satisfies_the_protocol():
-    """A source built with no ctrl array is still a complete, valid TrajectorySource --
-    the ctrl channel is optional, not a new required member every implementor must supply."""
-    src = ArrayTrajectorySource(make_qpos())
+class _BareThreeMemberSource:
+    """The ORIGINAL ``TrajectorySource`` shape -- exactly ``n_clips``/``clip_length``/``qpos``,
+    predating the ctrl channel entirely. No ``has_ctrl``, no ``ctrl``.
+
+    ``ArrayTrajectorySource`` cannot stand in for this: it defines both ``has_ctrl`` and
+    ``ctrl`` itself, so it would satisfy ``isinstance(src, TrajectorySource)`` even in a
+    (buggy) world where those two members were added directly onto the base protocol and made
+    MANDATORY for every implementor -- ``@runtime_checkable`` checks structural presence of
+    every declared member, so a legacy three-member source is the only thing that can actually
+    catch that regression.
+    """
+
+    def __init__(self, qpos):
+        self._src = ArrayTrajectorySource(qpos)
+
+    @property
+    def n_clips(self) -> int:
+        return self._src.n_clips
+
+    def clip_length(self, clip: int) -> int:
+        return self._src.clip_length(clip)
+
+    def qpos(self, clip: int, frame: int) -> np.ndarray:
+        return self._src.qpos(clip, frame)
+
+
+def test_a_bare_legacy_source_still_satisfies_the_protocol():
+    """A source with only the three original members -- no has_ctrl, no ctrl -- must still be
+    a complete, valid TrajectorySource: the ctrl channel is optional, not a new required
+    member every implementor must supply."""
+    src = _BareThreeMemberSource(make_qpos())
     assert isinstance(src, TrajectorySource)
+
+
+def test_a_source_with_ctrl_also_satisfies_the_richer_ctrl_protocol():
+    from mujoco_visualizer.serve.replay import CtrlTrajectorySource
+
+    src = ArrayTrajectorySource(make_qpos(), ctrl=make_ctrl())
+    assert isinstance(src, CtrlTrajectorySource)
 
 
 def test_source_with_ctrl_reports_has_ctrl_true_and_matching_width():
