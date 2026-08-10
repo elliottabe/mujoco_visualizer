@@ -175,6 +175,7 @@ class Session:
         alt_model: Optional[mujoco.MjModel] = None,
         user_settings_dir: Optional[Path] = None,
         scene_modifiers: Optional[Sequence[Callable]] = None,
+        actuator_color_schemes: Optional[Dict[str, Dict[str, Callable]]] = None,
         **viz_kwargs,
     ):
         # Where `save_settings_as` writes named presets, and where `load_settings` looks for
@@ -254,6 +255,21 @@ class Session:
         # why a stale map here is exactly the silent-corruption failure mode this exists to
         # avoid.
         self._ctrl_map = self._build_ctrl_map()
+
+        # Actuator colour schemes, keyed by the name that appears in
+        # vis_state['tendons']['color_by']. Each value is
+        # {"color": (name) -> hex|rgba, "group": (name) -> group_name}.
+        #
+        # A PARAMETER, not a palette shipped here: turning 'mu_T1_28a_left' into a colour is
+        # specific to one model's actuator naming, and this class is model-agnostic for tendons
+        # exactly as it is for lighting, floor and camera. An unregistered scheme name resolves
+        # to {} and therefore to build_actuator_tendon_map's existing solid-red fallback, so a
+        # settings file written against another model still renders (design D3).
+        #
+        # The "group" half is what a legend needs: grouping by resolved hex would label the
+        # legend with colour codes instead of muscle-group names. Keeping both halves in one
+        # entry means a scheme cannot supply a palette without the labels that explain it.
+        self._actuator_color_schemes = dict(actuator_color_schemes or {})
         self._rebuild_tendon_state()
 
         self._tree = build_control_tree(self.model)
@@ -493,13 +509,18 @@ class Session:
 
     def _rebuild_tendon_state(self) -> None:
         """(Re)compute everything :meth:`_apply_tendon_activation_vis` needs from the CURRENTLY
-        ACTIVE model: the actuator->tendon map/colours, a snapshot of the model's own
-        tendon_rgba/tendon_width to restore to when the group is disabled, a fixed per-session
-        FALLBACK reference scale to normalise activation by, and the ``_vis_ctrl`` store itself
-        (see below).
+        ACTIVE model: the actuator->tendon map/colours (via :meth:`_rebuild_tendon_colors`), a
+        snapshot of the model's own tendon_rgba/tendon_width to restore to when the group is
+        disabled, a fixed per-session FALLBACK reference scale to normalise activation by, and
+        the ``_vis_ctrl`` store itself (see below).
 
-        Called from ``__init__`` and again from :meth:`swap_model`, exactly like
-        :meth:`_build_ctrl_map` right above each call site -- the reference-ghost swap roughly
+        Called from ``__init__`` and again from :meth:`swap_model` ONLY -- never for a
+        mid-session ``color_by`` change, which must go through :meth:`_rebuild_tendon_colors`
+        alone. See that method's docstring for why re-snapshotting here mid-session would be
+        destructive.
+
+        Called from those two sites exactly like :meth:`_build_ctrl_map` right above each call
+        site -- the reference-ghost swap roughly
         doubles ``ntendon``/``nu`` (260 -> 520 / 272 -> 544 on the real models), so a
         map/snapshot/store built against the OLD model would address the wrong tendons (or go
         out of range) on the new one. Unlike ``_ctrl_map``, nothing here is matched by NAME
@@ -516,9 +537,7 @@ class Session:
         a poor normalisation reference on real data, and why the fix is an overridable knob
         rather than recomputing anything from ``data.ctrl`` here.
         """
-        self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
-            self.model, getattr(self.viz, "actuator_color_fn", None)
-        )
+        self._rebuild_tendon_colors()
         self._tendon_orig_rgba = self.model.tendon_rgba.copy()
         self._tendon_orig_width = self.model.tendon_width.copy()
         self._tendon_default_ctrl_full_scale = default_tendon_ctrl_full_scale(
@@ -535,6 +554,41 @@ class Session:
         # frame writes a real one -- the same "stale-but-plausible visual" failure mode
         # :meth:`_apply_tendon_activation_vis` already guards against on disable.
         self._vis_ctrl = np.zeros(self.model.nu, dtype=np.float64)
+
+    def _rebuild_tendon_colors(self) -> None:
+        """(Re)compute the actuator->tendon map and its ``base_rgba`` for the CURRENT
+        ``vis_state['tendons']['color_by']``, and record which scheme they were built for.
+
+        Split out of :meth:`_rebuild_tendon_state` because a scheme change is a MID-SESSION
+        rebuild, and the rest of that method must not run again then: it snapshots
+        ``model.tendon_rgba`` into ``_tendon_orig_rgba``, which is correct at ``__init__``/
+        ``swap_model`` (nothing has touched the tendons) and destructive once
+        ``apply_tendon_activation`` has overwritten those arrays -- the snapshot would capture
+        activation colours as the model's own, and
+        :meth:`_apply_tendon_activation_vis` restores to it on every frame the group is off,
+        permanently. Splitting by NAME rather than adding a ``snapshot=False`` argument makes
+        the unsafe call unreachable rather than merely discouraged.
+
+        Deliberately does NOT recompute ``_tendon_default_ctrl_full_scale`` or reset
+        ``_vis_ctrl``: neither depends on the colour scheme, and zeroing ``_vis_ctrl`` here
+        would blank the activation for one frame every time a dropdown changed.
+        """
+        scheme_name = self.viz.vis_state.get("tendons", {}).get("color_by", "function")
+        scheme = self._actuator_color_schemes.get(scheme_name, {})
+        self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
+            self.model, scheme.get("color")
+        )
+        # build_actuator_tendon_map accepts a raw RGBA 4-tuple from a colour function and
+        # stores its alpha channel verbatim (it already forces alpha=1.0 for a hex string, via
+        # _hex_to_rgb(...) + [1.0], but a 4-tuple return has no such normalisation). Forced to
+        # 1.0 here, not in that shared function, because apply_tendon_activation always
+        # multiplies base_rgba's alpha by its own activation-derived alpha
+        # (`base_rgba[act] * [1, 1, 1, alpha]`) -- a scheme's own alpha would otherwise silently
+        # scale activation brightness, which is the one thing colour must not do. Left to
+        # build_actuator_tendon_map itself, this would also change the video-export path
+        # (render_video_pan), which this task does not touch.
+        self._tendon_base_rgba[:, 3] = 1.0
+        self._tendon_color_scheme = scheme_name
 
     def _apply_tendon_activation_vis(self) -> None:
         """Drive ``vis_state['tendons']`` from :attr:`_vis_ctrl` for the frame about to be
@@ -567,6 +621,13 @@ class Session:
             self.model.tendon_rgba[:] = self._tendon_orig_rgba
             self.model.tendon_width[:] = self._tendon_orig_width
             return
+        # A scheme change is picked up HERE, by comparison, rather than by hooking a write
+        # path: apply_render is not the only writer -- load_settings lands a whole
+        # vis_state['tendons'] dict, including color_by -- and one comparison against a cached
+        # string covers both, plus swap_model. Costs one dict lookup and a string compare per
+        # frame.
+        if tendons.get("color_by", "function") != self._tendon_color_scheme:
+            self._rebuild_tendon_colors()
         apply_tendon_activation(
             self.model,
             self._vis_ctrl,

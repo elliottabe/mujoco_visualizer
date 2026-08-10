@@ -793,6 +793,12 @@ class Visualizer:
             # still has a principled model-only fallback.
             'tendons': {
                 'enabled':   False,
+                # Which caller-supplied colour scheme (see Session's ``actuator_color_schemes``)
+                # recolours tendons -- 'function' is not itself a registered name here (this
+                # package ships no palette), it is just the stable default that makes the key
+                # exist so ``scene_message``'s settings payload always advertises 'color_by',
+                # which is what lets a UI control bind to it before any scheme is registered.
+                'color_by':  'function',
                 'max_width': (
                     float(self.model.tendon_width.max()) if self.model.ntendon else 0.003
                 ),
