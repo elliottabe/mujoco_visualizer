@@ -803,6 +803,21 @@ class Session:
     def active_model_name(self) -> str:
         return self._active_model
 
+    @property
+    def primary_actuator_names(self) -> List[str]:
+        """The order a replay ctrl vector is assumed to arrive in: the PRIMARY model's own.
+
+        Public because :class:`~mujoco_visualizer.serve.export.ExportJob` *requires* a caller
+        passing ``ctrl_frames`` to declare their ordering, and the caller's only correct source
+        for it is this session. Its first real caller had to reach into the private attribute --
+        a surface that forces its consumer to do that is not finished -- so this exists to make
+        the supported thing the reachable one.
+
+        A copy, not the list itself: a caller mutating it would silently desynchronise
+        ``_ctrl_map``, which is built from it and rebuilt only on a model swap.
+        """
+        return list(self._primary_actuator_names)
+
     def vis_state_snapshot(self) -> Dict:
         """A deep copy of ``vis_state``, safe to hand to another thread.
 

@@ -1457,3 +1457,34 @@ def test_a_rejected_bare_list_key_never_reaches_vis_state(sess):
     assert isinstance(after, list), f"geom_groups must stay a list; got {after!r}"
     assert after is before and len(after) == before_len, "apply_render must never have run"
     assert raised, "parse_command must reject the bare list key"
+
+
+def test_primary_actuator_names_is_public_and_a_defensive_copy():
+    """ExportJob REQUIRES a ctrl_frames caller to declare its ordering, and the session is the
+    only correct source. Its first real caller had to reach into `_primary_actuator_names`, so
+    the supported path must be reachable without touching a private -- and must not hand out
+    the live list, since mutating it would silently desynchronise `_ctrl_map`, which is built
+    from it and rebuilt only on a swap.
+
+    The expected order is captured into an INDEPENDENT list before mutating. Comparing the
+    property against `_primary_actuator_names` afterwards cannot work: if the property returned
+    the live list, the mutation would change both sides and they would still match. That is the
+    shape this repo keeps catching, so it is spelled out rather than left to be rediscovered.
+    """
+    s = Session(model=mujoco.MjModel.from_xml_string(_CTRL_PRIMARY_XML), width=8, height=8)
+    try:
+        expected = [str(n) for n in s._primary_actuator_names]
+        assert expected, "a model with actuators must report them"
+        assert s.primary_actuator_names == expected, "public view must match the real order"
+        handed_out = s.primary_actuator_names
+        handed_out.append("bogus")
+        handed_out[0] = "clobbered"
+        assert s.primary_actuator_names == expected, (
+            "mutating the returned list changed what the session reports: it handed out the "
+            "live list, so a caller can desynchronise _ctrl_map from the model"
+        )
+        assert list(s._primary_actuator_names) == expected, (
+            "the session's own order was mutated through the public accessor"
+        )
+    finally:
+        s.close()
