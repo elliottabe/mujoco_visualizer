@@ -32,8 +32,10 @@ import numpy as np
 from mujoco_visualizer.visualizer import (
     _apply_forces_vis,
     _az_el_to_dir,
+    _dir_to_az_el,
     _hex_to_rgb,
     _make_sky_pixels,
+    _read_sky_colors,
     _rgb_to_hex,
     _FREE_TYPE_MAP,
     _build_pan_camera,
@@ -262,42 +264,92 @@ def apply_settings(
                 model.geom_rgba[i, 3] = orig_geom_rgba[i, 3] * alpha
 
     # Apply lighting
+    #
+    # Every field below is written only if the caller's dict mentions it -- a raw settings
+    # dict (unlike Visualizer.vis_state, which always holds every key from __init__ onward) may
+    # legitimately be partial, e.g. {'lights': [{'active': True}]} to toggle one light without
+    # restating its colour. Fewer ENTRIES than model.nlight was already fine (the loop below
+    # only ever touches indices the list actually has); the gap was a partial dict WITHIN one
+    # entry. dir_az/dir_el is a pair backing the single light_dir vector: mentioning only one
+    # half decomposes the model's current direction (_dir_to_az_el is the exact inverse of the
+    # write below) and recomposes it with the mentioned half substituted in, rather than either
+    # dropping the mentioned half or resetting the other to zero.
     if apply_lighting and 'lighting' in settings:
         lighting = settings['lighting']
         for i, ld in enumerate(lighting.get('lights', [])):
             if i >= model.nlight:
                 break
-            model.light_active[i] = int(ld['active'])
-            model.light_ambient[i] = ld['ambient']
-            model.light_diffuse[i] = ld['diffuse']
-            model.light_specular[i] = ld['specular']
-            model.light_dir[i] = _az_el_to_dir(ld['dir_az'], ld['dir_el'])
+            if 'active' in ld:
+                model.light_active[i] = int(ld['active'])
+            if 'ambient' in ld:
+                model.light_ambient[i] = ld['ambient']
+            if 'diffuse' in ld:
+                model.light_diffuse[i] = ld['diffuse']
+            if 'specular' in ld:
+                model.light_specular[i] = ld['specular']
+            if 'dir_az' in ld or 'dir_el' in ld:
+                cur_az, cur_el = _dir_to_az_el(model.light_dir[i])
+                model.light_dir[i] = _az_el_to_dir(
+                    ld.get('dir_az', cur_az), ld.get('dir_el', cur_el)
+                )
         hl = lighting.get('headlight')
         if hl:
-            model.vis.headlight.active = int(hl['active'])
-            model.vis.headlight.ambient[:] = hl['ambient']
-            model.vis.headlight.diffuse[:] = hl['diffuse']
-            model.vis.headlight.specular[:] = hl['specular']
+            if 'active' in hl:
+                model.vis.headlight.active = int(hl['active'])
+            if 'ambient' in hl:
+                model.vis.headlight.ambient[:] = hl['ambient']
+            if 'diffuse' in hl:
+                model.vis.headlight.diffuse[:] = hl['diffuse']
+            if 'specular' in hl:
+                model.vis.headlight.specular[:] = hl['specular']
 
     # Apply floor
+    #
+    # 'color' and 'alpha' both land in the same geom_rgba/mat_rgba 4-vector, so mentioning only
+    # one means reading the other back off the model first (geom_rgba is exactly what the
+    # previous apply -- or the MJCF, on a model never touched by this function -- left there).
+    # Neither key present skips the geom_rgba/mat_rgba write entirely, not a rewrite with the
+    # same values. texrepeat_x/texrepeat_y is the same kind of pair as lights' dir_az/dir_el,
+    # just a plain 2-vector rather than a direction needing az/el decomposition.
     if apply_floor and floor_geom_id is not None and 'floor' in settings:
         fld = settings['floor']
-        rgb = _hex_to_rgb(fld['color'])
-        model.geom_rgba[floor_geom_id] = [*rgb, fld['alpha']]
+        if 'color' in fld or 'alpha' in fld:
+            rgb = _hex_to_rgb(fld['color']) if 'color' in fld else list(
+                model.geom_rgba[floor_geom_id, :3]
+            )
+            alpha = fld['alpha'] if 'alpha' in fld else float(model.geom_rgba[floor_geom_id, 3])
+            model.geom_rgba[floor_geom_id] = [*rgb, alpha]
+            if floor_mat_id is not None:
+                model.mat_rgba[floor_mat_id] = [*rgb, alpha]
         if floor_mat_id is not None:
-            model.mat_rgba[floor_mat_id] = [*rgb, fld['alpha']]
-            model.mat_texrepeat[floor_mat_id] = [fld['texrepeat_x'], fld['texrepeat_y']]
-            model.mat_reflectance[floor_mat_id] = fld['reflectance']
-            model.mat_shininess[floor_mat_id] = fld['shininess']
-            model.mat_emission[floor_mat_id] = fld['emission']
+            if 'texrepeat_x' in fld or 'texrepeat_y' in fld:
+                cur_tx, cur_ty = map(float, model.mat_texrepeat[floor_mat_id])
+                model.mat_texrepeat[floor_mat_id] = [
+                    fld.get('texrepeat_x', cur_tx), fld.get('texrepeat_y', cur_ty)
+                ]
+            if 'reflectance' in fld:
+                model.mat_reflectance[floor_mat_id] = fld['reflectance']
+            if 'shininess' in fld:
+                model.mat_shininess[floor_mat_id] = fld['shininess']
+            if 'emission' in fld:
+                model.mat_emission[floor_mat_id] = fld['emission']
 
     # Apply skybox
+    #
+    # sky_top/sky_bot have no dedicated model field to read back at all -- _make_sky_pixels
+    # bakes both into every texel of a rendered cube map. Mentioning only one reads the other
+    # back by SAMPLING the texture (_read_sky_colors), not indexing a struct; mentioning
+    # neither (e.g. a dict that only carries 'show', which this function does not otherwise
+    # handle) skips regeneration entirely rather than crashing or guessing.
+    pixels = None
     if apply_skybox and skybox_tex_id >= 0 and 'skybox' in settings:
         sky = settings['skybox']
-        pixels = _make_sky_pixels(
-            model, skybox_tex_id,
-            _hex_to_rgb(sky['sky_top']), _hex_to_rgb(sky['sky_bot'])
-        )
+        if 'sky_top' in sky or 'sky_bot' in sky:
+            current = _read_sky_colors(model, skybox_tex_id)
+            cur_top, cur_bot = current if current is not None else ([0.4, 0.6, 0.8], [0.0, 0.0, 0.0])
+            top_rgb = _hex_to_rgb(sky['sky_top']) if 'sky_top' in sky else cur_top
+            bot_rgb = _hex_to_rgb(sky['sky_bot']) if 'sky_bot' in sky else cur_bot
+            pixels = _make_sky_pixels(model, skybox_tex_id, top_rgb, bot_rgb)
         if pixels is not None:
             h = int(model.tex_height[skybox_tex_id])
             w = int(model.tex_width[skybox_tex_id])
