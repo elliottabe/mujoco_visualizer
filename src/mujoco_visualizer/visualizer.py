@@ -332,6 +332,42 @@ def default_tendon_ctrl_full_scale(
     return max(bounds) if bounds else 1.0
 
 
+def default_force_arrow_scale(model: mujoco.MjModel) -> float:
+    """The model-derived default for ``vis_state['force_arrows']['scale']``:
+    ``0.1 * model.stat.extent / (total_mass * |gravity_z|)``.
+
+    THIS IS DELIBERATELY NOT A HARDCODED CONSTANT -- the same hardcode hazard
+    ``default_tendon_ctrl_full_scale`` and ``_apply_forces_vis`` both exist to avoid. A fixed
+    scale is invisible on any model whose size/mass/gravity combination it was not tuned for:
+    MuJoCo's own native force-arrow scaling (``model.vis.map.force``, see the ``forces`` group
+    above) renders a weight-sized force at roughly ``3e-5`` of this model's own extent -- a
+    fixed default carried over from a different unit system is exactly that kind of
+    trap. The formula instead asks "how long should the arrow for ONE BODY-WEIGHT of force be,
+    relative to how big this model already is": a force of ``total_mass * |gravity_z|``
+    (one weight) times this scale renders at ``0.1 * model.stat.extent`` -- a visible,
+    consistent fraction of the model's own size, regardless of what units/scale the MJCF uses.
+
+    Verified against the real fly model (CGS units: ``gravity_z = -981``,
+    ``total_mass ≈ 9.8e-4``, ``extent = 1.0``): this returns ``0.10397``, matching the
+    measurement in ``scripts/rollout_viewer/force_arrows.default_force_arrow_scale`` (task
+    15a's sibling module, which computes the identical formula independently -- see this
+    module's own docstring note on that duplication).
+
+    Falls back to ``1.0`` when ``total_mass * |gravity_z|`` is zero (a model with no mass or
+    zero-gravity ``opt.gravity``, e.g. a bare test fixture) -- there is no principled "one
+    weight" reference distance to calibrate against on such a model, so this is a documented
+    placeholder a caller on that model must override, not a claim that 1.0 is somehow correct.
+    Mirrors ``default_tendon_ctrl_full_scale``'s own ``else: 1.0`` for the equivalent
+    no-signal case.
+    """
+    total_mass = float(model.body_mass.sum())
+    gravity_z = abs(float(model.opt.gravity[2]))
+    denom = total_mass * gravity_z
+    if denom <= 0.0:
+        return 1.0
+    return 0.1 * float(model.stat.extent) / denom
+
+
 def get_wing_fluid_idxs(model: mujoco.MjModel, suffix='') -> List[int]:
     """Return geom ids of the wing fluid geoms (left, right) in *model*."""
     out = []
@@ -718,6 +754,39 @@ class Visualizer:
                 'baseline':  0.0,
                 'ctrl_full_scale': default_tendon_ctrl_full_scale(self.model),
             },
+            # Recorded per-frame force-sensor arrows (drawn via ``add_arrow_to_scene`` by a
+            # ``modify_scene_fns`` callable a caller registers on ``Session.scene_modifiers`` --
+            # nothing in THIS package reads this group or draws anything from it; see
+            # ``add_arrow_to_scene``/``Session.render`` for the seam that would). Off by
+            # default: an arrow group with nothing feeding it real per-frame force data would
+            # otherwise draw at a stale/zero pose the moment a caller flips it on by habit.
+            #
+            # 'scale' is seeded from ``self._default_force_arrow_scale`` (see
+            # ``default_force_arrow_scale``'s docstring) rather than a hardcoded number,
+            # because a fixed default is invisible on any model whose mass/gravity/extent it
+            # was not tuned for -- the same reasoning ``ctrl_full_scale`` above and
+            # ``_apply_forces_vis``'s five fields already follow. Deliberately left UNTOUCHED
+            # by rebind_model/swap_model, exactly like 'tendons' ctrl_full_scale above (see
+            # that key's own comment) and UNLIKE 'forces' (which _carry_vis_state_across_swap
+            # DOES reapply, because it lives on model.vis and gets wiped by a fresh model
+            # object -- this key lives only in vis_state, so nothing wipes it, and a caller's
+            # explicit override deserves to survive a swap the same way ctrl_full_scale's does).
+            # self._default_force_arrow_scale IS still kept fresh for the CURRENTLY active
+            # model on every rebind (see _rebuild_model_derived_state) -- so a consumer that
+            # wants "the right default for THIS model" can read that attribute directly,
+            # even though this vis_state key itself is not automatically reset to it.
+            #
+            # 'radius' (arrow shaft width) reuses 0.003, the same default every existing
+            # arrow-drawing helper in this module already uses (``add_arrow_to_scene``,
+            # ``add_aero_force_arrows_to_scene``) -- consistent with them rather than a new
+            # number, and not model-derived: unlike 'scale' there is no principled formula for
+            # it in the task this group exists for, so consistency with the rest of the module
+            # is the least-surprising choice.
+            'force_arrows': {
+                'enabled': False,
+                'scale':   self._default_force_arrow_scale,
+                'radius':  0.003,
+            },
             'camera_presets': {},
         }
 
@@ -781,6 +850,19 @@ class Visualizer:
 
         # Refresh originals after baking
         self._orig_geom_rgba = self.model.geom_rgba.copy()
+
+        # The FALLBACK default for vis_state['force_arrows']['scale'] -- recomputed here (i.e.
+        # on every __init__ AND every rebind_model/swap) so it never goes stale for whichever
+        # model is CURRENTLY self.model, exactly like _cat_default_hex and the floor/light
+        # snapshot below. Unlike those, nothing in THIS package re-applies it onto vis_state on
+        # a swap: vis_state['force_arrows']['scale'] itself is intentionally left untouched by
+        # a swap (see Session._carry_vis_state_across_swap's docstring, and this class's own
+        # __init__ comment on 'force_arrows', for why that mirrors 'tendons' ctrl_full_scale
+        # rather than 'forces') -- a caller who explicitly set it is assumed to mean it on
+        # whichever model is active. This attribute exists so that claim is falsifiable: a
+        # future consumer (or a test) that wants "the right default for the CURRENT model" has
+        # somewhere to read it from without recomputing the formula itself.
+        self._default_force_arrow_scale = default_force_arrow_scale(self.model)
 
         # Cached render context. Building one re-uploads every mesh to the GPU (399 ms on
         # the fly model vs 8.6 ms reused), so exactly one is kept and reused; a resolution
@@ -894,7 +976,7 @@ class Visualizer:
         # default __init__ set, never an error and never a synthesized value.
         for key in ('colors', 'geom_colors', 'alpha', 'vis_flags',
                     'geom_groups', 'site_groups', 'camera', 'lighting',
-                    'floor', 'skybox', 'ghost', 'forces', 'tendons'):
+                    'floor', 'skybox', 'ghost', 'forces', 'tendons', 'force_arrows'):
             if key in settings:
                 if isinstance(settings[key], dict) and isinstance(self.vis_state.get(key), dict):
                     self.vis_state[key] = {**self.vis_state[key], **settings[key]}
@@ -948,6 +1030,7 @@ class Visualizer:
             'skybox':            copy.deepcopy(self.vis_state['skybox']),
             'forces':            copy.deepcopy(self.vis_state['forces']),
             'tendons':           copy.deepcopy(self.vis_state['tendons']),
+            'force_arrows':      copy.deepcopy(self.vis_state.get('force_arrows', {})),
             'geom_render_state': geom_render_state,
             'camera_presets':    self.vis_state.get('camera_presets', {}),
             # .get(..., {}), not ['ghost'], because this key was added after every existing
