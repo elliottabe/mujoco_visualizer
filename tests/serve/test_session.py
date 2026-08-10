@@ -339,6 +339,161 @@ def test_set_qpos_rejects_non_finite_input_and_does_not_poison_the_snapshot(sess
     assert np.isfinite(sess.data.qpos).all()
 
 
+# -- replay ctrl channel -----------------------------------------------------
+
+
+def test_set_qpos_with_no_ctrl_leaves_data_ctrl_untouched(sess):
+    """The existing signature must keep working unchanged for every caller that only ever
+    wrote qpos -- set_qpos(qpos) with no second argument must not touch data.ctrl at all."""
+    sess.set_ctrl({"coxa_T1_left": 0.7})
+    sess.step(1)  # composes ctrl and writes it into data.ctrl via the backend
+    before = sess.data.ctrl.copy()
+    sess.set_qpos(sess.model.qpos0.copy())
+    np.testing.assert_array_equal(sess.data.ctrl, before)
+
+
+def test_set_qpos_writes_ctrl_before_forward_so_actuator_force_reflects_it(sess):
+    """Proves ctrl actually reaches the constraint solve, not merely that data.ctrl holds the
+    value: actuator_force is a quantity mj_forward COMPUTES from ctrl (gain*ctrl for a motor),
+    so this fails if the write happened after forward, or not at all, even in a broken version
+    where data.ctrl itself looks correct."""
+    target = sess.model.qpos0.copy()
+    sess.set_qpos(target, ctrl=[0.4, -0.6])
+    assert sess.data.actuator_force[0] == pytest.approx(0.4)
+    assert sess.data.actuator_force[1] == pytest.approx(-0.6)
+
+
+def test_set_qpos_rejects_a_wrong_width_ctrl(sess):
+    from mujoco_visualizer.serve.session import CtrlWidthMismatch
+
+    target = sess.model.qpos0.copy()
+    with pytest.raises(CtrlWidthMismatch):
+        sess.set_qpos(target, ctrl=[0.1, 0.2, 0.3])  # sess's model has only 2 actuators
+
+
+# Two models whose actuator NAMES overlap but whose actuator ORDER is deliberately scrambled
+# between them, plus a suffixed "_ref" half on the alt model standing in for the doubled
+# reference-ghost pair's un-driven overlay. A positional slice (ctrl[i] -> data.ctrl[i]) would
+# misassign on this pair; only a name-based map lands each value on the right actuator.
+_CTRL_PRIMARY_XML = """
+<mujoco><worldbody>
+  <body name="ba"><joint name="ja" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bb"><joint name="jb" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bc"><joint name="jc" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+</worldbody>
+<actuator>
+  <motor name="m_a" joint="ja"/>
+  <motor name="m_b" joint="jb"/>
+  <motor name="m_c" joint="jc"/>
+</actuator>
+</mujoco>
+"""
+
+_CTRL_ALT_XML = """
+<mujoco><worldbody>
+  <body name="bc"><joint name="jc" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="ba_ref"><joint name="ja_ref" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bb"><joint name="jb" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="ba"><joint name="ja" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bc_ref"><joint name="jc_ref" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bb_ref"><joint name="jb_ref" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+</worldbody>
+<actuator>
+  <motor name="m_c" joint="jc"/>
+  <motor name="m_a_ref" joint="ja_ref"/>
+  <motor name="m_b" joint="jb"/>
+  <motor name="m_a" joint="ja"/>
+  <motor name="m_c_ref" joint="jc_ref"/>
+  <motor name="m_b_ref" joint="jb_ref"/>
+</actuator>
+</mujoco>
+"""
+
+
+@pytest.fixture
+def ctrl_map_session():
+    primary = mujoco.MjModel.from_xml_string(_CTRL_PRIMARY_XML)
+    alt = mujoco.MjModel.from_xml_string(_CTRL_ALT_XML)
+    s = Session(model=primary, alt_model=alt, width=64, height=48)
+    try:
+        yield s
+    finally:
+        s.close()
+
+
+def _force_by_name(model, data, name):
+    aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+    return float(data.actuator_force[aid])
+
+
+def test_ctrl_maps_by_actuator_name_on_the_primary_model(ctrl_map_session):
+    s = ctrl_map_session
+    qpos = s.model.qpos0.copy()
+    # Ordered exactly as the PRIMARY model declares its own actuators: m_a, m_b, m_c.
+    s.set_qpos(qpos, ctrl=[1.0, 2.0, 3.0])
+    assert _force_by_name(s.model, s.data, "m_a") == pytest.approx(1.0)
+    assert _force_by_name(s.model, s.data, "m_b") == pytest.approx(2.0)
+    assert _force_by_name(s.model, s.data, "m_c") == pytest.approx(3.0)
+
+
+def test_ctrl_maps_by_name_not_position_on_the_scrambled_doubled_model(ctrl_map_session):
+    """The width problem, for real: nu doubles (3 -> 6) AND the surviving names are declared
+    in a different order on the alt model. A ctrl vector ordered by the PRIMARY model's own
+    actuator order must still land on the matching name, wherever that name's id actually is
+    on the CURRENTLY ACTIVE model -- and the un-driven '_ref' half must stay untouched."""
+    s = ctrl_map_session
+    s.swap_model("alt")
+    qpos = s.model.qpos0.copy()
+    s.set_qpos(qpos, ctrl=[1.0, 2.0, 3.0])  # still primary-ordered: m_a=1, m_b=2, m_c=3
+    assert _force_by_name(s.model, s.data, "m_a") == pytest.approx(1.0)
+    assert _force_by_name(s.model, s.data, "m_b") == pytest.approx(2.0)
+    assert _force_by_name(s.model, s.data, "m_c") == pytest.approx(3.0)
+    # The reference half is a kinematic overlay, never driven: it must stay at zero.
+    assert _force_by_name(s.model, s.data, "m_a_ref") == pytest.approx(0.0)
+    assert _force_by_name(s.model, s.data, "m_b_ref") == pytest.approx(0.0)
+    assert _force_by_name(s.model, s.data, "m_c_ref") == pytest.approx(0.0)
+
+
+def test_ctrl_map_rebuilds_on_swap_back_even_when_the_forward_map_would_be_out_of_range(
+    ctrl_map_session,
+):
+    """A round-trip test that starts and ends on ``primary`` cannot, by itself, tell "the map
+    was rebuilt back to primary" apart from "the map was never touched at all": primary's own
+    ``__init__``-time map is already correct for primary, so a stale map surviving both swaps
+    unrebuilt would still (by coincidence) look right once back on primary. That is exactly
+    the "green while guarding nothing" shape this project keeps re-finding, so this test forces
+    the distinction by inspecting state ``s._ctrl_map`` WHILE alt is active (proving the
+    forward rebuild is not simply skipped) before swapping back and checking the write again."""
+    s = ctrl_map_session
+    s.swap_model("alt")
+    # If the forward rebuild had been skipped, `_ctrl_map` here would still be the identity
+    # `[0, 1, 2]` built at __init__ for primary -- writing THAT onto alt's data.ctrl silently
+    # lands on whatever actuators happen to sit at ids 0/1/2 (m_c, m_a_ref, m_b -- see
+    # _CTRL_ALT_XML), not m_a/m_b/m_c. The name-based map must instead point at m_a/m_b/m_c's
+    # ACTUAL ids on alt.
+    alt_id_of = {
+        mujoco.mj_id2name(s.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i): i
+        for i in range(s.model.nu)
+    }
+    assert list(s._ctrl_map) == [alt_id_of["m_a"], alt_id_of["m_b"], alt_id_of["m_c"]]
+
+    s.swap_model("primary")
+    qpos = s.model.qpos0.copy()
+    s.set_qpos(qpos, ctrl=[1.0, 2.0, 3.0])
+    assert _force_by_name(s.model, s.data, "m_a") == pytest.approx(1.0)
+    assert _force_by_name(s.model, s.data, "m_b") == pytest.approx(2.0)
+    assert _force_by_name(s.model, s.data, "m_c") == pytest.approx(3.0)
+
+
 def test_scene_message_describes_the_model(sess):
     msg = sess.scene_message()
     assert msg["nu"] == sess.model.nu

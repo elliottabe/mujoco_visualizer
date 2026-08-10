@@ -34,6 +34,18 @@ class Diverged(RuntimeError):
     step before this is raised, so the caller can still render and offer a reset."""
 
 
+class CtrlWidthMismatch(ValueError):
+    """:meth:`Session.set_qpos` raised this because the ``ctrl`` it was handed does not have
+    exactly as many entries as this Session's replay ctrl map expects.
+
+    A distinct subclass of ``ValueError`` -- not the plain one :meth:`set_qpos` raises for a
+    non-finite qpos -- so a caller that needs to tell the two apart (``SimLoop._write_replay_
+    qpos``, which must report a bad ctrl width as a non-pausing ``kind='command'`` error while
+    still letting a bad qpos get the ``kind='replay'``, paused treatment it deserves) can catch
+    exactly this one without also swallowing the other.
+    """
+
+
 # mjtWarning splits into two classes that must NOT be conflated:
 #
 # - Divergence: the state itself is corrupt. MuJoCo's own check for "Nan, Inf or huge value"
@@ -186,6 +198,18 @@ class Session:
         if alt_model is not None:
             self._models["alt"] = alt_model
         self._active_model = "primary"
+
+        # The order a replay ctrl vector is assumed to arrive in: the PRIMARY (policy) model's
+        # own actuator order. This never changes across a swap -- the primary model itself is
+        # never swapped away, only which model is ACTIVE -- so it is computed once here rather
+        # than rebuilt alongside `_ctrl_map` below.
+        self._primary_actuator_names = self._actuator_names(self._models["primary"])
+        # {index into a primary-ordered replay ctrl vector -> index into data.ctrl on the
+        # CURRENTLY ACTIVE model}, built by matching actuator NAMES (see _build_ctrl_map).
+        # Rebuilt by swap_model whenever the active model changes -- see its own comment for
+        # why a stale map here is exactly the silent-corruption failure mode this exists to
+        # avoid.
+        self._ctrl_map = self._build_ctrl_map()
 
         self._tree = build_control_tree(self.model)
         self._group_of = actuator_group_map(self._tree)
@@ -388,7 +412,42 @@ class Session:
             self._warn_baseline[i] = count
         return ", ".join(names) if names else None
 
-    def set_qpos(self, qpos: Sequence[float]) -> None:
+    @staticmethod
+    def _actuator_names(model: mujoco.MjModel) -> list:
+        """Every actuator name on *model*, in id order. Mirrors
+        ``locks.build_joint_qpos_map``'s own id2name fallback: an unnamed actuator gets a
+        placeholder rather than ``None``, so it can still occupy a slot in the map below
+        without ever matching a real name (and therefore never gets written to)."""
+        return [
+            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or f"actuator{i}"
+            for i in range(model.nu)
+        ]
+
+    def _build_ctrl_map(self) -> np.ndarray:
+        """``{index into a primary-ordered replay ctrl vector -> index into data.ctrl on the
+        CURRENTLY ACTIVE model}``, built by matching actuator NAMES -- never by position.
+
+        The reference-ghost pair doubles the actuator count (``nu`` 272 -> 544 on the real
+        models), so a 272-wide replay ctrl vector cannot be written into a 544-wide
+        ``data.ctrl`` positionally: assuming the policy's actuators occupy a fixed prefix of
+        the doubled model is exactly the attachment-order assumption that produced a real
+        data-corruption bug on this branch (a prefix heuristic silently mis-assigning ghost
+        counterparts). ``locks.pair_with_suffix`` already solves the equivalent problem for
+        joint names for the same reason; this does it for actuator ids.
+
+        A primary name with no match on the active model (there is never one when the active
+        model IS primary) maps to ``-1`` and is simply never written -- see :meth:`set_qpos`.
+        The reference half of a doubled model is a kinematic overlay, not driven by anything,
+        so its own actuators likewise never appear as a TARGET of this map and are left at
+        whatever :meth:`set_qpos` zeroed them to.
+        """
+        active_id_of = {name: i for i, name in enumerate(self._actuator_names(self.model))}
+        return np.array(
+            [active_id_of.get(name, -1) for name in self._primary_actuator_names],
+            dtype=np.int64,
+        )
+
+    def set_qpos(self, qpos: Sequence[float], ctrl: Optional[Sequence[float]] = None) -> None:
         """Write state directly, no stepping. Used by replay scrubbing.
 
         Rejects non-finite input outright, before writing or snapshotting anything: a NaN/Inf
@@ -396,10 +455,33 @@ class Session:
         straight into :meth:`_snapshot`, permanently poisoning the rollback target that every
         later :meth:`step` restores to -- turning one bad frame into a session that raises
         :class:`Diverged` forever until :meth:`reset`.
+
+        ``ctrl``, when given, is written into ``data.ctrl`` BEFORE ``mj_forward`` runs below --
+        forward is what turns ``ctrl`` into actuator force and the constraint solve, so writing
+        it after would have no effect on this frame. It is scattered onto ``data.ctrl`` through
+        :attr:`_ctrl_map` (see :meth:`_build_ctrl_map`), i.e. by actuator NAME against whichever
+        model is currently active, not by position -- so this is safe to call unchanged whether
+        or not a reference-ghost overlay is active. ``data.ctrl`` is zeroed first: the
+        reference half of a doubled model is a kinematic overlay that is never driven, so its
+        actuators are deliberately left at zero rather than carrying over whatever they held
+        before.
+
+        Omitting ``ctrl`` (the default) leaves ``data.ctrl`` completely untouched, so every
+        existing caller that only ever wrote qpos keeps behaving exactly as before.
         """
         arr = np.asarray(qpos, dtype=np.float64)
         if not np.isfinite(arr).all():
             raise ValueError("set_qpos: qpos contains non-finite values (NaN/Inf)")
+        if ctrl is not None:
+            ctrl_arr = np.asarray(ctrl, dtype=np.float64)
+            if ctrl_arr.shape != (len(self._ctrl_map),):
+                raise CtrlWidthMismatch(
+                    f"set_qpos: ctrl has shape {ctrl_arr.shape}, expected "
+                    f"({len(self._ctrl_map)},) to match this session's replay ctrl map"
+                )
+            self.data.ctrl[:] = 0.0
+            valid = self._ctrl_map >= 0
+            self.data.ctrl[self._ctrl_map[valid]] = ctrl_arr[valid]
         self.data.qpos[:] = arr
         mujoco.mj_forward(self.model, self.data)
         self._snapshot()
@@ -631,6 +713,13 @@ class Session:
         self._renderer = new_renderer
         old_renderer.close()
         self._active_model = which
+        # `_ctrl_map` is built by matching actuator NAMES against `self.model`, which just
+        # changed -- a stale map would go on pointing at the OLD model's actuator ids, silently
+        # writing a replay ctrl vector to the wrong slots on the new one (wrong at best, an
+        # index error if the new model has fewer actuators). Structurally the same trap
+        # `_carry_vis_state_across_swap`'s own docstring calls out for `forces`, and the one
+        # `loop.py` guards against for its joint map on this same swap.
+        self._ctrl_map = self._build_ctrl_map()
 
     def load_settings(self, name: str) -> None:
         """Load a bundled OR user settings preset by name.

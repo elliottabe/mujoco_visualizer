@@ -11,7 +11,7 @@ import pytest
 
 from mujoco_visualizer.serve.loop import SimLoop
 from mujoco_visualizer.serve.replay import ArrayTrajectorySource
-from mujoco_visualizer.serve.session import Diverged
+from mujoco_visualizer.serve.session import CtrlWidthMismatch, Diverged
 
 # A tiny real model for the lock tests: three independent hinge DOFs (nq == 3, matching
 # make_source()'s default), so build_joint_qpos_map is exercised for real instead of a faked
@@ -106,6 +106,7 @@ class FakeSession:
         self._diverge_after = diverge_after
         self._time = 0.0
         self.qpos_writes = []
+        self.ctrl_writes = []
         self.model_swaps = []
         self.pose = None
         # For build_joint_qpos_map to exercise a real model. See _LOCK_MODEL/_LOCK_ALT_MODEL
@@ -166,7 +167,7 @@ class FakeSession:
         return f"/fake/user/settings/{name}.json"
 
     # -- added for replay mode --
-    def set_qpos(self, qpos):
+    def set_qpos(self, qpos, ctrl=None):
         self.qpos_writes.append(np.asarray(qpos).copy())
         # `pose` models WHAT IS ON SCREEN, as opposed to `qpos_writes`, which is a history.
         # The real Session.reset() snaps qpos to a keyframe, so a reset that does not
@@ -174,6 +175,10 @@ class FakeSession:
         # reporting the old frame -- see
         # test_a_reset_in_replay_mode_re_renders_the_frame_it_reports.
         self.pose = np.asarray(qpos).copy()
+        # `ctrl` defaults to None so every pre-existing 1-arg call (every test above this
+        # point) is untouched; recorded (not just the latest) so a test can tell "never
+        # passed" apart from "passed None on this particular tick".
+        self.ctrl_writes.append(None if ctrl is None else np.asarray(ctrl).copy())
 
     def swap_model(self, which):
         self.model_swaps.append(which)
@@ -788,6 +793,92 @@ def test_out_of_range_clip_reports_a_command_error_without_pausing():
         assert err is not None and err["kind"] == "command"
         assert err["paused"] is False
         assert loop.playing is True, "a bad command must not stop playback for everyone"
+
+
+# -- ctrl channel --------------------------------------------------------------
+
+
+def make_ctrl(n_clips=2, n_frames=10, nu=2):
+    """Distinct value per (clip, frame, actuator), offset from make_source's qpos range so a
+    mix-up between the two channels would be visible, not plausible."""
+    return 1000.0 + np.arange(n_clips * n_frames * nu, dtype=np.float32).reshape(
+        n_clips, n_frames, nu
+    )
+
+
+def test_ctrl_is_fetched_and_written_when_the_source_offers_it():
+    """has_ctrl True is what makes SimLoop fetch and pass ctrl through _write_replay_qpos --
+    the one existing write path -- to Session.set_qpos, alongside qpos."""
+    ctrl_arr = make_ctrl()
+    source = ArrayTrajectorySource(
+        np.arange(2 * 10 * 3, dtype=np.float32).reshape(2, 10, 3), ctrl=ctrl_arr
+    )
+    with running_replay_loop(source=source) as (session, loop):
+        loop.submit({"t": "replay", "frame": 4})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 4)
+        assert session.ctrl_writes, "set_qpos must have been called at least once"
+        last_ctrl = session.ctrl_writes[-1]
+        assert last_ctrl is not None, "the source offers ctrl; it must not be dropped as None"
+        np.testing.assert_array_equal(last_ctrl, ctrl_arr[0, 4])
+
+
+def test_ctrl_is_none_when_the_source_has_no_ctrl_channel():
+    """make_source() returns a plain ArrayTrajectorySource with has_ctrl False -- the explicit
+    query SimLoop must check BEFORE calling .ctrl(), never by calling it and catching whatever
+    a ctrl-less source raises."""
+    with running_replay_loop() as (session, loop):
+        assert loop._source.has_ctrl is False
+        loop.submit({"t": "replay", "frame": 4})
+        assert wait_until(lambda: loop.replay_state()["frame"] == 4)
+        assert session.ctrl_writes, "set_qpos must have been called at least once"
+        assert all(c is None for c in session.ctrl_writes)
+
+
+class WidthMismatchFakeSession(FakeSession):
+    """set_qpos raises CtrlWidthMismatch whenever it is handed a ctrl vector that is not
+    exactly `expected_width` long -- standing in for a real Session whose _ctrl_map disagrees
+    with what the source is serving (e.g. the source has not caught up to a ghost swap yet).
+    Proves the guard in _write_replay_qpos is what turns that into a non-pausing 'command'
+    error rather than letting the exception escape and get the 'replay'/paused treatment
+    _advance_replay's/_step_replay's own try/except gives anything else."""
+
+    expected_width = 3
+
+    def set_qpos(self, qpos, ctrl=None):
+        if ctrl is not None and len(ctrl) != self.expected_width:
+            raise CtrlWidthMismatch(
+                f"ctrl has {len(ctrl)} entries, expected {self.expected_width}"
+            )
+        super().set_qpos(qpos, ctrl)
+
+
+def test_ctrl_width_mismatch_reports_a_command_error_without_pausing():
+    # nu=5 on the source; WidthMismatchFakeSession expects 3 -- a real-shaped disagreement.
+    source = ArrayTrajectorySource(
+        np.arange(2 * 10 * 3, dtype=np.float32).reshape(2, 10, 3), ctrl=make_ctrl(nu=5)
+    )
+    session = WidthMismatchFakeSession()
+    loop = SimLoop(session, source=source, fps_cap=1000.0, idle_pause_s=None)
+    thread = threading.Thread(target=loop.run, daemon=True)
+    thread.start()
+    try:
+        loop.submit({"t": "replay", "play": True})
+        # Wait for BOTH facts at once, not one then the other: the loop's initial
+        # `_replay_dirty` write (queued before "play" is even drained -- see __init__) already
+        # hits the same mismatch and sets `error` while `playing` is still False, so polling
+        # for `error is not None` alone can catch that transient instant and read `playing` a
+        # moment later as if the mismatch had stopped it -- a race in the test, not a real
+        # inconsistency (once `play` lands, `playing` never flips back off on this path).
+        assert wait_until(lambda: loop.playing and loop.error is not None)
+        assert loop.error["kind"] == "command"
+        assert loop.error["paused"] is False
+        assert loop.playing is True, "a bad ctrl width must not stop playback"
+        # The pose itself must still have been written (via the fallback retry with no ctrl) --
+        # a width problem with the ctrl channel is not a reason to freeze the picture.
+        assert len(session.qpos_writes) > 0
+    finally:
+        loop.stop()
+        thread.join(timeout=2.0)
 
 
 def test_ghost_toggle_swaps_the_model():

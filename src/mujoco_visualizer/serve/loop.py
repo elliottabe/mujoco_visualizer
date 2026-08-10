@@ -24,7 +24,7 @@ from mujoco_visualizer.serve.locks import (
     resolve_lock_values,
 )
 from mujoco_visualizer.serve.protocol import coalesce
-from mujoco_visualizer.serve.session import Diverged
+from mujoco_visualizer.serve.session import CtrlWidthMismatch, Diverged
 
 
 class SimLoop(threading.Thread):
@@ -635,11 +635,37 @@ class SimLoop(threading.Thread):
         ordering each of those two methods owns is untouched; only where the write itself lands
         moved, into here. ``apply_locks`` always returns a copy, so the source's frozen array is
         never touched, locked or not.
+
+        ``ctrl`` is fetched only when the source explicitly advertises one via ``has_ctrl`` --
+        never by calling ``.ctrl()`` and catching whatever a ctrl-less source raises, which
+        could not be told apart from a genuine bug in a source that DOES claim to have ctrl.
+        ``getattr(..., "has_ctrl", False)`` mirrors the existing ``hasattr(self._source,
+        "ghost")`` duck-typing above: a source with neither attribute (e.g. the plain
+        ``ArrayTrajectorySource`` most tests use) is untouched and this stays exactly what it
+        was before this channel existed.
+
+        A ``CtrlWidthMismatch`` from ``Session.set_qpos`` -- the source's ctrl and the active
+        model's actuator map disagree, e.g. right after a ghost swap the source has not caught
+        up to yet -- is a data-shape problem with the ctrl channel, not evidence the pose itself
+        is untrustworthy, so it is caught HERE and reported as a non-pausing ``kind='command'``
+        error, then retried with no ctrl so the pose still updates and playback is not stuck.
+        Anything escaping this method instead gets ``_advance_replay``'s/``_step_replay``'s own
+        ``kind='replay'``, paused treatment -- the wrong one for a bad ctrl width, exactly the
+        misclassification ``_apply_lock``'s docstring already describes for a bad lock width.
         """
         raw = self._source.qpos(self._clip, frame)
         qpos = apply_locks(raw, self._locks, self._jmap())
         self._last_written_qpos = qpos
-        self._session.set_qpos(qpos)
+        ctrl = (
+            self._source.ctrl(self._clip, frame)
+            if getattr(self._source, "has_ctrl", False)
+            else None
+        )
+        try:
+            self._session.set_qpos(qpos, ctrl)
+        except CtrlWidthMismatch as exc:
+            self._error = {"t": "error", "kind": "command", "msg": str(exc), "paused": False}
+            self._session.set_qpos(qpos)
 
     def _advance_replay(self) -> None:
         """Write the current frame, then move the playhead one stride if playing.
