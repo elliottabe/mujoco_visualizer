@@ -216,10 +216,11 @@ def test_apply_tendon_activation_is_idempotent_no_snapshot_needed_between_calls(
 # -- vis_state['tendons'] must read model.tendon_width, never hardcode -------------------------
 
 
-def test_vis_state_tendons_group_exists_with_all_six_fields(viz):
+def test_vis_state_tendons_group_exists_with_all_seven_fields(viz):
     tendons = viz.vis_state["tendons"]
     assert set(tendons) == {
         "enabled", "max_width", "min_width", "min_alpha", "baseline", "ctrl_full_scale",
+        "color_by",
     }
 
 

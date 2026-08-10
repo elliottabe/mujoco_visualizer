@@ -307,6 +307,15 @@ def apply_tendon_activation(
     result drives BOTH the tendon's alpha (floored at ``tendon_alpha_min``) and its width
     (interpolated between ``tendon_min_width`` and ``tendon_width``).
 
+    ``base_rgba`` supplies RGB only -- colour says which muscle, alpha and width say how hard.
+    Its own alpha channel is ignored and OVERWRITTEN by the activation-derived value above, not
+    multiplied into it: the rendered alpha is always exactly ``max(norm, tendon_alpha_min)``,
+    regardless of what a colour function returned. This is why a colour function passed to
+    :func:`build_actuator_tendon_map` may return either a hex string (which has no alpha at
+    all) or an RGBA 4-tuple interchangeably -- a 4-tuple's alpha component is accepted but never
+    has any effect on what gets drawn, so a palette cannot silently scale activation brightness
+    by choosing a dim or bright alpha.
+
     ``ctrl_max`` is a single caller-supplied scalar, not computed here: this function has no
     lookahead across frames (see :meth:`Visualizer.render_video_pan`, which computes it once
     from the whole ``ctrls`` clip, and the live-serving path in ``serve/session.py``, which
@@ -329,7 +338,9 @@ def apply_tendon_activation(
         raw = float(np.clip(abs(ctrl[act_id]) / denom, 0.0, 1.0))
         norm = tendon_baseline + (1.0 - tendon_baseline) * raw
         alpha = max(norm, tendon_alpha_min)
-        model.tendon_rgba[ten_id] = base_rgba[act_id] * np.array([1, 1, 1, alpha])
+        rgba = base_rgba[act_id].copy()
+        rgba[3] = alpha
+        model.tendon_rgba[ten_id] = rgba
         model.tendon_width[ten_id] = tendon_min_width + width_range * norm
 
 

@@ -578,16 +578,6 @@ class Session:
         self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
             self.model, scheme.get("color")
         )
-        # build_actuator_tendon_map accepts a raw RGBA 4-tuple from a colour function and
-        # stores its alpha channel verbatim (it already forces alpha=1.0 for a hex string, via
-        # _hex_to_rgb(...) + [1.0], but a 4-tuple return has no such normalisation). Forced to
-        # 1.0 here, not in that shared function, because apply_tendon_activation always
-        # multiplies base_rgba's alpha by its own activation-derived alpha
-        # (`base_rgba[act] * [1, 1, 1, alpha]`) -- a scheme's own alpha would otherwise silently
-        # scale activation brightness, which is the one thing colour must not do. Left to
-        # build_actuator_tendon_map itself, this would also change the video-export path
-        # (render_video_pan), which this task does not touch.
-        self._tendon_base_rgba[:, 3] = 1.0
         self._tendon_color_scheme = scheme_name
 
     def _apply_tendon_activation_vis(self) -> None:
