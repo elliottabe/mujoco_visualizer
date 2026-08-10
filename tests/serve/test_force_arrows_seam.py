@@ -131,25 +131,52 @@ def test_scene_modifiers_defaults_to_an_empty_list(sess):
 
 
 @pytest.mark.gl
-def test_export_path_does_not_forward_scene_modifiers():
-    """Finding, not a bug in this seam: ``ExportJob`` (serve/export.py) builds its OWN
-    ``Visualizer`` from a ``vis_state`` snapshot on its OWN thread and never touches a
-    ``Session`` at all, and its ``_iter_rendered`` calls ``render_with`` with no
-    ``modify_scene_fns`` argument -- there is no parameter on ``ExportJob.__init__`` to carry
-    one even if a caller wanted to. This test pins that gap directly against the real
-    ``ExportJob`` class rather than asserting it only in prose."""
-    import inspect
+def test_export_now_forwards_scene_modifiers_and_they_reach_the_rendered_pixels(tmp_path):
+    """Task 15c closed the gap the previous version of this test pinned (see git history for
+    ``test_export_path_does_not_forward_scene_modifiers``): ``ExportJob`` now accepts
+    ``modify_scene_fns`` and forwards it to ``Visualizer.render_with``, exactly like
+    ``Session.render`` already does for ``Session.scene_modifiers`` on the live path.
+
+    Asserting the signature merely gained the parameter would prove registration, not that the
+    callable ever reached a rendered frame -- so this renders the SAME model/qpos twice, once
+    with a modifier that draws a large arrow into the scene and once without, and asserts the
+    two PNG outputs differ in actual pixels. That is the only way to tell "the callable is
+    stored" apart from "the callable is invoked and its geometry rasterised"."""
+    import mujoco
+    import numpy as np
 
     from mujoco_visualizer.serve.export import ExportJob
+    from mujoco_visualizer.visualizer import add_arrow_to_scene
 
-    sig = inspect.signature(ExportJob.__init__)
-    assert "modify_scene_fns" not in sig.parameters
+    model = mujoco.MjModel.from_xml_string(_XML)
+    qpos = model.qpos0.copy().reshape(1, -1)
 
-    source = inspect.getsource(ExportJob._iter_rendered)
-    assert "modify_scene_fns" not in source, (
-        "ExportJob._iter_rendered now forwards modify_scene_fns -- if this is intentional, "
-        "the finding in this seam's report is stale and should be updated, not this test "
-        "silently deleted"
+    def modifier(scene, data=None, frame_idx=0):
+        add_arrow_to_scene(scene, [0.0, 0.0, 0.4], [0.0, 0.0, 1.0], radius=0.08)
+
+    plain_dir = tmp_path / "plain"
+    plain = ExportJob(
+        model, None, {}, qpos, path=plain_dir, fmt="png", width=64, height=48, fps=10,
+    )
+    plain.start()
+    plain.join(timeout=120)
+    assert plain.progress()["state"] == "done", plain.progress()
+
+    modded_dir = tmp_path / "modded"
+    modded = ExportJob(
+        model, None, {}, qpos, path=modded_dir, fmt="png", width=64, height=48, fps=10,
+        modify_scene_fns=[modifier],
+    )
+    modded.start()
+    modded.join(timeout=120)
+    assert modded.progress()["state"] == "done", modded.progress()
+
+    import imageio.v2 as imageio
+
+    plain_frame = imageio.imread(plain_dir / "frame_00000.png")
+    modded_frame = imageio.imread(modded_dir / "frame_00000.png")
+    assert not np.array_equal(plain_frame, modded_frame), (
+        "ExportJob accepted modify_scene_fns but the callable never reached the rendered pixels"
     )
 
 

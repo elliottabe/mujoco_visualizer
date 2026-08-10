@@ -535,6 +535,42 @@ def test_ctrl_maps_by_actuator_name_on_the_primary_model(ctrl_map_session):
     assert _vis_ctrl_by_name(s.model, s, "m_c") == pytest.approx(3.0)
 
 
+def test_build_ctrl_map_delegates_to_the_extracted_module_level_function(
+    ctrl_map_session, monkeypatch,
+):
+    """Task 15c extracted ``Session._build_ctrl_map``'s body into the module-level
+    ``mujoco_visualizer.visualizer.build_ctrl_name_map`` so ``ExportJob`` (which has no
+    ``Session`` to call into) can reuse the exact same matching rule -- see that function's
+    own tests for the by-name-not-position guarantee itself. This test is the guard that
+    ``Session`` actually DELEGATES to it rather than keeping a second, independent
+    implementation that merely happens to compute the same thing: it replaces the imported
+    name with a spy that returns an all -1 map, and asserts (a) the spy was actually called
+    with this session's own primary names and active model, and (b) the resulting
+    ``_ctrl_map`` is the spy's -- obviously wrong -- return value, not a correct one computed
+    by some other code path."""
+    import mujoco_visualizer.serve.session as session_mod
+
+    s = ctrl_map_session
+    calls = []
+
+    def fake_build_ctrl_name_map(primary_names, active_model):
+        calls.append((list(primary_names), active_model))
+        return np.full(len(primary_names), -1, dtype=np.int64)
+
+    monkeypatch.setattr(session_mod, "build_ctrl_name_map", fake_build_ctrl_name_map)
+
+    result = s._build_ctrl_map()
+
+    assert calls == [(s._primary_actuator_names, s.model)], (
+        "Session._build_ctrl_map did not call the extracted build_ctrl_name_map -- it is "
+        "keeping a separate implementation instead of delegating"
+    )
+    assert list(result) == [-1, -1, -1], (
+        "Session._build_ctrl_map returned something other than the extracted function's own "
+        "result -- it is not actually delegating"
+    )
+
+
 def test_ctrl_maps_by_name_not_position_on_the_scrambled_doubled_model(ctrl_map_session):
     """The width problem, for real: nu doubles (3 -> 6) AND the surviving names are declared
     in a different order on the alt model. A ctrl vector ordered by the PRIMARY model's own

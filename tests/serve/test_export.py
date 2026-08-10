@@ -6,13 +6,34 @@ dimensions crash libx264 with OSError: Broken pipe. A viewer whose purpose is pu
 figures must not quietly change the resolution it was asked for.
 """
 
+import copy
 import json
 import subprocess
 
+import mujoco
 import numpy as np
 import pytest
 
 from mujoco_visualizer.serve.export import ExportJob, even_dims, mp4_writer_kwargs
+
+
+def _vis_state_with_tendons(model, tendons):
+    """A REALISTIC full ``vis_state`` snapshot (as ``Session.vis_state_snapshot`` would hand
+    to a real ``ExportJob``) with ``tendons`` overridden -- never a bare ``{"tendons": ...}``
+    dict. ``ExportJob._make_visualizer`` replaces ``viz.vis_state`` WHOLESALE with whatever
+    snapshot it is given (``viz.vis_state = copy.deepcopy(self._vis_state)``), so a partial
+    dict here would silently wipe every other required key (``alpha``, ``floor``, ...) that
+    ``Visualizer.render_with`` reads unconditionally -- this constructs a real ``Visualizer``
+    (no GL context; that is only created by ``make_renderer``) purely to get its own
+    fully-populated defaults, then overrides just the one group under test."""
+    from mujoco_visualizer.visualizer import Visualizer
+
+    viz = Visualizer(model=model)
+    vis_state = copy.deepcopy(viz.vis_state)
+    viz.close()
+    vis_state["tendons"].update(tendons)
+    return vis_state
+
 
 _MODEL_XML = """
 <mujoco><worldbody>
@@ -20,6 +41,116 @@ _MODEL_XML = """
   <body name="b1"><joint name="j1" type="hinge" axis="0 0 1"/>
     <geom type="box" size=".1 .1 .1" rgba=".8 .3 .2 1"/></body>
 </worldbody></mujoco>
+"""
+
+# Two hinge-jointed, motor-actuated bodies -- used by every ctrl_frames test below, since
+# _MODEL_XML above has no actuators at all (nu == 0), which cannot exercise a width mismatch.
+_ACTUATED_MODEL_XML = """
+<mujoco><worldbody>
+  <light pos="0 0 2"/>
+  <body name="b1"><joint name="j1" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1" rgba=".8 .3 .2 1"/></body>
+  <body name="b2"><joint name="j2" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".1 .1 .1" rgba=".2 .3 .8 1"/></body>
+</worldbody>
+<actuator>
+  <motor name="m1" joint="j1"/>
+  <motor name="m2" joint="j2"/>
+</actuator>
+</mujoco>
+"""
+
+# A single spatial tendon driven by one motor -- used by the tendon-activation pixel tests.
+# rgba alpha=1 and a real (if small) width in the MJCF itself, deliberately, so "tendon
+# activation was never applied" (ctrl_frames=None) still renders a REAL, visible tendon at
+# its own default appearance -- the two pixel-diff tests below are about activation CHANGING
+# that appearance, not about a tendon being invisible without this feature.
+_TENDON_MODEL_XML = """
+<mujoco>
+  <worldbody>
+    <light pos="0 0 2"/>
+    <geom name="floor" type="plane" size="1 1 0.1"/>
+    <site name="anchor_a" pos="-0.3 0 0.4" size="0.01"/>
+    <body name="box_a" pos="-0.3 0 0.6">
+      <joint name="slide_a" type="slide" axis="0 0 1"/>
+      <geom name="box_a_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_a" pos="0 0 0" size="0.01"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="t_a" width="0.003" rgba="1 0 0 1">
+      <site site="anchor_a"/><site site="tip_a"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="m_a" tendon="t_a" ctrlrange="-1 1"/>
+  </actuator>
+</mujoco>
+"""
+
+# Named exactly like tests/serve/test_session.py's own _CTRL_PRIMARY_XML/_CTRL_ALT_XML pair
+# (same names, same deliberately scrambled order, same "_ref" un-driven half standing in for
+# a reference-ghost overlay's kinematic actuators) -- so the ExportJob-side wiring test below
+# exercises the identical "nu doubles, order scrambles" shape that motivated
+# build_ctrl_name_map, rather than a fixture whose primary actuators happen to occupy the
+# model's first nu slots (which a positional slice would pass by accident).
+_CTRL_PRIMARY_NAMES = ["m_a", "m_b", "m_c"]
+
+_CTRL_DOUBLED_ALT_XML = """
+<mujoco><worldbody>
+  <body name="bc"><joint name="jc" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="ba_ref"><joint name="ja_ref" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bb"><joint name="jb" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="ba"><joint name="ja" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bc_ref"><joint name="jc_ref" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+  <body name="bb_ref"><joint name="jb_ref" type="hinge" axis="0 0 1"/>
+    <geom type="box" size=".05 .05 .05"/></body>
+</worldbody>
+<actuator>
+  <motor name="m_c" joint="jc"/>
+  <motor name="m_a_ref" joint="ja_ref"/>
+  <motor name="m_b" joint="jb"/>
+  <motor name="m_a" joint="ja"/>
+  <motor name="m_c_ref" joint="jc_ref"/>
+  <motor name="m_b_ref" joint="jb_ref"/>
+</actuator>
+</mujoco>
+"""
+
+# Export-side twin of tests/serve/test_session.py's own
+# _CTRL_PRIMARY_WITH_UNMATCHED_XML/_CTRL_ALT_ONE_ACTUATOR_XML pair: "m_missing" is a PRIMARY
+# actuator name with no counterpart on this model at all. Ordered so the unmatched one is NOT
+# first (mirrors the Session fixture's own reasoning), and driving a real tendon so the guard
+# test below can observe the SCATTERED result (not just inspect the map), the same way the
+# tendon pixel tests above do.
+_CTRL_PRIMARY_NAMES_WITH_UNMATCHED = ["m_real", "m_missing"]
+
+_CTRL_MODEL_ONE_REAL_ACTUATOR_WITH_TENDON_XML = """
+<mujoco>
+  <worldbody>
+    <light pos="0 0 2"/>
+    <geom name="floor" type="plane" size="1 1 0.1"/>
+    <site name="anchor_r" pos="-0.2 0 0.4" size="0.01"/>
+    <body name="box_r" pos="-0.2 0 0.6">
+      <joint name="slide_r" type="slide" axis="0 0 1"/>
+      <geom name="box_r_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_r" pos="0 0 0" size="0.01"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="t_r" width="0.003" rgba="1 0 0 1">
+      <site site="anchor_r"/><site site="tip_r"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="m_real" tendon="t_r" ctrlrange="-1 1"/>
+  </actuator>
+</mujoco>
 """
 
 
@@ -279,3 +410,316 @@ def test_export_never_mutates_the_callers_model(tmp_path):
     assert job.progress()["state"] == "done"
     assert model.vis.global_.offwidth == orig_offwidth
     assert model.vis.global_.offheight == orig_offheight
+
+
+# --- task 15c: tendon activation + modify_scene_fns reach the export ----------------------
+
+
+@pytest.mark.gl
+def test_tendon_activation_reaches_exported_pixels(tmp_path):
+    """The test that matters most for this task: tendon activation must reach the actual
+    rendered frame, not merely mutate ``vis_state`` or be accepted as a constructor argument.
+    Renders the SAME qpos twice -- once with ``ctrl_frames`` and ``tendons.enabled=True`` at
+    a width/colour that cannot be confused with the MJCF's own declared tendon appearance,
+    once with no ``ctrl_frames`` at all (tendons therefore never touched, exactly the
+    pre-existing behaviour) -- and asserts the two PNG outputs differ in actual pixels."""
+    model = mujoco.MjModel.from_xml_string(_TENDON_MODEL_XML)
+    qpos = model.qpos0.copy().reshape(1, -1)
+
+    off_dir = tmp_path / "off"
+    off = ExportJob(
+        model, None, {}, qpos,
+        path=off_dir, fmt="png", width=128, height=96, fps=10,
+    )
+    off.start()
+    off.join(timeout=120)
+    assert off.progress()["state"] == "done", off.progress()
+
+    on_dir = tmp_path / "on"
+    on = ExportJob(
+        model, None,
+        _vis_state_with_tendons(model, {
+            "enabled": True, "max_width": 0.05, "min_width": 0.001,
+            "min_alpha": 0.05, "baseline": 0.0, "ctrl_full_scale": 1.0,
+        }),
+        qpos,
+        path=on_dir, fmt="png", width=128, height=96, fps=10,
+        ctrl_frames=np.array([[1.0]]),
+        primary_actuator_names=["m_a"],
+    )
+    on.start()
+    on.join(timeout=120)
+    assert on.progress()["state"] == "done", on.progress()
+
+    import imageio.v2 as imageio
+
+    off_frame = imageio.imread(off_dir / "frame_00000.png")
+    on_frame = imageio.imread(on_dir / "frame_00000.png")
+    assert not np.array_equal(off_frame, on_frame), (
+        "ExportJob accepted ctrl_frames/tendons but tendon activation never reached the "
+        "rendered pixels"
+    )
+
+
+@pytest.mark.gl
+def test_export_never_mutates_the_callers_model_tendon_state(tmp_path):
+    """Tendon-activation visualisation writes ``model.tendon_rgba``/``tendon_width`` in
+    place -- exactly the kind of mutation the existing offwidth/offheight no-mutation
+    guarantee (see ``test_export_never_mutates_the_callers_model`` above) already protects.
+    This proves that guarantee extends to the new mutation: it must land only on ``ExportJob``'s
+    own deep copy, never on the ``model`` object the caller passed in."""
+    model = mujoco.MjModel.from_xml_string(_TENDON_MODEL_XML)
+    orig_rgba = model.tendon_rgba.copy()
+    orig_width = model.tendon_width.copy()
+
+    qpos = model.qpos0.copy().reshape(1, -1)
+    job = ExportJob(
+        model, None,
+        _vis_state_with_tendons(model, {
+            "enabled": True, "max_width": 0.05, "min_width": 0.001,
+            "min_alpha": 0.05, "baseline": 0.0, "ctrl_full_scale": 1.0,
+        }),
+        qpos,
+        path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+        ctrl_frames=np.array([[1.0]]),
+        primary_actuator_names=["m_a"],
+    )
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done"
+
+    assert np.array_equal(model.tendon_rgba, orig_rgba)
+    assert np.array_equal(model.tendon_width, orig_width)
+
+
+@pytest.mark.gl
+def test_export_forwards_modify_scene_fns_and_they_reach_the_rendered_pixels(tmp_path):
+    """Companion to the tendon test above, for the second overlay this task wires up: a
+    ``modify_scene_fns`` callable that draws an extra geom must actually reach the frame the
+    renderer produces, not merely be accepted and stored. See also
+    ``tests/serve/test_force_arrows_seam.py::
+    test_export_now_forwards_scene_modifiers_and_they_reach_the_rendered_pixels`` for the
+    seam-level counterpart of this same guarantee."""
+    import mujoco
+
+    from mujoco_visualizer.visualizer import add_arrow_to_scene
+
+    model = mujoco.MjModel.from_xml_string(_MODEL_XML)
+    qpos = model.qpos0.copy().reshape(1, -1)
+
+    def modifier(scene, data=None, frame_idx=0):
+        add_arrow_to_scene(scene, [0.0, 0.0, 0.0], [0.0, 0.0, 0.5], radius=0.05)
+
+    plain_dir = tmp_path / "plain"
+    plain = ExportJob(
+        model, None, {}, qpos, path=plain_dir, fmt="png", width=128, height=96, fps=10,
+    )
+    plain.start()
+    plain.join(timeout=120)
+    assert plain.progress()["state"] == "done", plain.progress()
+
+    modded_dir = tmp_path / "modded"
+    modded = ExportJob(
+        model, None, {}, qpos, path=modded_dir, fmt="png", width=128, height=96, fps=10,
+        modify_scene_fns=[modifier],
+    )
+    modded.start()
+    modded.join(timeout=120)
+    assert modded.progress()["state"] == "done", modded.progress()
+
+    import imageio.v2 as imageio
+
+    plain_frame = imageio.imread(plain_dir / "frame_00000.png")
+    modded_frame = imageio.imread(modded_dir / "frame_00000.png")
+    assert not np.array_equal(plain_frame, modded_frame), (
+        "ExportJob accepted modify_scene_fns but the callable never reached the rendered "
+        "pixels"
+    )
+
+
+# --- mismatched ctrl_frames lengths fail loudly at construction ---------------------------
+
+
+def test_ctrl_frames_row_count_mismatch_raises_at_construction(tmp_path):
+    """ExportJob's chosen contract: a shape mismatch is a construction-time ValueError, never
+    a partially-rendered file the caller has to notice and clean up."""
+    model = mujoco.MjModel.from_xml_string(_ACTUATED_MODEL_XML)  # nq == 2
+    qpos = np.linspace(0, 1, 6 * model.nq, dtype=np.float64).reshape(6, model.nq)
+    with pytest.raises(ValueError, match="ctrl_frames has 5 rows but qpos_frames has 6"):
+        ExportJob(
+            model, None, {}, qpos,
+            path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+            ctrl_frames=np.zeros((5, model.nu)),
+        )
+
+
+def test_ctrl_frames_row_width_mismatch_raises_at_construction(tmp_path):
+    model = mujoco.MjModel.from_xml_string(_ACTUATED_MODEL_XML)  # nu == 2
+    qpos = np.linspace(0, 1, 4 * model.nq, dtype=np.float64).reshape(4, model.nq)
+    with pytest.raises(ValueError, match="ctrl_frames rows have width 3, expected 2"):
+        ExportJob(
+            model, None, {}, qpos,
+            path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+            ctrl_frames=np.zeros((4, 3)),
+            primary_actuator_names=["m1", "m2"],
+        )
+
+
+def test_ctrl_frames_must_be_two_dimensional(tmp_path):
+    model = mujoco.MjModel.from_xml_string(_ACTUATED_MODEL_XML)
+    qpos = np.linspace(0, 1, 4 * model.nq, dtype=np.float64).reshape(4, model.nq)
+    with pytest.raises(ValueError, match="ctrl_frames must be 2D"):
+        ExportJob(
+            model, None, {}, qpos,
+            path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+            ctrl_frames=np.zeros(4),
+        )
+
+
+def test_ctrl_frames_without_primary_actuator_names_raises_at_construction(tmp_path):
+    """Fix round 1: there is no safe default for ``primary_actuator_names`` -- a model whose
+    ``nu`` happens to match the primary's but whose actuator order genuinely differs (e.g.
+    ``ctrl_frames`` recorded against a different model version with the same actuator count
+    but reordered names) cannot be detected from shape alone, so it must be supplied
+    explicitly whenever ``ctrl_frames`` is."""
+    model = mujoco.MjModel.from_xml_string(_ACTUATED_MODEL_XML)  # nu == 2
+    qpos = np.linspace(0, 1, 4 * model.nq, dtype=np.float64).reshape(4, model.nq)
+    with pytest.raises(ValueError, match="ctrl_frames requires primary_actuator_names"):
+        ExportJob(
+            model, None, {}, qpos,
+            path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+            ctrl_frames=np.zeros((4, 2)),
+        )
+
+
+# --- ctrl_frames are matched by NAME, never by position ------------------------------------
+
+
+def test_ctrl_frames_are_matched_by_name_not_position_on_a_doubled_export_model(tmp_path):
+    """The width problem for real, directly against ``ExportJob``: the model handed to it may
+    be the reference-ghost pair (``nu`` doubles, and the surviving names are declared in a
+    genuinely different order -- see ``_CTRL_DOUBLED_ALT_XML`` above). A ``ctrl_frames`` row
+    ordered by the PRIMARY model's own actuator order must land on the matching name wherever
+    that name's id actually sits on THIS job's model, never at a fixed positional prefix.
+    Deliberately inspects ``job._ctrl_map`` directly (no GL, no render needed) rather than
+    running the whole job -- the pixel-level proof that the map is actually USED lives in
+    ``test_tendon_activation_reaches_exported_pixels`` above; this is the proof that the map
+    ITSELF is right on a model shaped like the real doubled one."""
+    alt = mujoco.MjModel.from_xml_string(_CTRL_DOUBLED_ALT_XML)
+    qpos = np.zeros((1, alt.nq), dtype=np.float64)
+    job = ExportJob(
+        alt, None, {}, qpos,
+        path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+        ctrl_frames=np.array([[1.0, 2.0, 3.0]]),
+        primary_actuator_names=_CTRL_PRIMARY_NAMES,
+    )
+    alt_id_of = {
+        mujoco.mj_id2name(alt, mujoco.mjtObj.mjOBJ_ACTUATOR, i): i
+        for i in range(alt.nu)
+    }
+    assert list(job._ctrl_map) == [
+        alt_id_of["m_a"], alt_id_of["m_b"], alt_id_of["m_c"],
+    ]
+
+
+@pytest.mark.gl
+def test_ctrl_frames_skip_an_unmatched_primary_name_rather_than_misassigning(tmp_path):
+    """Export-side twin of ``tests/serve/test_session.py::
+    test_ctrl_map_skips_an_unmatched_primary_name_rather_than_wrapping_onto_the_last_actuator``
+    -- this task's whole premise is that ``Session`` and ``ExportJob`` apply the SAME matching
+    rule, so an unmatched primary name must be handled identically on both paths. ``m_missing``
+    has no actuator on this model at all, so ``_ctrl_map``'s entry for it must be -1 and must
+    be SKIPPED when scattering ``ctrl_frames`` into this model's own actuator order -- never
+    wrapped via numpy's negative-index behaviour onto ``m_real``'s slot, and never a shape
+    mismatch either (dropping the mask on the RHS of the scatter assignment, rather than only
+    the LHS, makes the LHS index array and the RHS values array different lengths whenever a
+    -1 is actually present -- which is exactly the "forgot the mask on one side" slip
+    ``build_ctrl_name_map``'s own docstring warns about). Runs a REAL job end to end and reads
+    back the job's own tendon width (not the stored map) so either kind of slip is caught:
+    a wrong value if regressed some other way, or an outright job failure for this specific
+    slip, which a bare ``_ctrl_map`` inspection could not distinguish from success."""
+    model = mujoco.MjModel.from_xml_string(_CTRL_MODEL_ONE_REAL_ACTUATOR_WITH_TENDON_XML)
+    assert model.nu == 1  # only "m_real" -- "m_missing" has no actuator on this model at all
+    qpos = model.qpos0.copy().reshape(1, -1)
+
+    job = ExportJob(
+        model, None,
+        _vis_state_with_tendons(model, {
+            "enabled": True, "max_width": 0.05, "min_width": 0.001,
+            "min_alpha": 0.05, "baseline": 0.0, "ctrl_full_scale": 1.0,
+        }),
+        qpos,
+        path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+        ctrl_frames=np.array([[1.0, 2.0]]),  # m_real=1.0, m_missing=2.0 (unmatched)
+        primary_actuator_names=_CTRL_PRIMARY_NAMES_WITH_UNMATCHED,
+    )
+    assert list(job._ctrl_map) == [0, -1]
+
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+
+    t_r = mujoco.mj_name2id(job._model, mujoco.mjtObj.mjOBJ_TENDON, "t_r")
+    assert job._model.tendon_width[t_r] == pytest.approx(0.05), (
+        "m_real's own ctrl_frames value (1.0, full scale) did not drive its tendon to "
+        "max_width -- either m_missing's unmatched value corrupted the scatter, or this "
+        "silently did not raise the way a dropped RHS mask would"
+    )
+
+
+# --- sidecar provenance: what overlays were actually applied --------------------------------
+
+
+@pytest.mark.gl
+def test_sidecar_records_tendon_activation_and_scene_modifier_provenance(tmp_path):
+    model = mujoco.MjModel.from_xml_string(_ACTUATED_MODEL_XML)
+    qpos = np.zeros((2, model.nq), dtype=np.float64)
+
+    def modifier(scene, data=None, frame_idx=0):
+        pass
+
+    job = ExportJob(
+        model, None,
+        _vis_state_with_tendons(model, {
+            "enabled": True, "max_width": 0.01, "min_width": 0.001,
+            "min_alpha": 0.05, "baseline": 0.0, "ctrl_full_scale": 1.0,
+        }),
+        qpos,
+        path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+        ctrl_frames=np.zeros((2, model.nu)),
+        primary_actuator_names=["m1", "m2"],
+        modify_scene_fns=[modifier, modifier],
+    )
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+
+    side = json.loads((tmp_path / "out.mp4.json").read_text())
+    assert side["ctrl_frames_provided"] is True
+    assert side["tendon_activation_applied"] is True
+    assert side["scene_modifiers_applied"] == 2
+
+
+@pytest.mark.gl
+def test_sidecar_tendon_activation_applied_is_false_when_tendons_disabled(tmp_path):
+    """``ctrl_frames`` being supplied is not the same claim as tendon activation having been
+    applied: the ``vis_state`` snapshot's own ``tendons.enabled`` (default False) governs
+    whether anything was actually drawn from it."""
+    model = mujoco.MjModel.from_xml_string(_ACTUATED_MODEL_XML)
+    qpos = np.zeros((2, model.nq), dtype=np.float64)
+
+    job = ExportJob(
+        model, None, {},  # tendons not mentioned -> disabled
+        qpos,
+        path=tmp_path / "out.mp4", width=64, height=48, fps=10,
+        ctrl_frames=np.zeros((2, model.nu)),
+        primary_actuator_names=["m1", "m2"],
+    )
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+
+    side = json.loads((tmp_path / "out.mp4.json").read_text())
+    assert side["ctrl_frames_provided"] is True
+    assert side["tendon_activation_applied"] is False
+    assert side["scene_modifiers_applied"] == 0
