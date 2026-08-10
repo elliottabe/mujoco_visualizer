@@ -233,6 +233,43 @@ def build_actuator_tendon_map(
     return act_to_ten, base_rgba
 
 
+def build_ctrl_name_map(
+    primary_names: Sequence[str],
+    active_model: mujoco.MjModel,
+) -> np.ndarray:
+    """``{index into a primary-ordered ctrl vector -> index into data.ctrl on *active_model*}``,
+    built by matching actuator NAMES -- never by position.
+
+    Extracted from ``Session._build_ctrl_map`` (serve/session.py) so a caller that has no
+    ``Session`` at all -- ``ExportJob`` (serve/export.py), which builds its own ``Visualizer``
+    on its own thread -- can reuse exactly the same matching rule rather than re-deriving (or
+    silently drifting from) it. ``Session._build_ctrl_map`` itself now calls this function; it
+    keeps no separate implementation.
+
+    The reference-ghost pair doubles the actuator count (``nu`` 272 -> 544 on the real
+    models), so a 272-wide replay/recorded ctrl vector cannot be written into a 544-wide
+    ``data.ctrl`` positionally: assuming the policy's actuators occupy a fixed prefix of the
+    doubled model is exactly the attachment-order assumption that produced a real
+    data-corruption bug on this branch (a prefix heuristic silently mis-assigning ghost
+    counterparts). ``locks.pair_with_suffix`` already solves the equivalent problem for joint
+    names for the same reason; this does it for actuator ids.
+
+    A primary name with no match on *active_model* (there is never one when the active model
+    IS the primary model) maps to ``-1`` -- callers must filter ``map >= 0`` before scattering,
+    never rely on numpy's negative-index wraparound to skip it (see
+    ``test_ctrl_map_skips_an_unmatched_primary_name_rather_than_wrapping_onto_the_last_actuator``).
+    """
+    active_names = [
+        mujoco.mj_id2name(active_model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or f"actuator{i}"
+        for i in range(active_model.nu)
+    ]
+    active_id_of = {name: i for i, name in enumerate(active_names)}
+    return np.array(
+        [active_id_of.get(name, -1) for name in primary_names],
+        dtype=np.int64,
+    )
+
+
 def apply_tendon_activation(
     model: mujoco.MjModel,
     ctrl: Sequence[float],

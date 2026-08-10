@@ -30,6 +30,7 @@ from mujoco_visualizer.visualizer import (
     _apply_forces_vis,
     apply_tendon_activation,
     build_actuator_tendon_map,
+    build_ctrl_name_map,
     default_tendon_ctrl_full_scale,
 )
 
@@ -470,6 +471,10 @@ class Session:
         """``{index into a primary-ordered replay ctrl vector -> index into data.ctrl on the
         CURRENTLY ACTIVE model}``, built by matching actuator NAMES -- never by position.
 
+        Delegates to the module-level :func:`~mujoco_visualizer.visualizer.build_ctrl_name_map`
+        (extracted so ``ExportJob``, which has no ``Session`` to call into, can build the exact
+        same map) -- this method keeps no separate implementation of its own.
+
         The reference-ghost pair doubles the actuator count (``nu`` 272 -> 544 on the real
         models), so a 272-wide replay ctrl vector cannot be written into a 544-wide
         ``data.ctrl`` positionally: assuming the policy's actuators occupy a fixed prefix of
@@ -484,11 +489,7 @@ class Session:
         so its own actuators likewise never appear as a TARGET of this map and are left at
         whatever :meth:`set_qpos` zeroed them to.
         """
-        active_id_of = {name: i for i, name in enumerate(self._actuator_names(self.model))}
-        return np.array(
-            [active_id_of.get(name, -1) for name in self._primary_actuator_names],
-            dtype=np.int64,
-        )
+        return build_ctrl_name_map(self._primary_actuator_names, self.model)
 
     def _rebuild_tendon_state(self) -> None:
         """(Re)compute everything :meth:`_apply_tendon_activation_vis` needs from the CURRENTLY

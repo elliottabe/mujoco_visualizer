@@ -33,12 +33,26 @@ import copy
 import json
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mujoco
 import numpy as np
 
 __all__ = ["even_dims", "mp4_writer_kwargs", "ExportJob"]
+
+
+def _actuator_names(model: mujoco.MjModel) -> List[str]:
+    """Every actuator name on *model*, in id order. Mirrors ``Session._actuator_names`` (serve/
+    session.py) -- duplicated rather than imported, because importing ``serve.session`` here
+    would pull in ``Session`` (and its ``simplejpeg``/backend/controls dependencies) for a
+    thread that, by design (see the module docstring), never touches a ``Session`` at all.
+    An unnamed actuator gets a placeholder rather than ``None``, so it can still occupy a slot
+    in :func:`~mujoco_visualizer.visualizer.build_ctrl_name_map`'s name lists without ever
+    matching a real name."""
+    return [
+        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i) or f"actuator{i}"
+        for i in range(model.nu)
+    ]
 
 
 def even_dims(width: int, height: int) -> Tuple[int, int, Optional[str]]:
@@ -109,13 +123,19 @@ class ExportJob(threading.Thread):
         crf: int = 20,
         frame_dt: float = 1e-3,
         meta: Optional[Dict] = None,
+        ctrl_frames: Optional[Sequence[np.ndarray]] = None,
+        primary_actuator_names: Optional[Sequence[str]] = None,
+        modify_scene_fns: Optional[Sequence[Callable]] = None,
     ):
         super().__init__(name="ExportJob", daemon=True)
         # Deep-copy rather than trust the caller: _make_visualizer mutates this model's
         # offscreen framebuffer size, and a bare reference to a live preview model would
         # let that mutation reach the thing this job exists to leave editable. Cheap next
         # to the render itself, and it makes the no-mutation guarantee true unconditionally
-        # rather than "true if every caller remembers to copy first".
+        # rather than "true if every caller remembers to copy first". Tendon-activation
+        # visualisation (see _apply_tendon_activation_frame below) mutates
+        # model.tendon_rgba/tendon_width, and this same deep copy is what confines that
+        # mutation to this job's own model rather than the caller's.
         self._model = copy.deepcopy(model)
         self._anatomy = anatomy
         self._vis_state = vis_state
@@ -127,10 +147,74 @@ class ExportJob(threading.Thread):
         self._fmt = fmt
         self._crf = int(crf)
         # Accepted but not yet consumed by any renderer here -- kept for forward
-        # compatibility with a later task's per-frame overlays (e.g. a timestamp drawn via
-        # modify_scene_fns), and recorded in the sidecar below since it's free provenance.
+        # compatibility with a later task's per-frame overlay that needs real elapsed time
+        # (e.g. a timestamp burned into the frame), and recorded in the sidecar below since
+        # it's free provenance.
         self._frame_dt = float(frame_dt)
         self._meta = dict(meta or {})
+
+        # Extra per-frame scene decoration (e.g. recorded force-sensor arrows), forwarded
+        # verbatim to Visualizer.render_with's existing modify_scene_fns -- see
+        # Session.scene_modifiers for the identical LIVE-path seam this mirrors. A plain list
+        # copy (or None), never the caller's own list object: this job runs on its own thread
+        # and must not observe the caller mutating its list mid-export any more than it may
+        # observe vis_state changing (see vis_state's own deepcopy in _make_visualizer).
+        self._modify_scene_fns = (
+            list(modify_scene_fns) if modify_scene_fns is not None else None
+        )
+
+        # ctrl_frames is VISUALISATION-ONLY, exactly like Session._vis_ctrl (see
+        # Session.set_qpos's docstring for why data.ctrl is never written from a recorded
+        # ctrl during replay): it drives _apply_tendon_activation_frame below and nothing
+        # else. It never reaches data.ctrl and is never read by mj_forward.
+        #
+        # Fail loudly at construction, not partway through a render: a job that discovers a
+        # shape mismatch on frame 400 of 1000 would have already written 400 frames of a file
+        # a caller then has to know to distrust or clean up. Two distinct checks, both against
+        # what the caller actually supplied wrong (row count vs qpos_frames; row width vs the
+        # primary actuator names), so the message names the real mismatch rather than a single
+        # generic "shape wrong".
+        if ctrl_frames is not None:
+            ctrl_arr = np.asarray(ctrl_frames, dtype=np.float64)
+            if ctrl_arr.ndim != 2:
+                raise ValueError(
+                    "ExportJob: ctrl_frames must be 2D (n_frames, n_actuators); got shape "
+                    f"{ctrl_arr.shape}"
+                )
+            if len(ctrl_arr) != len(self._frames):
+                raise ValueError(
+                    f"ExportJob: ctrl_frames has {len(ctrl_arr)} rows but qpos_frames has "
+                    f"{len(self._frames)} -- they must be parallel, one row per exported frame"
+                )
+            # The order a ctrl_frames row is assumed to arrive in: PRIMARY-actuator order,
+            # exactly like Session._primary_actuator_names -- never this job's own (possibly
+            # doubled, differently-ordered) self._model. Defaults to self._model's own
+            # actuator names for the common case of exporting from a model that IS the
+            # primary model (no reference-ghost overlay active), where "primary order" and
+            # "this model's order" are the same thing by construction.
+            primary_names = (
+                list(primary_actuator_names)
+                if primary_actuator_names is not None
+                else _actuator_names(self._model)
+            )
+            if ctrl_arr.shape[1] != len(primary_names):
+                raise ValueError(
+                    f"ExportJob: ctrl_frames rows have width {ctrl_arr.shape[1]}, expected "
+                    f"{len(primary_names)} (len(primary_actuator_names) if given, else this "
+                    "model's own actuator count)"
+                )
+            from mujoco_visualizer.visualizer import build_ctrl_name_map
+
+            # Matched by NAME against self._model -- never by position. self._model may be
+            # the reference-ghost pair (nu doubles, 272 -> 544 on the real models), so a
+            # primary-ordered ctrl row cannot be trusted to already line up with this job's
+            # own actuator order; see build_ctrl_name_map's own docstring for the real
+            # data-corruption bug a positional assumption caused on this branch.
+            self._ctrl_frames = ctrl_arr
+            self._ctrl_map = build_ctrl_name_map(primary_names, self._model)
+        else:
+            self._ctrl_frames = None
+            self._ctrl_map = None
 
         self._lock = threading.Lock()
         self._state = "pending"
@@ -218,7 +302,60 @@ class ExportJob(threading.Thread):
         viz = Visualizer(model=self._model, anatomy=self._anatomy)
         if self._vis_state:
             viz.vis_state = copy.deepcopy(self._vis_state)
+
+        # Tendon-activation visualisation state, built once here rather than per frame --
+        # mirrors Session._rebuild_tendon_state, computed against THIS job's own model copy
+        # (never the caller's). Skipped entirely when no ctrl_frames were supplied: there is
+        # nothing to drive activation from, so this job must behave exactly as it did before
+        # this feature existed (no tendon mutation at all).
+        if self._ctrl_frames is not None:
+            from mujoco_visualizer.visualizer import (
+                build_actuator_tendon_map,
+                default_tendon_ctrl_full_scale,
+            )
+
+            self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
+                self._model, getattr(viz, "actuator_color_fn", None)
+            )
+            self._tendon_default_ctrl_full_scale = default_tendon_ctrl_full_scale(
+                self._model, self._tendon_act_to_ten
+            )
         return viz
+
+    def _apply_tendon_activation_frame(self, viz, frame_idx: int) -> None:
+        """Colour/thicken ``self._model``'s muscle tendons for *frame_idx*, honouring the
+        ``vis_state['tendons']`` group in the snapshot this job was constructed with -- the
+        export counterpart of ``Session._apply_tendon_activation_vis``.
+
+        Unlike the live path, there is no toggling mid-export (``vis_state`` is a single fixed
+        snapshot for the whole job -- see ``_make_visualizer``), so there is nothing to
+        restore-on-disable here: when the group is off, this method simply does nothing, and
+        ``self._model``'s tendon_rgba/tendon_width stay at the values this job's own deep copy
+        started with (never the caller's model -- see ``__init__``).
+        """
+        tendons = viz.vis_state.get("tendons", {})
+        if not tendons.get("enabled", False):
+            return
+        from mujoco_visualizer.visualizer import apply_tendon_activation
+
+        # ctrl_frames is primary-actuator-ordered; scattered into this model's own actuator
+        # order via self._ctrl_map (see __init__) -- by NAME, never by position, exactly like
+        # Session.set_qpos. An unmatched primary name (-1) is skipped, never wrapped via
+        # numpy's negative-index behaviour onto this model's last actuator.
+        vis_ctrl = np.zeros(self._model.nu, dtype=np.float64)
+        valid = self._ctrl_map >= 0
+        vis_ctrl[self._ctrl_map[valid]] = self._ctrl_frames[frame_idx][valid]
+        apply_tendon_activation(
+            self._model,
+            vis_ctrl,
+            self._tendon_act_to_ten,
+            self._tendon_base_rgba,
+            tendon_width=tendons.get("max_width", 0.003),
+            tendon_min_width=tendons.get("min_width", 0.0005),
+            tendon_alpha_min=tendons.get("min_alpha", 0.05),
+            tendon_baseline=tendons.get("baseline", 0.0),
+            ctrl_max=tendons.get("ctrl_full_scale", self._tendon_default_ctrl_full_scale),
+        )
 
     def _iter_rendered(self, viz, renderer):
         for i, qpos in enumerate(self._frames):
@@ -226,7 +363,14 @@ class ExportJob(threading.Thread):
                 return
             viz.data.qpos[:] = qpos
             mujoco.mj_forward(viz.model, viz.data)
-            yield viz.render_with(renderer, camera=self._camera, frame_idx=i)
+            if self._ctrl_frames is not None:
+                self._apply_tendon_activation_frame(viz, i)
+            yield viz.render_with(
+                renderer,
+                camera=self._camera,
+                frame_idx=i,
+                modify_scene_fns=self._modify_scene_fns,
+            )
             with self._lock:
                 self._done = i + 1
 
@@ -266,7 +410,17 @@ class ExportJob(threading.Thread):
             renderer.close()
 
     def _write_sidecar(self) -> None:
-        """Provenance beside the output, so a figure can be re-made without guessing."""
+        """Provenance beside the output, so a figure can be re-made without guessing.
+
+        ``tendon_activation_applied``/``scene_modifiers_applied`` are FACTUAL records of what
+        this job actually did, not a claim about what the result looks like -- an exported
+        video whose sidecar does not say what overlays it carries is exactly the kind of
+        artifact that gets misread in a paper six months later. ``tendon_activation_applied``
+        is true only when BOTH ``ctrl_frames`` were supplied AND ``vis_state['tendons']
+        ['enabled']`` was true in the snapshot this job rendered with -- ctrl_frames alone
+        (tendons left disabled) applied nothing, and this field says exactly that.
+        """
+        tendons_enabled = bool((self._vis_state or {}).get("tendons", {}).get("enabled", False))
         payload = dict(self._meta)
         payload.update({
             "width": self._width,
@@ -277,6 +431,11 @@ class ExportJob(threading.Thread):
             "crf": self._crf,
             "n_frames": int(len(self._frames)),
             "note": self._note,
+            "ctrl_frames_provided": self._ctrl_frames is not None,
+            "tendon_activation_applied": self._ctrl_frames is not None and tendons_enabled,
+            "scene_modifiers_applied": int(len(self._modify_scene_fns))
+            if self._modify_scene_fns
+            else 0,
         })
         if self._fmt == "png":
             target = self._path / "export.json"
