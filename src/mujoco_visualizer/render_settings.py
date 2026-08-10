@@ -30,6 +30,7 @@ import mujoco
 import numpy as np
 
 from mujoco_visualizer.visualizer import (
+    _apply_forces_vis,
     _az_el_to_dir,
     _hex_to_rgb,
     _make_sky_pixels,
@@ -140,13 +141,14 @@ def apply_settings(
     apply_lighting: bool = True,
     apply_floor: bool = True,
     apply_skybox: bool = True,
+    apply_forces: bool = True,
     body_name_substring: Optional[str] = None,
 ) -> dict:
     """Apply a settings dict to a MuJoCo model (mutates model in place).
 
-    This handles geom colors, lighting, floor material, and skybox texture.
-    Returns internal state needed for correct color reset (keep if you plan
-    to call apply_settings again with different settings on the same model).
+    This handles geom colors, lighting, floor material, skybox texture, and force/torque arrow
+    scaling. Returns internal state needed for correct color reset (keep if you plan to call
+    apply_settings again with different settings on the same model).
 
     Args:
         model: MuJoCo model to modify.
@@ -155,6 +157,10 @@ def apply_settings(
         apply_lighting: Whether to apply lighting settings.
         apply_floor: Whether to apply floor material settings.
         apply_skybox: Whether to apply skybox gradient.
+        apply_forces: Whether to apply force/torque arrow scaling (``model.vis.map``/
+            ``model.vis.scale``). ``build_scene_option`` already turns
+            ``mjVIS_CONTACTFORCE`` arrows on via ``vis_flags`` -- without this, they render
+            at whatever scale ``model.vis`` happens to hold instead of the settings dict's.
         body_name_substring: Optional substring filter. When set, only geoms
             whose parent body name contains this substring are recolored
             (and their materials baked). Intended for multi-instance scenes
@@ -309,6 +315,10 @@ def apply_settings(
                 tex_buf = getattr(model, 'tex_rgb', None)
             if tex_buf is not None:
                 tex_buf[adr:adr + len(flat)] = flat
+
+    # Apply force/torque arrow scaling
+    if apply_forces and 'forces' in settings:
+        _apply_forces_vis(settings['forces'], model)
 
     return {
         'geom_categories': geom_categories,

@@ -231,3 +231,62 @@ def test_swap_model_back_and_forth_keeps_reapplying_forces(forces_swap_session):
     assert s.model.vis.map.force == pytest.approx(7.0)
     s.swap_model("primary")
     assert s.model.vis.map.force == pytest.approx(7.0)
+
+
+# -- the standalone notebook path (render_settings.apply_settings) must also apply forces ----
+#
+# render_settings.build_scene_option already flips mjVIS_CONTACTFORCE on via vis_flags, so the
+# notebook path can turn contact-force arrows ON -- but without forces support in apply_settings
+# they render at whatever scale model.vis happens to hold, which for the fly is exactly the
+# invisible-arrow bug this feature exists to fix. Without wiring, this is a second, independent
+# way to hit the original bug -- not merely a divergence between two APIs.
+
+
+def test_apply_settings_writes_forces_onto_the_model():
+    from mujoco_visualizer.render_settings import apply_settings
+
+    xml = "<mujoco><worldbody><geom type='box' size='.1 .1 .1'/></worldbody></mujoco>"
+    model = mujoco.MjModel.from_xml_string(xml)
+    assert model.vis.map.force != pytest.approx(3.3)  # sanity: not already there
+
+    apply_settings(model, {"forces": {
+        "map_force": 3.3, "map_torque": 4.4,
+        "scale_forcewidth": 0.08, "scale_contactwidth": 0.6, "scale_contactheight": 0.11,
+    }})
+
+    assert model.vis.map.force == pytest.approx(3.3)
+    assert model.vis.map.torque == pytest.approx(4.4)
+    assert model.vis.scale.forcewidth == pytest.approx(0.08)
+    assert model.vis.scale.contactwidth == pytest.approx(0.6)
+    assert model.vis.scale.contactheight == pytest.approx(0.11)
+
+
+def test_apply_settings_with_no_forces_key_leaves_the_model_untouched():
+    """Behaviour preservation: every settings dict written before this feature existed has no
+    'forces' key, and apply_settings must not error or invent a value for it."""
+    from mujoco_visualizer.render_settings import apply_settings
+
+    xml = "<mujoco><visual><map force='9.0'/></visual><worldbody>" \
+          "<geom type='box' size='.1 .1 .1'/></worldbody></mujoco>"
+    model = mujoco.MjModel.from_xml_string(xml)
+
+    apply_settings(model, {})
+
+    assert model.vis.map.force == pytest.approx(9.0)
+
+
+def test_apply_settings_apply_forces_false_skips_the_write():
+    """Mirrors the apply_colors/apply_lighting/apply_floor/apply_skybox opt-out pattern already
+    on this function -- forces gets the same on/off knob, not special-cased as always-on."""
+    from mujoco_visualizer.render_settings import apply_settings
+
+    xml = "<mujoco><worldbody><geom type='box' size='.1 .1 .1'/></worldbody></mujoco>"
+    model = mujoco.MjModel.from_xml_string(xml)
+    original = float(model.vis.map.force)
+
+    apply_settings(model, {"forces": {
+        "map_force": 3.3, "map_torque": 4.4,
+        "scale_forcewidth": 0.08, "scale_contactwidth": 0.6, "scale_contactheight": 0.11,
+    }}, apply_forces=False)
+
+    assert model.vis.map.force == pytest.approx(original)
