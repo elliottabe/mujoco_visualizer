@@ -35,7 +35,6 @@ from mujoco_visualizer.visualizer import (
     _dir_to_az_el,
     _hex_to_rgb,
     _make_sky_pixels,
-    _read_sky_colors,
     _rgb_to_hex,
     _FREE_TYPE_MAP,
     _build_pan_camera,
@@ -336,20 +335,32 @@ def apply_settings(
 
     # Apply skybox
     #
-    # sky_top/sky_bot have no dedicated model field to read back at all -- _make_sky_pixels
-    # bakes both into every texel of a rendered cube map. Mentioning only one reads the other
-    # back by SAMPLING the texture (_read_sky_colors), not indexing a struct; mentioning
-    # neither (e.g. a dict that only carries 'show', which this function does not otherwise
-    # handle) skips regeneration entirely rather than crashing or guessing.
-    pixels = None
+    # sky_top/sky_bot are deliberately NOT given the permissive "write only what's present"
+    # treatment the other four groups got in round 3. That rule assumes the unmentioned value
+    # can be read back exactly from the model; a gradient's ends cannot be, because there is
+    # no dedicated model field for either one -- _make_sky_pixels bakes both into every texel
+    # of a rendered cube map. An earlier version of this block sampled the texture to
+    # reconstruct whichever colour was not mentioned; that was exact only on a texture whose
+    # width and height//6 were both odd, off by roughly 1-2/255 otherwise, and drifted further
+    # on every repeated partial update since each call re-sampled an already slightly-off
+    # value -- "leave the rest at the model's current value" silently was not what it did.
+    # Being permissive here would be a silent lie about a precision this function cannot
+    # deliver, so sky_top/sky_bot are instead an ATOMIC PAIR: applied when both are present,
+    # rejected with a ValueError naming both keys when exactly one is (before any pixel is
+    # touched), and left alone -- same as every other unrecognised key in this function, e.g.
+    # a dict that only carries 'show' -- when neither is present.
     if apply_skybox and skybox_tex_id >= 0 and 'skybox' in settings:
         sky = settings['skybox']
-        if 'sky_top' in sky or 'sky_bot' in sky:
-            current = _read_sky_colors(model, skybox_tex_id)
-            cur_top, cur_bot = current if current is not None else ([0.4, 0.6, 0.8], [0.0, 0.0, 0.0])
-            top_rgb = _hex_to_rgb(sky['sky_top']) if 'sky_top' in sky else cur_top
-            bot_rgb = _hex_to_rgb(sky['sky_bot']) if 'sky_bot' in sky else cur_bot
-            pixels = _make_sky_pixels(model, skybox_tex_id, top_rgb, bot_rgb)
+        has_top, has_bot = 'sky_top' in sky, 'sky_bot' in sky
+        if has_top != has_bot:
+            given = 'sky_top' if has_top else 'sky_bot'
+            raise ValueError(
+                "'skybox' requires both 'sky_top' and 'sky_bot' together -- a gradient cannot "
+                f"be specified with only one end; got {given!r} without the other"
+            )
+        pixels = _make_sky_pixels(
+            model, skybox_tex_id, _hex_to_rgb(sky['sky_top']), _hex_to_rgb(sky['sky_bot'])
+        ) if has_top and has_bot else None
         if pixels is not None:
             h = int(model.tex_height[skybox_tex_id])
             w = int(model.tex_width[skybox_tex_id])

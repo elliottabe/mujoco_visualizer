@@ -147,50 +147,6 @@ def _make_sky_pixels(
     return pixels
 
 
-def _read_sky_colors(
-    model: mujoco.MjModel, skybox_tex_id: int
-) -> Optional[Tuple[List[float], List[float]]]:
-    """Read back the top/bottom gradient colours currently rendered into the texture at
-    *skybox_tex_id*, as ``([r, g, b], [r, g, b])`` floats in ``[0, 1]``, or ``None`` if there
-    is nothing readable (no skybox texture, or no exposed pixel buffer).
-
-    Unlike ``forces``, ``floor``'s alpha, or a light's direction, ``sky_top``/``sky_bot`` have
-    no dedicated scalar field on the model to read back -- ``_make_sky_pixels`` bakes both into
-    every texel of a rendered cube map, so recovering "the current value of the one the caller
-    didn't mention" means sampling the texture, not indexing a struct.
-
-    This samples the one texel per face where the reconstruction is exact (up to the uint8
-    quantization ``_make_sky_pixels`` already introduces when it wrote the texture): the pure
-    top face has ``face_axes`` normal ``[0, 1, 0]`` (index 2, ``face_axes[2]`` above) and the
-    pure bottom face has normal ``[0, -1, 0]`` (index 3) -- at those faces' own centers, the
-    sampled direction ``d`` is exactly the face normal, so ``t`` in ``_make_sky_pixels`` is
-    exactly 1 or 0 and the texel is exactly ``top``/``bot`` (mod rounding), not a blend. This
-    works whether the texture was last written by ``_make_sky_pixels`` or by MuJoCo's own
-    ``builtin="gradient"`` compiler: both are vertical top-to-bottom gradients, and sampling a
-    texture's own vertical extremes is what "the sky colour when you look straight up/down"
-    means regardless of which code produced the pixels.
-    """
-    if skybox_tex_id < 0:
-        return None
-    total_h = int(model.tex_height[skybox_tex_id])
-    w = int(model.tex_width[skybox_tex_id])
-    face_h = max(1, total_h // 6)
-    nchan = int(model.tex_nchannel[skybox_tex_id]) if hasattr(model, 'tex_nchannel') else 3
-    tex_buf = getattr(model, 'tex_data', None)
-    if tex_buf is None:
-        tex_buf = getattr(model, 'tex_rgb', None)
-    if tex_buf is None:
-        return None
-    adr = int(model.tex_adr[skybox_tex_id])
-    n_pixels = total_h * w
-    flat = np.asarray(tex_buf[adr:adr + n_pixels * nchan])
-    pixels = flat.reshape(n_pixels, nchan)[:, :3]
-    center = (face_h // 2) * w + (w // 2)
-    top_px = pixels[2 * face_h * w + center]
-    bot_px = pixels[3 * face_h * w + center]
-    return [float(c) / 255.0 for c in top_px], [float(c) / 255.0 for c in bot_px]
-
-
 # Scene modifier functions (applied after update_scene)
 def dual_lighting(scene: mujoco.MjvScene, geom_xpos: Optional[np.ndarray] = None,
                   **kwargs) -> None:

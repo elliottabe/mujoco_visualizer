@@ -23,11 +23,17 @@ reasoning):
   (via ``_dir_to_az_el``, the exact inverse of the direction write) before re-composing it with
   the mentioned half substituted in -- not "leave the whole pair untouched", since the mentioned
   half must still take effect.
-- ``skybox``'s ``sky_top``/``sky_bot`` have no dedicated model field to read back at all --
-  ``_make_sky_pixels`` bakes both into every texel of a rendered cube map. Recovering "the
-  current value of the one not mentioned" means sampling the texture (see
-  ``visualizer._read_sky_colors``), not indexing a struct. Verified independently below by
-  sampling pixels directly in the test rather than trusting the new production helper.
+- ``skybox``'s ``sky_top``/``sky_bot`` are treated as an ATOMIC PAIR, not permissively like the
+  other four groups (fix round 4, superseding an earlier round-3 attempt that sampled the
+  texture to reconstruct whichever colour was not mentioned -- that reconstruction was exact
+  only when the texture's width and ``height // 6`` were both odd, approximate by roughly
+  1-2/255 otherwise, and drifted a little further on every repeated partial update since each
+  call re-samples an already slightly-off value). "Write only what's present, leave the rest
+  untouched" assumes the untouched value CAN be read back exactly; a gradient's ends cannot be,
+  since there is no dedicated model field for either one -- ``_make_sky_pixels`` bakes both
+  into every texel of a rendered cube map. So both keys are required together (raises
+  ``ValueError`` naming both if only one is given) or neither is touched at all -- never a
+  silent approximation.
 """
 
 import numpy as np
@@ -182,90 +188,82 @@ def test_apply_settings_floor_reflectance_alone_does_not_touch_geom_rgba():
     assert list(model.geom_rgba[floor_gid]) == pytest.approx(list(orig_rgba))
 
 
-# -- skybox -----------------------------------------------------------------------------------
+# -- skybox: sky_top/sky_bot as an ATOMIC PAIR (fix round 4) --------------------------------
 #
-# Odd width and odd (height // 6) so the pure-top/pure-bottom texel lands exactly at each
-# face's own center (u=v=0) -- see visualizer._read_sky_colors's docstring. This makes the
-# reconstruction exact up to the uint8 quantization _make_sky_pixels already introduces, rather
-# than the extra few percent of interpolation error an even-sized face would add on top.
+# EVEN width and EVEN (height // 6), deliberately -- this is exactly the shape where the
+# round-3 sampling-based reconstruction was only approximate (a center texel that does not
+# land exactly on the face normal). A test that only used odd dimensions would pass under both
+# the old lossy implementation and the new exact one, proving nothing about which is in place.
 
 _SKYBOX_XML = """
 <mujoco>
   <asset>
     <texture name="skybox" type="skybox" builtin="gradient"
-             rgb1="1 0 0" rgb2="0 0 1" width="9" height="54"/>
+             rgb1="1 0 0" rgb2="0 0 1" width="8" height="48"/>
   </asset>
   <worldbody><geom type="box" size=".1 .1 .1"/></worldbody>
 </mujoco>
 """
 
 
-def _sample_sky_top_bot(model, tex_id):
-    """Independent pixel-sampling check, written separately from
-    ``visualizer._read_sky_colors`` so this test does not simply assert the production helper
-    agrees with itself."""
+def test_apply_settings_skybox_with_both_keys_applies_exactly_on_an_even_sized_texture():
+    """Byte-exact, not approximate: the applied texture must equal what _make_sky_pixels itself
+    would produce for these colours, computed independently in the test -- no sampling
+    involved on either side, so there is no interpolation error to tolerate with pytest.approx.
+    """
+    from mujoco_visualizer.visualizer import _make_sky_pixels
+
+    model = mujoco.MjModel.from_xml_string(_SKYBOX_XML)
+    tex_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_TEXTURE, "skybox")
+    top_hex, bot_hex = "#336699", "#0d0d26"
+
+    apply_settings(model, {"skybox": {"sky_top": top_hex, "sky_bot": bot_hex}})
+
+    expected = _make_sky_pixels(model, tex_id, _hex_to_rgb(top_hex), _hex_to_rgb(bot_hex))
     total_h = int(model.tex_height[tex_id])
     w = int(model.tex_width[tex_id])
-    face_h = total_h // 6
     nchan = int(model.tex_nchannel[tex_id])
     adr = int(model.tex_adr[tex_id])
     n_pixels = total_h * w
-    flat = np.asarray(model.tex_data[adr:adr + n_pixels * nchan]).reshape(n_pixels, nchan)
-    center = (face_h // 2) * w + (w // 2)
-    top = flat[2 * face_h * w + center, :3] / 255.0
-    bot = flat[3 * face_h * w + center, :3] / 255.0
-    return top, bot
+    actual = np.asarray(model.tex_data[adr:adr + n_pixels * nchan]).reshape(n_pixels, nchan)
+    assert list(actual[:, :3].flatten()) == list(expected.flatten())  # exact, no tolerance
 
 
-def test_apply_settings_partial_skybox_dict_updates_only_the_mentioned_field():
+@pytest.mark.parametrize("given, missing", [
+    ({"sky_top": "#336699"}, "sky_bot"),
+    ({"sky_bot": "#0d0d26"}, "sky_top"),
+])
+def test_apply_settings_skybox_with_exactly_one_key_raises_naming_both_keys(given, missing):
+    model = mujoco.MjModel.from_xml_string(_SKYBOX_XML)
+
+    with pytest.raises(ValueError, match="sky_top") as excinfo:
+        apply_settings(model, {"skybox": given})
+    assert "sky_bot" in str(excinfo.value)  # both keys named, not just the one that's missing
+
+
+def test_apply_settings_skybox_exactly_one_key_does_not_touch_pixels_before_raising():
+    """The raise must happen before any write -- a half-applied gradient would be worse than
+    the KeyError this replaces, since it would look like it worked."""
     model = mujoco.MjModel.from_xml_string(_SKYBOX_XML)
     tex_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_TEXTURE, "skybox")
-
     apply_settings(model, {"skybox": {"sky_top": "#336699", "sky_bot": "#0d0d26"}})
-    _, bot_before = _sample_sky_top_bot(model, tex_id)
+    before = model.tex_data.copy()
 
-    apply_settings(model, {"skybox": {"sky_top": "#ff8800"}})  # only sky_top mentioned
-    top_after, bot_after = _sample_sky_top_bot(model, tex_id)
+    with pytest.raises(ValueError):
+        apply_settings(model, {"skybox": {"sky_top": "#ff8800"}})
 
-    assert list(top_after) == pytest.approx(_hex_to_rgb("#ff8800"), abs=2 / 255)  # mentioned
-    assert list(bot_after) == pytest.approx(list(bot_before), abs=2 / 255)        # unmentioned
+    assert list(model.tex_data) == list(before)
 
 
-def test_apply_settings_skybox_with_neither_color_key_does_not_crash_or_touch_pixels():
+def test_apply_settings_skybox_with_neither_color_key_still_no_ops():
     """A settings dict that mentions the skybox group but neither colour key (e.g. only
-    'show', which this function does not otherwise handle) must not crash and must not
-    regenerate the texture."""
+    'show', which this function does not otherwise handle) must not raise and must not
+    regenerate the texture -- unambiguous now, since there is no lossy path left to be
+    adjacent to."""
     model = mujoco.MjModel.from_xml_string(_SKYBOX_XML)
-    tex_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_TEXTURE, "skybox")
     apply_settings(model, {"skybox": {"sky_top": "#336699", "sky_bot": "#0d0d26"}})
     before = model.tex_data.copy()
 
     apply_settings(model, {"skybox": {"show": True}})  # must not raise
 
     assert list(model.tex_data) == list(before)
-
-
-# -- visualizer._read_sky_colors, in isolation -------------------------------------------------
-
-
-def test_read_sky_colors_reconstructs_known_top_and_bottom():
-    from mujoco_visualizer.visualizer import _make_sky_pixels, _read_sky_colors
-
-    model = mujoco.MjModel.from_xml_string(_SKYBOX_XML)
-    tex_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_TEXTURE, "skybox")
-    top, bot = [0.2, 0.6, 0.9], [0.05, 0.05, 0.15]
-    pixels = _make_sky_pixels(model, tex_id, top, bot)
-    model.tex_data[:] = pixels.flatten()
-
-    got_top, got_bot = _read_sky_colors(model, tex_id)
-    assert got_top == pytest.approx(top, abs=1 / 255)
-    assert got_bot == pytest.approx(bot, abs=1 / 255)
-
-
-def test_read_sky_colors_returns_none_when_there_is_no_skybox_texture():
-    from mujoco_visualizer.visualizer import _read_sky_colors
-
-    model = mujoco.MjModel.from_xml_string(
-        "<mujoco><worldbody><geom type='box' size='.1 .1 .1'/></worldbody></mujoco>"
-    )
-    assert _read_sky_colors(model, -1) is None
