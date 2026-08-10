@@ -68,6 +68,28 @@ def _rgb_to_hex(rgb: Sequence[float]) -> str:
     )
 
 
+def _apply_forces_vis(forces: dict, model: mujoco.MjModel) -> None:
+    """Write the five force/torque arrow-scaling fields in *forces* onto *model.vis*.
+
+    These fields (``map.force``/``map.torque``/``scale.forcewidth``/``scale.contactwidth``/
+    ``scale.contactheight``) control ``mjVIS_CONTACTFORCE`` arrow length and width, but unlike
+    every other ``vis_state`` group they live on ``MjModel.vis``, not on the per-render
+    ``MjvOption`` -- so there is no scene-option flag to flip, and no reason to expect a fresh
+    render to pick these up on its own after the model object itself changes.
+
+    That is exactly why this is a free function rather than only a ``Visualizer`` method:
+    :meth:`Visualizer._apply_forces` calls it against ``self.model`` on every render, and
+    ``session._carry_vis_state_across_swap`` calls it again, directly against the freshly
+    swapped-in model, because that model's own MJCF may set entirely different values and a
+    swap does not otherwise touch it at all.
+    """
+    model.vis.map.force          = forces['map_force']
+    model.vis.map.torque         = forces['map_torque']
+    model.vis.scale.forcewidth   = forces['scale_forcewidth']
+    model.vis.scale.contactwidth = forces['scale_contactwidth']
+    model.vis.scale.contactheight = forces['scale_contactheight']
+
+
 def _make_sky_pixels(
     model: mujoco.MjModel,
     skybox_tex_id: int,
@@ -497,6 +519,18 @@ class Visualizer:
                 'sky_top': _rgb_to_hex([0.4, 0.6, 0.8]),
                 'sky_bot': _rgb_to_hex([0.0, 0.0, 0.0]),
             },
+            # Force/torque arrow scaling (mjVIS_CONTACTFORCE draws with these). Read from
+            # ``self.model.vis`` rather than hardcoded -- unlike vis_flags these live on
+            # MjModel.vis, not MjvOption, and MuJoCo's own library default (map.force=0.005)
+            # is not what the fly model's MJCF sets (2e-05); hardcoding here would silently
+            # overwrite the MJCF's value the moment a Visualizer is constructed.
+            'forces': {
+                'map_force':          float(self.model.vis.map.force),
+                'map_torque':         float(self.model.vis.map.torque),
+                'scale_forcewidth':   float(self.model.vis.scale.forcewidth),
+                'scale_contactwidth': float(self.model.vis.scale.contactwidth),
+                'scale_contactheight': float(self.model.vis.scale.contactheight),
+            },
             'camera_presets': {},
         }
 
@@ -673,7 +707,7 @@ class Visualizer:
         # default __init__ set, never an error and never a synthesized value.
         for key in ('colors', 'geom_colors', 'alpha', 'vis_flags',
                     'geom_groups', 'site_groups', 'camera', 'lighting',
-                    'floor', 'skybox', 'ghost'):
+                    'floor', 'skybox', 'ghost', 'forces'):
             if key in settings:
                 if isinstance(settings[key], dict) and isinstance(self.vis_state.get(key), dict):
                     self.vis_state[key] = {**self.vis_state[key], **settings[key]}
@@ -725,6 +759,7 @@ class Visualizer:
             'lighting':          copy.deepcopy(self.vis_state['lighting']),
             'floor':             copy.deepcopy(self.vis_state['floor']),
             'skybox':            copy.deepcopy(self.vis_state['skybox']),
+            'forces':            copy.deepcopy(self.vis_state['forces']),
             'geom_render_state': geom_render_state,
             'camera_presets':    self.vis_state.get('camera_presets', {}),
             # .get(..., {}), not ['ghost'], because this key was added after every existing
@@ -834,6 +869,11 @@ class Visualizer:
         self._sky_fingerprint = fingerprint
         return True
 
+    def _apply_forces(self) -> None:
+        """Write ``vis_state['forces']`` onto ``self.model.vis`` (see :func:`_apply_forces_vis`
+        for why this cannot be folded into a scene-option flag like the other vis_flags)."""
+        _apply_forces_vis(self.vis_state['forces'], self.model)
+
     def _apply_all(self) -> bool:
         """Apply all vis_state properties to the model.
 
@@ -844,6 +884,7 @@ class Visualizer:
         self._apply_geom_colors()
         self._apply_lighting()
         self._apply_floor_props()
+        self._apply_forces()
         return self._apply_sky_props()
 
     def _build_scene_option(self) -> mujoco.MjvOption:
