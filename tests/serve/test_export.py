@@ -808,3 +808,118 @@ def test_live_and_export_agree_on_base_rgba_for_the_same_scheme(tmp_path):
     job.join(timeout=120)
     assert job.progress()["state"] == "done", job.progress()
     assert list(job._tendon_base_rgba.flatten()) == pytest.approx(list(live_rgba.flatten()))
+
+
+# --- the exclusion filter must reach the EXPORT path, not just the preview ------------------
+#
+# `m_a_ref`/`t_a_ref` stand in for the reference ghost's duplicate half: an actuator that
+# exists on the model being rendered but that no primary ctrl column drives. Declared FIRST so
+# a positional-prefix assumption cannot pass by accident, and given the MJCF's own opaque
+# `rgba="1 0 0 1"` so "the filter did nothing" cannot be mistaken for "the tendon was already
+# invisible".
+_TENDON_DOUBLED_XML = """
+<mujoco>
+  <worldbody>
+    <light pos="0 0 2"/>
+    <geom name="floor" type="plane" size="1 1 0.1"/>
+    <site name="anchor_ref" pos="0.3 0 0.4" size="0.01"/>
+    <body name="box_ref" pos="0.3 0 0.6">
+      <joint name="slide_ref" type="slide" axis="0 0 1"/>
+      <geom name="box_ref_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_ref" pos="0 0 0" size="0.01"/>
+    </body>
+    <site name="anchor_a" pos="-0.3 0 0.4" size="0.01"/>
+    <body name="box_a" pos="-0.3 0 0.6">
+      <joint name="slide_a" type="slide" axis="0 0 1"/>
+      <geom name="box_a_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_a" pos="0 0 0" size="0.01"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="t_a_ref" width="0.003" rgba="1 0 0 1">
+      <site site="anchor_ref"/><site site="tip_ref"/>
+    </spatial>
+    <spatial name="t_a" width="0.003" rgba="1 0 0 1">
+      <site site="anchor_a"/><site site="tip_a"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="m_a_ref" tendon="t_a_ref" ctrlrange="-1 1"/>
+    <motor name="m_a" tendon="t_a" ctrlrange="-1 1"/>
+  </actuator>
+</mujoco>
+"""
+
+
+@pytest.mark.gl
+def test_export_hides_the_tendons_of_actuators_no_ctrl_column_drives(tmp_path):
+    """Fix 1. ``Session._rebuild_tendon_colors`` narrows the actuator->tendon map to actuators
+    some primary ctrl column drives; ``ExportJob`` rebuilds the same map from the same model and
+    used to apply NO such filter, so exporting with the reference ghost active wrote ~260 dim
+    but palette-COLOURED duplicate tendons into the video that the preview never showed.
+
+    Expectation if the fix is correct: with a colour fn supplied and a doubled model whose
+    ``m_a_ref`` matches no name in ``primary_actuator_names``, the exported frames must show
+    ``t_a_ref`` at alpha 0.0 (hidden) while ``t_a`` -- driven at full scale -- is opaque; and the
+    whole rendered alpha vector must equal, element for element, what a live ``Session`` on the
+    same model produces. Both halves are asserted: the alpha values themselves (so removing
+    ``driven_ids`` from ``build_actuator_tendon_map`` fails here with 0.05, the ``min_alpha``
+    floor, instead of 0.0) and the live/export parity (so a filter that came back on ONE caller
+    only still fails).
+    """
+    from mujoco_visualizer.serve.session import Session
+
+    colour_fn = lambda name: "#0000ff"  # noqa: E731 -- one expression, used on both paths
+
+    # --- live: the same doubled model, reached through a swap so _ctrl_map is the alt one -----
+    live = Session(
+        model=mujoco.MjModel.from_xml_string(_TENDON_MODEL_XML),
+        alt_model=mujoco.MjModel.from_xml_string(_TENDON_DOUBLED_XML),
+        width=128, height=96,
+        actuator_color_schemes={"s": {"color": colour_fn, "group": lambda n: "g"}},
+    )
+    try:
+        live.swap_model("alt")
+        live.viz.vis_state["tendons"].update(_TENDON_VIS_ON)
+        live.viz.vis_state["tendons"]["color_by"] = "s"
+        live._vis_ctrl[:] = 0.0
+        live._vis_ctrl[mujoco.mj_name2id(
+            live.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "m_a"
+        )] = 1.0
+        live.render()
+        live_alpha = live.model.tendon_rgba[:, 3].copy()
+    finally:
+        live.close()
+
+    # --- export: a fresh copy of that same doubled model, 2 PNG frames ----------------------
+    export_model = mujoco.MjModel.from_xml_string(_TENDON_DOUBLED_XML)
+    qpos = np.repeat(export_model.qpos0.copy().reshape(1, -1), 2, axis=0)
+    job = ExportJob(
+        export_model, None,
+        _vis_state_with_tendons(export_model, _TENDON_VIS_ON),
+        qpos,
+        path=tmp_path / "ghostfilter", fmt="png", width=128, height=96, fps=10,
+        ctrl_frames=np.array([[1.0], [1.0]]),  # m_a only; m_a_ref is not a primary name
+        primary_actuator_names=["m_a"],
+        actuator_color_fn=colour_fn,
+    )
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+    assert sorted(p.name for p in tmp_path.glob("ghostfilter/*.png")), "no frames were written"
+
+    t_a = mujoco.mj_name2id(job._model, mujoco.mjtObj.mjOBJ_TENDON, "t_a")
+    t_a_ref = mujoco.mj_name2id(job._model, mujoco.mjtObj.mjOBJ_TENDON, "t_a_ref")
+    assert job._model.tendon_rgba[t_a_ref, 3] == pytest.approx(0.0), (
+        "the exported frames drew t_a_ref, whose actuator m_a_ref no primary ctrl column "
+        "drives -- its activation is structurally zero, so build_actuator_tendon_map's "
+        "driven_ids filter must have hidden it"
+    )
+    assert job._model.tendon_rgba[t_a, 3] == pytest.approx(1.0), (
+        "m_a was driven at full scale, so its own tendon must be opaque -- the filter went "
+        "too far if this is dim or hidden"
+    )
+    assert list(job._model.tendon_rgba[:, 3]) == pytest.approx(list(live_alpha)), (
+        "the exported frames' tendon alphas disagree with what the live Session shows for the "
+        "same model -- the two paths have drifted again"
+    )

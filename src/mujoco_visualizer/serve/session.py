@@ -270,6 +270,14 @@ class Session:
         # legend with colour codes instead of muscle-group names. Keeping both halves in one
         # entry means a scheme cannot supply a palette without the labels that explain it.
         self._actuator_color_schemes = dict(actuator_color_schemes or {})
+        # Bumped by every _rebuild_tendon_colors (its sole writer), and half of
+        # :meth:`_tendon_legend`'s memo key. Initialised before the first rebuild below so that
+        # rebuild is itself counted.
+        self._tendon_generation = 0
+        # (color_by, generation) -> (groups, unclassified); see :meth:`_tendon_legend`.
+        self._tendon_legend_cache: Optional[
+            Tuple[Tuple[str, int], Tuple[Dict[str, Dict[str, object]], int]]
+        ] = None
         self._rebuild_tendon_state()
 
         self._tree = build_control_tree(self.model)
@@ -575,25 +583,21 @@ class Session:
         """
         scheme_name = self.viz.vis_state.get("tendons", {}).get("color_by", "function")
         scheme = self._actuator_color_schemes.get(scheme_name, {})
-        self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
-            self.model, scheme.get("color")
-        )
-        # Drop actuators that no primary ctrl column maps to. _vis_ctrl is written ONLY by
-        # set_qpos through _ctrl_map, so such an actuator's activation is zero for the life of
-        # the session and its tendon carries no signal -- on the fly reference-ghost pair that
-        # is 260 dim duplicates drawn directly over the muscles they mimic.
-        # apply_tendon_activation already hides every tendon absent from act_to_ten.values(),
-        # so excluding here IS hiding; no new code path.
-        # Stated in terms of the ctrl map rather than a name suffix so this package needs no
-        # knowledge of what a ghost is. On a single-model session every primary name matches and
-        # nothing is dropped.
+        # `driven_ids` drops actuators that no primary ctrl column maps to. _vis_ctrl is written
+        # ONLY by set_qpos through _ctrl_map, so such an actuator's activation is zero for the
+        # life of the session and its tendon carries no signal. Passed INTO the shared builder
+        # rather than post-filtered here: ExportJob is the second caller of that builder and,
+        # while this rule lived on this method alone, exported video carried ~260 coloured ghost
+        # duplicate tendons the preview never showed. See build_actuator_tendon_map's docstring.
         driven = {int(i) for i in self._ctrl_map if int(i) >= 0}
-        self._tendon_act_to_ten = {
-            act_id: ten_id
-            for act_id, ten_id in self._tendon_act_to_ten.items()
-            if act_id in driven
-        }
+        self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
+            self.model, scheme.get("color"), driven_ids=driven
+        )
         self._tendon_color_scheme = scheme_name
+        # Sole assignment site of _tendon_act_to_ten in the class, so bumping a counter here is
+        # a complete invalidation signal for anything memoised off that map -- see
+        # :meth:`_tendon_legend`.
+        self._tendon_generation += 1
 
     def _apply_tendon_activation_vis(self) -> None:
         """Drive ``vis_state['tendons']`` from :attr:`_vis_ctrl` for the frame about to be
@@ -1047,25 +1051,53 @@ class Session:
         actually drawn -- not over ``model.nu``, so a reference-ghost session reports what is on
         screen rather than double it. A scheme with no ``group`` function (``uniform``, or an
         unregistered name) reports nothing: there is no legend to draw for one colour.
+
+        MEMOISED, because :meth:`scene_message` calls this once per PUBLISHED FRAME while the
+        client reads it only on connect and after a ``tendons.color_by`` change: on the real fly
+        model it measured 1.00 ms of scene_message's 1.36 ms, ~9% of a 10.96 ms render, paid
+        unconditionally -- including with ``tendons.enabled`` False, the default -- to rebuild a
+        byte-identical dict.
+
+        The key is ``(color_by, generation)``, NOT the generation alone: ``color_by`` can change
+        while ``tendons.enabled`` is False, and :meth:`_rebuild_tendon_colors` -- the only place
+        the generation is bumped -- is not reached on that path, so a generation-only key would
+        serve the previous scheme's legend. Conversely ``color_by`` alone is not enough because a
+        ``swap_model`` changes which actuators exist. Pairing them is sufficient because
+        ``_tendon_act_to_ten`` does NOT depend on the scheme (only ``base_rgba`` does), so
+        recomputing the legend for a new ``color_by`` over the EXISTING map is correct -- the map
+        only ever changes through ``_rebuild_tendon_colors``, which is also its sole assignment
+        site and therefore fully covered by the counter.
+
+        The cached dict is handed out BY REFERENCE, deliberately and for the same reason
+        ``scene_message`` shares ``controls`` by reference: it is built here and never written to
+        again. A caller that means to mutate it must copy it first.
         """
         scheme_name = self.viz.vis_state.get("tendons", {}).get("color_by", "function")
+        key = (scheme_name, self._tendon_generation)
+        cached = self._tendon_legend_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
         scheme = self._actuator_color_schemes.get(scheme_name, {})
         group_fn, color_fn = scheme.get("group"), scheme.get("color")
         if group_fn is None or color_fn is None:
-            return {}, 0
+            self._tendon_legend_cache = (key, ({}, 0))
+            return self._tendon_legend_cache[1]
 
         groups: Dict[str, Dict[str, object]] = {}
         unclassified = 0
         for act_id in sorted(self._tendon_act_to_ten):
+            # No `name is None` guard: build_actuator_tendon_map already skips an unnamed
+            # actuator, so no key here can have one. (Defensive re-checking would read as live
+            # error handling for a case the builder makes unreachable.)
             name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, act_id)
-            if name is None:
-                continue
             group = group_fn(name)
             if group in ("unknown", "non_leg"):
                 unclassified += 1
                 continue
             entry = groups.setdefault(group, {"color": color_fn(name), "count": 0})
             entry["count"] += 1
+        self._tendon_legend_cache = (key, (groups, unclassified))
         return groups, unclassified
 
     def scene_message(self) -> Dict:

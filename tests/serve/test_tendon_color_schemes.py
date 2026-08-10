@@ -172,8 +172,9 @@ def test_scheme_touches_rgb_only_not_alpha_or_width(sess):
 
 
 def test_a_colour_functions_own_alpha_is_ignored():
-    """``apply_tendon_activation`` writes ``base_rgba[act] * [1, 1, 1, alpha]``, so the alpha a
-    colour function returns is discarded and replaced by the activation-derived one. Two
+    """``apply_tendon_activation`` takes RGB from ``base_rgba[act]`` and SETS the alpha from the
+    activation -- it does not multiply the base colour's alpha into it -- so the alpha a colour
+    function returns is discarded entirely rather than scaling anything. Two
     schemes differing ONLY in the alpha they return must render identically -- otherwise a
     palette could quietly override activation brightness, which is the one thing colour must
     not do. Uses rgba 4-tuples because a hex string can't express an alpha at all."""
@@ -321,3 +322,81 @@ def test_a_scheme_with_group_but_no_color_reports_no_groups_and_does_not_raise(s
     scene = sess.scene_message()
     assert scene["tendon_color_groups"] == {}
     assert scene["tendon_unclassified"] == 0
+
+
+# -- the legend memo (fix 2) -------------------------------------------------------------------
+
+
+def test_the_legend_is_not_recomputed_for_an_unchanged_scheme(sess):
+    """``scene_message`` runs once per PUBLISHED FRAME, and on the real fly model the legend was
+    1.00 ms of its 1.36 ms -- ~9% of a 10.96 ms render -- rebuilding a byte-identical dict. The
+    memo is what removes that, so a repeat call must not re-enter the grouping loop at all.
+
+    Counts calls to the scheme's ``group`` function rather than timing anything, so the check is
+    deterministic."""
+    calls = []
+    sess._actuator_color_schemes["counted"] = {
+        "color": lambda n: "#0000ff",
+        "group": lambda n: calls.append(n) or "g",
+    }
+    sess.viz.vis_state["tendons"]["color_by"] = "counted"
+    first = sess.scene_message()["tendon_color_groups"]
+    n_after_first = len(calls)
+    assert n_after_first > 0, "the legend was never computed even once"
+    again = sess.scene_message()["tendon_color_groups"]
+    assert len(calls) == n_after_first, (
+        f"the legend was recomputed on a repeat call ({len(calls)} group() calls, expected "
+        f"{n_after_first}) -- the memo is not being hit"
+    )
+    assert again == first
+
+
+def test_a_color_by_change_while_tendons_are_disabled_still_gets_a_fresh_legend(sess):
+    """The trap that makes the naive memo wrong. Invalidating only inside
+    ``_rebuild_tendon_colors`` is not enough: that method is not reached while
+    ``tendons.enabled`` is False (the DEFAULT), so a scheme change made with tendons off would
+    keep serving the previous scheme's legend -- and the client reads the legend exactly on
+    connect and after a ``color_by`` change, i.e. precisely then. The key must include
+    ``color_by`` itself."""
+    assert sess.viz.vis_state["tendons"].get("enabled") is False, (
+        "this test's whole premise is that tendons are DISABLED, so _rebuild_tendon_colors is "
+        "never reached and the generation counter never moves"
+    )
+    sess.viz.vis_state["tendons"]["color_by"] = "byname"
+    gen_before = sess._tendon_generation
+    byname = sess.scene_message()["tendon_color_groups"]
+    assert set(byname) == {"first", "second"}
+
+    sess._actuator_color_schemes["single"] = {
+        "color": lambda n: "#00ff00",
+        "group": lambda n: "one_group",
+    }
+    sess.viz.vis_state["tendons"]["color_by"] = "single"
+    single = sess.scene_message()["tendon_color_groups"]
+    assert sess._tendon_generation == gen_before, (
+        "the generation counter moved, so this test no longer exercises the color_by half of "
+        "the memo key -- something now rebuilds the tendon colours with tendons disabled"
+    )
+    assert set(single) == {"one_group"}, (
+        f"got {sorted(single)} -- a stale legend was served for the new scheme"
+    )
+
+
+def test_the_legend_follows_a_model_swap_even_under_an_unchanged_scheme(sess):
+    """The other half of the key. ``color_by`` alone would be stale across a ``swap_model``,
+    which changes which actuators exist; the generation counter (bumped in
+    ``_rebuild_tendon_colors``, the sole assignment site of ``_tendon_act_to_ten``) covers it."""
+    primary = mujoco.MjModel.from_xml_string(_XML)
+    alt = mujoco.MjModel.from_xml_string(_ALT_XML)
+    s = Session(model=primary, alt_model=alt, width=64, height=48,
+                actuator_color_schemes=_SCHEMES)
+    try:
+        s.viz.vis_state["tendons"]["color_by"] = "byname"
+        assert set(s.scene_message()["tendon_color_groups"]) == {"first", "second"}
+        s.swap_model("alt")
+        assert s.scene_message()["tendon_color_groups"] == {}, (
+            "the legend still reports the primary model's groups after a swap -- the "
+            "generation half of the memo key is not invalidating"
+        )
+    finally:
+        s.close()

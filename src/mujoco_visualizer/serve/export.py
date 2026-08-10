@@ -318,8 +318,18 @@ class ExportJob(threading.Thread):
                 default_tendon_ctrl_full_scale,
             )
 
+            # driven_ids: exactly the filter Session._rebuild_tendon_colors applies, passed to
+            # the same shared builder rather than restated here. self._ctrl_map already holds
+            # the by-name mapping (see __init__, and its use in
+            # _apply_tendon_activation_frame), and it is the only thing that ever writes this
+            # job's vis_ctrl -- so an actuator absent from it has structurally-zero activation
+            # and its tendon must be hidden, not palette-coloured. Without this the exported
+            # video showed ~260 coloured reference-ghost duplicate tendons the live preview
+            # never did.
             self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
-                self._model, self._actuator_color_fn
+                self._model,
+                self._actuator_color_fn,
+                driven_ids={int(i) for i in self._ctrl_map if int(i) >= 0},
             )
             self._tendon_default_ctrl_full_scale = default_tendon_ctrl_full_scale(
                 self._model, self._tendon_act_to_ten

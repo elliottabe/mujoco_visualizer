@@ -20,7 +20,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
 import mujoco
 import numpy as np
@@ -196,6 +196,7 @@ def add_arrow_to_scene(
 def build_actuator_tendon_map(
     model: mujoco.MjModel,
     actuator_color_fn: Optional[Callable] = None,
+    driven_ids: Optional[Set[int]] = None,
 ) -> Tuple[Dict[int, int], np.ndarray]:
     """``{actuator id: tendon id}`` for every actuator whose transmission is a tendon, plus a
     ``(model.nu, 4)`` base RGBA array carrying each such actuator's colour.
@@ -211,6 +212,29 @@ def build_actuator_tendon_map(
     function at all, falls back to solid red -- the same fallback
     :meth:`Visualizer.render_video_pan` already used before this map-building loop was
     extracted out of it.
+
+    *driven_ids*, when given, is the set of actuator ids on *model* that some primary ctrl
+    column actually drives (i.e. the non-negative entries of a :func:`build_ctrl_name_map`
+    result). An actuator absent from it is OMITTED from the returned map, because nothing ever
+    writes its activation: it is structurally zero for the life of the caller, so its tendon
+    carries no signal at all and drawing it palette-coloured states something the data does
+    not. Since :func:`apply_tendon_activation` already hides every tendon absent from
+    ``act_to_ten.values()``, omitting here IS hiding -- no new code path. On the fly
+    reference-ghost pair that is ~260 dim duplicate tendons drawn directly over the muscles they
+    mimic; on a single-model session every primary name matches and nothing is dropped.
+
+    That rule lives HERE, in the shared builder, rather than as a post-filter at a call site,
+    because it has more than one caller and the two must not diverge:
+    ``Session._rebuild_tendon_colors`` (serve/session.py) drives the live preview and
+    ``ExportJob`` (serve/export.py) renders video from its own ``Visualizer`` on its own thread.
+    While the filter lived on the Session only, exporting with the reference ghost active wrote
+    coloured duplicate tendons into the video that the preview never showed. Same reasoning as
+    :func:`build_ctrl_name_map`, which was extracted for those same two callers so the
+    name-matching rule could not drift between them. Expressed in terms of ctrl columns rather
+    than a name suffix so this package needs no knowledge of what a ghost is.
+
+    When *driven_ids* is ``None`` nothing is filtered -- exactly the pre-existing behaviour,
+    which ``render_video_pan`` and other single-model callers holding no ctrl map still want.
     """
     act_to_ten: Dict[int, int] = {}
     base_rgba = np.zeros((model.nu, 4), dtype=np.float32)
@@ -218,6 +242,8 @@ def build_actuator_tendon_map(
     for i in range(model.nu):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
         if name is None:
+            continue
+        if driven_ids is not None and i not in driven_ids:
             continue
         trntype = int(model.actuator_trntype[i])
         trnid = model.actuator_trnid[i, 0]
