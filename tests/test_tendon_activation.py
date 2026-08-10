@@ -164,6 +164,13 @@ def test_apply_tendon_activation_varies_with_ctrl():
 
 
 def test_apply_tendon_activation_respects_tendon_baseline():
+    """Baseline blends into the SAME ``norm`` that drives BOTH alpha and width (see the
+    function's docstring) -- asserting only alpha here would leave the width half of that
+    contract unguarded. That gap was real: the reviewer changed the width line from
+    ``tendon_min_width + width_range * norm`` to ``... * raw`` (dropping the baseline blend
+    from width alone) and every existing test, including an earlier version of this one that
+    checked alpha only, stayed green. See the task report's "Fix round 2" section for the
+    verbatim failure once width is asserted here too."""
     model = mujoco.MjModel.from_xml_string(_XML)
     act_to_ten, base_rgba = build_actuator_tendon_map(model)
     t_a = _tendon_id(model, "t_a")
@@ -174,6 +181,12 @@ def test_apply_tendon_activation_respects_tendon_baseline():
     )
     # ctrl == 0 with baseline 0.3 must land at exactly the baseline, not at alpha_min/zero.
     assert model.tendon_rgba[t_a, 3] == pytest.approx(0.3)
+    # Width: same norm (0.3), interpolated between the function's own defaults
+    # (tendon_min_width=0.0005, tendon_width=0.003) -- not left at tendon_min_width, which is
+    # exactly what dropping the baseline blend from the width line alone would produce (norm
+    # would still be reported via alpha, but width would use raw=0.0 instead).
+    expected_width = 0.0005 + (0.003 - 0.0005) * 0.3
+    assert model.tendon_width[t_a] == pytest.approx(expected_width)
 
 
 def test_apply_tendon_activation_floors_alpha_at_alpha_min():
