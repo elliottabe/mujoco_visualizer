@@ -287,8 +287,37 @@ def test_unclassified_actuators_are_counted_separately(sess):
     assert scene["tendon_unclassified"] == 1
 
 
-def test_uniform_scheme_reports_no_groups(sess):
+def test_an_unregistered_scheme_name_reports_no_groups(sess):
+    """'uniform' is deliberately never registered in _SCHEMES -- it means "no scheme", which
+    resolves to the solid-red fallback -- so this reaches the legend through the unregistered-name
+    path (scheme = {}, so both color_fn and group_fn are None)."""
     sess.viz.vis_state["tendons"]["color_by"] = "uniform"
+    scene = sess.scene_message()
+    assert scene["tendon_color_groups"] == {}
+    assert scene["tendon_unclassified"] == 0
+
+
+def test_a_scheme_with_color_but_no_group_reports_no_groups_and_does_not_raise(sess):
+    """Pins the ``group_fn is None`` half of the guard in ``_tendon_legend``. Without it,
+    ``group_fn(name)`` would be called with ``group_fn is None`` and raise ``TypeError`` --
+    inside ``scene_message``, which runs at frame rate on the simulation thread."""
+    sess._actuator_color_schemes["color_only"] = {
+        "color": lambda n: "#0000ff",
+    }
+    sess.viz.vis_state["tendons"]["color_by"] = "color_only"
+    scene = sess.scene_message()
+    assert scene["tendon_color_groups"] == {}
+    assert scene["tendon_unclassified"] == 0
+
+
+def test_a_scheme_with_group_but_no_color_reports_no_groups_and_does_not_raise(sess):
+    """Pins the ``color_fn is None`` half of the guard in ``_tendon_legend``. Without it,
+    ``color_fn(name)`` would be called with ``color_fn is None`` and raise ``TypeError`` --
+    inside ``scene_message``, which runs at frame rate on the simulation thread."""
+    sess._actuator_color_schemes["group_only"] = {
+        "group": lambda n: "first",
+    }
+    sess.viz.vis_state["tendons"]["color_by"] = "group_only"
     scene = sess.scene_message()
     assert scene["tendon_color_groups"] == {}
     assert scene["tendon_unclassified"] == 0
