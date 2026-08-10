@@ -26,7 +26,11 @@ from mujoco_visualizer.render_settings import PRESET_NAME_RE
 from mujoco_visualizer.serve.backends import CpuBackend, PhysicsBackend, UnknownKeyframe
 from mujoco_visualizer.serve.controls import actuator_group_map, build_control_tree
 from mujoco_visualizer.serve.locks import build_joint_qpos_map
-from mujoco_visualizer.visualizer import _apply_forces_vis
+from mujoco_visualizer.visualizer import (
+    _apply_forces_vis,
+    apply_tendon_activation,
+    build_actuator_tendon_map,
+)
 
 
 class Diverged(RuntimeError):
@@ -224,6 +228,7 @@ class Session:
         # why a stale map here is exactly the silent-corruption failure mode this exists to
         # avoid.
         self._ctrl_map = self._build_ctrl_map()
+        self._rebuild_tendon_state()
 
         self._tree = build_control_tree(self.model)
         self._group_of = actuator_group_map(self._tree)
@@ -461,6 +466,76 @@ class Session:
             dtype=np.int64,
         )
 
+    def _rebuild_tendon_state(self) -> None:
+        """(Re)compute everything :meth:`_apply_tendon_activation_vis` needs from the CURRENTLY
+        ACTIVE model: the actuator->tendon map/colours, a snapshot of the model's own
+        tendon_rgba/tendon_width to restore to when the group is disabled, and a fixed
+        per-session ``ctrl_max`` to normalise activation by.
+
+        Called from ``__init__`` and again from :meth:`swap_model`, exactly like
+        :meth:`_build_ctrl_map` right above each call site -- the reference-ghost swap roughly
+        doubles ``ntendon`` (260 -> 520 on the real models), so a map/snapshot built against the
+        OLD model would address the wrong tendons (or go out of range) on the new one. Unlike
+        ``_ctrl_map``, nothing here is matched by NAME across the two models: this map is used
+        only against whichever model is currently active, never to translate an id from one
+        model to the other, so there is no primary/alt pairing to get wrong here.
+
+        ``ctrl_max`` is fixed once here, not recomputed every frame: it is the largest
+        ``|ctrlrange|`` bound declared by any tendon-driving, ctrl-limited actuator on this
+        model, falling back to 1.0 if none of them declare one. A per-FRAME max (the live
+        loop's ctrl has no lookahead across frames the way ``render_video_pan``'s whole ``ctrls``
+        array does) would make every frame's single brightest muscle equally bright regardless
+        of how active the animal actually is that frame -- a quiet frame would look identical
+        to a maximal one. Anchoring to the model's own declared control range instead gives an
+        absolute scale that a quiet frame renders as quiet.
+        """
+        self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
+            self.model, getattr(self.viz, "actuator_color_fn", None)
+        )
+        self._tendon_orig_rgba = self.model.tendon_rgba.copy()
+        self._tendon_orig_width = self.model.tendon_width.copy()
+        bounds = [
+            max(
+                abs(float(self.model.actuator_ctrlrange[a, 0])),
+                abs(float(self.model.actuator_ctrlrange[a, 1])),
+            )
+            for a in self._tendon_act_to_ten
+            if bool(self.model.actuator_ctrllimited[a])
+        ]
+        self._tendon_ctrl_max = max(bounds) if bounds else 1.0
+
+    def _apply_tendon_activation_vis(self) -> None:
+        """Drive ``vis_state['tendons']`` from ``data.ctrl`` for the frame about to be rendered.
+
+        Tolerates a PARTIAL ``vis_state['tendons']`` dict -- every field is read with
+        ``.get(..., default)``, never indexed directly -- because ``render.set`` merges one
+        wire key at a time (see ``Session.apply_render``) and a settings preset can likewise
+        mention only some of this group's fields.
+
+        Disabling does not merely stop updating the tendons: it actively restores
+        ``model.tendon_rgba``/``model.tendon_width`` to this model's own values, every frame
+        the group is off, not just the frame it was switched off on. A live loop has no
+        natural "end of clip" the way ``render_video_pan`` does to restore once after its last
+        frame -- leaving the LAST frame's activation frozen on screen the moment the toggle
+        flips off would be a confident, wrong picture with nothing to signal it changed.
+        """
+        tendons = self.viz.vis_state.get("tendons", {})
+        if not tendons.get("enabled", False):
+            self.model.tendon_rgba[:] = self._tendon_orig_rgba
+            self.model.tendon_width[:] = self._tendon_orig_width
+            return
+        apply_tendon_activation(
+            self.model,
+            self.data.ctrl,
+            self._tendon_act_to_ten,
+            self._tendon_base_rgba,
+            tendon_width=tendons.get("max_width", 0.003),
+            tendon_min_width=tendons.get("min_width", 0.0005),
+            tendon_alpha_min=tendons.get("min_alpha", 0.05),
+            tendon_baseline=tendons.get("baseline", 0.0),
+            ctrl_max=self._tendon_ctrl_max,
+        )
+
     def set_qpos(self, qpos: Sequence[float], ctrl: Optional[Sequence[float]] = None) -> None:
         """Write state directly, no stepping. Used by replay scrubbing.
 
@@ -530,6 +605,7 @@ class Session:
     # -- rendering -------------------------------------------------------------
 
     def render(self) -> np.ndarray:
+        self._apply_tendon_activation_vis()
         return self.viz.render_with(self._renderer, camera=self._camera)
 
     def encode(self, frame: np.ndarray) -> bytes:
@@ -735,6 +811,7 @@ class Session:
         # `_carry_vis_state_across_swap`'s own docstring calls out for `forces`, and the one
         # `loop.py` guards against for its joint map on this same swap.
         self._ctrl_map = self._build_ctrl_map()
+        self._rebuild_tendon_state()
 
     def load_settings(self, name: str) -> None:
         """Load a bundled OR user settings preset by name.

@@ -1,0 +1,320 @@
+"""``vis_state['tendons']`` drives muscle-tendon activation colouring/thickening in the LIVE
+browser path -- the per-frame counterpart to ``Visualizer.render_video_pan``'s offline muscle
+visualisation (see ``tests/test_tendon_activation.py`` for the extracted functions themselves).
+
+Unlike every render-only ``vis_state`` group, this one:
+
+1. Is driven by ``data.ctrl`` -- the recorded replay control signal now written there by a
+   sibling task -- not by anything baked into the model ahead of time.
+2. Must actively RESTORE the model's own tendon_rgba/tendon_width the moment it is disabled,
+   every frame it stays disabled, not just leave the last-drawn activation frozen on screen
+   (see ``Session._apply_tendon_activation_vis``'s docstring for why "looks plausible" is
+   exactly the failure mode here).
+3. Caches an actuator->tendon map that MUST be rebuilt on a reference-ghost model swap, the same
+   way ``Session._ctrl_map`` already is -- a stale map addresses the wrong tendons (or goes out
+   of range entirely) on a model with a different ``ntendon``.
+"""
+
+import mujoco
+import numpy as np
+import pytest
+
+from mujoco_visualizer.serve.session import Session
+
+_XML = """
+<mujoco>
+  <worldbody>
+    <light pos="0 0 2"/>
+    <geom name="floor" type="plane" size="1 1 0.1"/>
+    <site name="anchor_a" pos="-0.3 0 0.4" size="0.01"/>
+    <site name="anchor_b" pos="0.3 0 0.4" size="0.01"/>
+    <site name="anchor_free" pos="0 0.5 0.4" size="0.01"/>
+    <body name="box_a" pos="-0.3 0 0.6">
+      <joint name="slide_a" type="slide" axis="0 0 1"/>
+      <geom name="box_a_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_a" pos="0 0 0" size="0.01"/>
+    </body>
+    <body name="box_b" pos="0.3 0 0.6">
+      <joint name="slide_b" type="slide" axis="0 0 1"/>
+      <geom name="box_b_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_b" pos="0 0 0" size="0.01"/>
+    </body>
+    <body name="box_free" pos="0 0.5 0.6">
+      <joint name="slide_free" type="slide" axis="0 0 1"/>
+      <geom name="box_free_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_free" pos="0 0 0" size="0.01"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="t_a" width="0.003" rgba="1 0 0 1">
+      <site site="anchor_a"/><site site="tip_a"/>
+    </spatial>
+    <spatial name="t_b" width="0.00015" rgba="0 1 0 1">
+      <site site="anchor_b"/><site site="tip_b"/>
+    </spatial>
+    <spatial name="t_free" width="0.002" rgba="0 0 1 1">
+      <site site="anchor_free"/><site site="tip_free"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="m_a" tendon="t_a" ctrlrange="-1 1"/>
+    <motor name="m_b" tendon="t_b" ctrlrange="-1 1"/>
+  </actuator>
+</mujoco>
+"""
+
+
+@pytest.fixture
+def sess():
+    model = mujoco.MjModel.from_xml_string(_XML)
+    s = Session(model=model, width=64, height=48)
+    yield s
+    s.close()
+
+
+def _tendon_id(model, name):
+    return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_TENDON, name)
+
+
+# -- disabled by default, and rendering does not require it to be touched at all --------------
+
+
+def test_tendons_disabled_by_default_render_does_not_change_tendon_state(sess):
+    orig_rgba = sess.model.tendon_rgba.copy()
+    orig_width = sess.model.tendon_width.copy()
+    sess.data.ctrl[:] = [0.9, 0.9]
+    sess.render()
+    assert list(sess.model.tendon_rgba.flatten()) == pytest.approx(list(orig_rgba.flatten()))
+    assert list(sess.model.tendon_width) == pytest.approx(list(orig_width))
+
+
+# -- enabling drives alpha/width from data.ctrl, and two different ctrl vectors give two
+#    different results -------------------------------------------------------------------------
+
+
+def test_enabling_colours_muscle_tendons_from_data_ctrl(sess):
+    t_a = _tendon_id(sess.model, "t_a")
+    sess.viz.vis_state["tendons"]["enabled"] = True
+    sess.data.ctrl[:] = [1.0, 0.0]
+    sess.render()
+    assert sess.model.tendon_rgba[t_a, 3] == pytest.approx(1.0)
+    assert sess.model.tendon_width[t_a] == pytest.approx(
+        sess.viz.vis_state["tendons"]["max_width"]
+    )
+
+
+def test_two_different_ctrl_vectors_produce_two_different_alpha_and_width(sess):
+    """The load-bearing 'activation actually varies with ctrl' reversion test for the LIVE
+    path -- see the task report for the verbatim before/after."""
+    t_a = _tendon_id(sess.model, "t_a")
+    sess.viz.vis_state["tendons"]["enabled"] = True
+
+    sess.data.ctrl[:] = [0.1, 0.0]
+    sess.render()
+    low_alpha = float(sess.model.tendon_rgba[t_a, 3])
+    low_width = float(sess.model.tendon_width[t_a])
+
+    sess.data.ctrl[:] = [0.9, 0.0]
+    sess.render()
+    high_alpha = float(sess.model.tendon_rgba[t_a, 3])
+    high_width = float(sess.model.tendon_width[t_a])
+
+    assert high_alpha > low_alpha
+    assert high_width > low_width
+
+
+def test_non_muscle_tendon_is_hidden_while_enabled(sess):
+    t_free = _tendon_id(sess.model, "t_free")
+    sess.viz.vis_state["tendons"]["enabled"] = True
+    sess.data.ctrl[:] = [0.5, 0.5]
+    sess.render()
+    assert sess.model.tendon_rgba[t_free, 3] == pytest.approx(0.0)
+
+
+# -- restore-on-disable: the load-bearing test for this feature ---------------------------------
+
+
+def test_disabling_restores_the_models_own_tendon_state_not_the_last_activation(sess):
+    """The load-bearing 'restore-on-disable' reversion test -- see the task report for the
+    verbatim before/after result of skipping the restore-on-disable branch."""
+    t_a = _tendon_id(sess.model, "t_a")
+    t_free = _tendon_id(sess.model, "t_free")
+    orig_rgba = sess.model.tendon_rgba.copy()
+    orig_width = sess.model.tendon_width.copy()
+
+    sess.viz.vis_state["tendons"]["enabled"] = True
+    sess.data.ctrl[:] = [0.9, 0.9]
+    sess.render()
+    # Sanity: activation actually moved the model away from its original values, so the
+    # restore below is provably doing something, not vacuously matching by never having moved.
+    assert sess.model.tendon_rgba[t_a, 3] != pytest.approx(float(orig_rgba[t_a, 3]))
+    assert sess.model.tendon_rgba[t_free, 3] == pytest.approx(0.0)
+    assert float(orig_rgba[t_free, 3]) != pytest.approx(0.0)  # t_free starts visible in the XML
+
+    sess.viz.vis_state["tendons"]["enabled"] = False
+    sess.render()
+
+    assert list(sess.model.tendon_rgba.flatten()) == pytest.approx(list(orig_rgba.flatten()))
+    assert list(sess.model.tendon_width) == pytest.approx(list(orig_width))
+
+
+def test_disabling_keeps_restoring_on_every_subsequent_frame_not_just_the_first(sess):
+    orig_rgba = sess.model.tendon_rgba.copy()
+    sess.viz.vis_state["tendons"]["enabled"] = True
+    sess.data.ctrl[:] = [0.9, 0.9]
+    sess.render()
+    sess.viz.vis_state["tendons"]["enabled"] = False
+    for _ in range(3):
+        sess.render()
+        assert list(sess.model.tendon_rgba.flatten()) == pytest.approx(
+            list(orig_rgba.flatten())
+        )
+
+
+# -- partial dicts must not raise ---------------------------------------------------------------
+#
+# apply_render/load_settings both merge one key at a time into an already fully-populated
+# dict (see Visualizer.__init__), so a wire-level partial dict can never actually leave
+# vis_state['tendons'] itself partial. The scenario that WOULD leave it partial -- a settings
+# file saved before some field existed, or any caller that assigns vis_state['tendons']
+# wholesale instead of merging -- is what test_apply_render_with_a_single_tendons_key_does_not_
+# raise's sibling below exercises directly, bypassing the merge machinery entirely.
+
+
+def test_a_wholesale_partial_tendons_dict_does_not_raise(sess):
+    """Directly replaces vis_state['tendons'] with a one-key dict -- as a settings file
+    written before this feature's other four fields existed would, once loaded by a future
+    version of load_settings, or as any caller bypassing apply_render's per-key merge would --
+    to prove the apply path itself tolerates a partial dict, not merely that apply_render's own
+    merge happens to never produce one."""
+    sess.viz.vis_state["tendons"] = {"enabled": True}
+    sess.data.ctrl[:] = [0.5, 0.5]
+    sess.render()  # must not raise despite max_width/min_width/min_alpha/baseline missing
+
+
+def test_apply_render_with_a_single_tendons_key_does_not_raise(sess):
+    # Captured BEFORE render(): rendering while enabled mutates model.tendon_width for the
+    # muscle tendons, so reading the model's OWN widths back afterwards would no longer show
+    # this MJCF's original values -- the unmentioned vis_state fields are what is under test.
+    expected_max_width = float(sess.model.tendon_width.max())
+
+    sess.apply_render({"tendons.enabled": True})
+    sess.data.ctrl[:] = [0.5, 0.5]
+    sess.render()  # must not raise despite max_width/min_width/min_alpha/baseline unmentioned
+    assert sess.viz.vis_state["tendons"]["enabled"] is True
+    # Unmentioned fields keep their construction-time defaults, not some filled-in placeholder.
+    assert sess.viz.vis_state["tendons"]["max_width"] == pytest.approx(expected_max_width)
+
+
+def test_apply_render_with_only_baseline_leaves_other_tendons_fields_untouched(sess):
+    sess.apply_render({"tendons.min_alpha": 0.33})
+    sess.apply_render({"tendons.baseline": 0.2})
+    assert sess.viz.vis_state["tendons"]["min_alpha"] == pytest.approx(0.33)
+    assert sess.viz.vis_state["tendons"]["baseline"] == pytest.approx(0.2)
+    assert sess.viz.vis_state["tendons"]["enabled"] is False  # never mentioned, stayed default
+
+
+# -- protocol: 'tendons' must be an accepted render.set root -------------------------------------
+
+
+def test_render_set_tendons_key_is_accepted_by_parse_command():
+    from mujoco_visualizer.serve.protocol import parse_command
+
+    cmd = parse_command({"t": "render", "set": {"tendons.enabled": True}})
+    assert cmd == {"t": "render", "set": {"tendons.enabled": True}}
+
+
+# -- the reference-ghost swap must rebuild the tendon map, never reuse it -----------------------
+
+_ALT_XML = """
+<mujoco>
+  <worldbody>
+    <light pos="0 0 2"/>
+    <geom name="floor" type="plane" size="1 1 0.1"/>
+    <site name="anchor_c" pos="0 0 0.4" size="0.01"/>
+    <body name="box_c" pos="0 0 0.6">
+      <joint name="slide_c" type="slide" axis="0 0 1"/>
+      <geom name="box_c_geom" type="box" size="0.05 0.05 0.05"/>
+      <site name="tip_c" pos="0 0 0" size="0.01"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="t_c" width="0.001" rgba="1 1 0 1">
+      <site site="anchor_c"/><site site="tip_c"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="m_c" tendon="t_c" ctrlrange="-1 1"/>
+  </actuator>
+</mujoco>
+"""
+
+
+@pytest.fixture
+def tendon_swap_session():
+    primary = mujoco.MjModel.from_xml_string(_XML)
+    alt = mujoco.MjModel.from_xml_string(_ALT_XML)
+    s = Session(model=primary, alt_model=alt, width=64, height=48)
+    yield s
+    s.close()
+
+
+def test_swap_model_rebuilds_the_tendon_map_for_the_smaller_alt_model(tendon_swap_session):
+    """The load-bearing 'swap rebuild' reversion test. ``alt`` has ntendon=1 where ``primary``
+    has ntendon=3 -- a map/snapshot left over from primary would either colour the wrong tendon
+    on alt or index straight past the end of its (shorter) tendon_rgba/tendon_width arrays. See
+    the task report for the verbatim IndexError this guards against."""
+    s = tendon_swap_session
+    s.viz.vis_state["tendons"]["enabled"] = True
+    s.data.ctrl[:] = [0.5, 0.5]
+    s.render()  # primary: exercise the map once before swapping away from it
+
+    s.swap_model("alt")
+    assert s.model.ntendon == 1
+
+    t_c = _tendon_id(s.model, "t_c")
+    s.data.ctrl[:] = [1.0]
+    s.render()  # must not raise -- and must colour t_c, the ONLY tendon on this model
+    assert s.model.tendon_rgba[t_c, 3] == pytest.approx(1.0)
+    assert s.model.tendon_width[t_c] == pytest.approx(
+        s.viz.vis_state["tendons"]["max_width"]
+    )
+
+
+def test_swap_model_back_and_forth_keeps_the_tendon_map_correct(tendon_swap_session):
+    s = tendon_swap_session
+    s.viz.vis_state["tendons"]["enabled"] = True
+
+    s.swap_model("alt")
+    t_c = _tendon_id(s.model, "t_c")
+    s.data.ctrl[:] = [1.0]
+    s.render()
+    assert s.model.tendon_rgba[t_c, 3] == pytest.approx(1.0)
+
+    s.swap_model("primary")
+    t_a = _tendon_id(s.model, "t_a")
+    s.data.ctrl[:] = [1.0, 0.0]
+    s.render()
+    assert s.model.ntendon == 3
+    assert s.model.tendon_rgba[t_a, 3] == pytest.approx(1.0)
+
+
+def test_swap_model_rebuilds_the_restore_snapshot_from_the_new_models_own_values(
+    tendon_swap_session,
+):
+    """Disabling after a swap must restore to the model NOW ACTIVE's own tendon_rgba/width, not
+    to a snapshot taken of the model that was active before the swap (wrong shape entirely once
+    ntendon differs, and wrong VALUES even when shapes happen to coincide)."""
+    s = tendon_swap_session
+    alt_orig_rgba = s._models["alt"].tendon_rgba.copy()
+    alt_orig_width = s._models["alt"].tendon_width.copy()
+
+    s.swap_model("alt")
+    s.viz.vis_state["tendons"]["enabled"] = True
+    s.data.ctrl[:] = [1.0]
+    s.render()
+    s.viz.vis_state["tendons"]["enabled"] = False
+    s.render()
+
+    assert list(s.model.tendon_rgba.flatten()) == pytest.approx(list(alt_orig_rgba.flatten()))
+    assert list(s.model.tendon_width) == pytest.approx(list(alt_orig_width))

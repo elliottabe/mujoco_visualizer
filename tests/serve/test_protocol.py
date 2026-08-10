@@ -403,7 +403,7 @@ def test_vis_state_roots_contains_exactly_the_roots_vis_state_actually_has():
     expected = {
         "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
         "camera", "camera_presets", "lighting", "floor", "skybox", "ghost",
-        "geom_render_state", "forces",
+        "geom_render_state", "forces", "tendons",
     }
     assert _VIS_STATE_ROOTS == expected
 
