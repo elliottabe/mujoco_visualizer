@@ -371,15 +371,25 @@ def test_set_qpos_rejects_a_wrong_width_ctrl(sess):
         sess.set_qpos(target, ctrl=[0.1, 0.2, 0.3])  # sess's model has only 2 actuators
 
 
-def test_zero_ctrl_zeros_data_ctrl_directly(sess):
-    """SimLoop's replay write path calls this when a ctrl vector is REJECTED, so "we could
-    not apply this frame's commands" renders as no commands rather than the previous frame's
-    -- see _write_replay_qpos's own comment for why leaving it at the stale value would be a
-    confident, wrong picture once anything downstream (tendon colour, force arrows) reads it."""
-    sess.set_qpos(sess.model.qpos0.copy(), ctrl=[0.4, -0.6])
-    assert sess.data.ctrl[0] != 0.0  # sanity: something non-zero is actually there first
-    sess.zero_ctrl()
-    np.testing.assert_array_equal(sess.data.ctrl, [0.0, 0.0])
+def test_ctrl_width_mismatch_carries_the_expected_width(sess):
+    """SimLoop's replay write path builds an all-zero retry vector from this attribute (see
+    _write_replay_qpos) and hands it back through set_qpos's own ctrl parameter -- there is no
+    separate zero-only method, precisely so a rejected ctrl can only ever be cleared together
+    with the write that pushes it through mj_forward, never on its own."""
+    from mujoco_visualizer.serve.session import CtrlWidthMismatch
+
+    target = sess.model.qpos0.copy()
+    with pytest.raises(CtrlWidthMismatch) as excinfo:
+        sess.set_qpos(target, ctrl=[0.1, 0.2, 0.3])  # sess's model has only 2 actuators
+    assert excinfo.value.expected_width == 2
+
+
+def test_set_qpos_has_no_zero_ctrl_style_sibling_that_bypasses_the_solve(sess):
+    """A rejected ctrl must only ever be clearable BY writing qpos (and so calling
+    mj_forward) in the same call -- confirms no separately-callable method exists that could
+    zero data.ctrl without immediately pushing that zero through the solve."""
+    assert not hasattr(sess, "zero_ctrl")
+    assert not hasattr(sess, "clear_ctrl")
 
 
 # Two models whose actuator NAMES overlap but whose actuator ORDER is deliberately scrambled

@@ -43,7 +43,21 @@ class CtrlWidthMismatch(ValueError):
     qpos``, which must report a bad ctrl width as a non-pausing ``kind='command'`` error while
     still letting a bad qpos get the ``kind='replay'``, paused treatment it deserves) can catch
     exactly this one without also swallowing the other.
+
+    Carries :attr:`expected_width` so a catcher can build a validly-shaped all-zero ctrl
+    vector and hand it straight back through :meth:`Session.set_qpos`'s own ``ctrl``
+    parameter -- the same seam a good ctrl vector takes -- rather than reaching for some other,
+    separately-callable way to clear ``data.ctrl``. There is deliberately no such separate
+    method: zeroing ``data.ctrl`` with nothing to immediately push it through ``mj_forward``
+    afterwards is a footgun a future call site could trip over long after the reasoning why
+    that matters has scrolled out of view, so the only zeroing path left is one that is
+    *always* followed, in the same method call, by the qpos write and forward that make it
+    real for this frame.
     """
+
+    def __init__(self, message: str, expected_width: int):
+        super().__init__(message)
+        self.expected_width = int(expected_width)
 
 
 # mjtWarning splits into two classes that must NOT be conflated:
@@ -477,7 +491,8 @@ class Session:
             if ctrl_arr.shape != (len(self._ctrl_map),):
                 raise CtrlWidthMismatch(
                     f"set_qpos: ctrl has shape {ctrl_arr.shape}, expected "
-                    f"({len(self._ctrl_map)},) to match this session's replay ctrl map"
+                    f"({len(self._ctrl_map)},) to match this session's replay ctrl map",
+                    expected_width=len(self._ctrl_map),
                 )
             self.data.ctrl[:] = 0.0
             valid = self._ctrl_map >= 0
@@ -485,21 +500,6 @@ class Session:
         self.data.qpos[:] = arr
         mujoco.mj_forward(self.model, self.data)
         self._snapshot()
-
-    def zero_ctrl(self) -> None:
-        """Zero ``data.ctrl`` directly. No qpos write, no ``mj_forward`` of its own -- a
-        caller that needs the zeroed value to actually reach the solve must still write qpos
-        (and so trigger ``mj_forward``) afterwards, e.g. via a bare :meth:`set_qpos` call.
-
-        Used by ``SimLoop._write_replay_qpos`` when a replay ctrl vector is REJECTED
-        (:class:`CtrlWidthMismatch`): "we could not apply this frame's commands" must render
-        as NO commands, not as whatever the last successfully-applied frame left in
-        ``data.ctrl``. Leaving it untouched would be a confident, plausible-looking, WRONG
-        picture the moment anything downstream reads ctrl directly (tendon colour/thickness,
-        force arrows computed from the real command) -- frozen-but-plausible activation gives
-        no visible sign anything failed, where zeroed activation does.
-        """
-        self.data.ctrl[:] = 0.0
 
     def reset(self) -> None:
         """Reset to the fly's rest pose, then sync that state from the backend.

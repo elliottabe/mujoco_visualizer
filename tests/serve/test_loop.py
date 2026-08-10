@@ -107,7 +107,6 @@ class FakeSession:
         self._time = 0.0
         self.qpos_writes = []
         self.ctrl_writes = []
-        self.zero_ctrl_calls = 0
         self.model_swaps = []
         self.pose = None
         # For build_joint_qpos_map to exercise a real model. See _LOCK_MODEL/_LOCK_ALT_MODEL
@@ -180,12 +179,6 @@ class FakeSession:
         # point) is untouched; recorded (not just the latest) so a test can tell "never
         # passed" apart from "passed None on this particular tick".
         self.ctrl_writes.append(None if ctrl is None else np.asarray(ctrl).copy())
-
-    def zero_ctrl(self):
-        """Base tracking only (a call count); subclasses that need to prove WHAT got zeroed
-        (as opposed to merely that this was called) track their own state -- see
-        CtrlTrackingFakeSession below."""
-        self.zero_ctrl_calls += 1
 
     def swap_model(self, which):
         self.model_swaps.append(which)
@@ -854,7 +847,8 @@ class WidthMismatchFakeSession(FakeSession):
     def set_qpos(self, qpos, ctrl=None):
         if ctrl is not None and len(ctrl) != self.expected_width:
             raise CtrlWidthMismatch(
-                f"ctrl has {len(ctrl)} entries, expected {self.expected_width}"
+                f"ctrl has {len(ctrl)} entries, expected {self.expected_width}",
+                expected_width=self.expected_width,
             )
         super().set_qpos(qpos, ctrl)
 
@@ -889,12 +883,13 @@ def test_ctrl_width_mismatch_reports_a_command_error_without_pausing():
 
 
 class CtrlTrackingFakeSession(FakeSession):
-    """Tracks a fake ``ctrl_state`` mimicking ``data.ctrl`` (start it wherever the fixture
-    likes, then applied/zeroed exactly like the real thing) -- lets a test tell "the previous
+    """Tracks a fake ``ctrl_state`` mimicking ``data.ctrl`` -- lets a test tell "the previous
     frame's ctrl is still sitting there" apart from "it was actually zeroed" without a real
-    MjModel/MjData. ``expected_width`` starts matching the source so an initial good frame is
-    accepted; a test can change it afterwards to force a later mismatch, standing in for a
-    source/model disagreement that persists rather than resolving on the next tick."""
+    MjModel/MjData. ``expected_width`` is fixed for the life of the session, exactly like the
+    real ``Session._ctrl_map``'s length (always ``len(_primary_actuator_names)``, which never
+    changes across a swap -- only the map's VALUES do, see ``_build_ctrl_map``): a persistent
+    mismatch is something the SOURCE does, by handing over the wrong width, not something this
+    session's own expectation ever does."""
 
     def __init__(self, expected_width):
         super().__init__()
@@ -905,14 +900,37 @@ class CtrlTrackingFakeSession(FakeSession):
         if ctrl is not None:
             if len(ctrl) != self.expected_width:
                 raise CtrlWidthMismatch(
-                    f"ctrl has {len(ctrl)} entries, expected {self.expected_width}"
+                    f"ctrl has {len(ctrl)} entries, expected {self.expected_width}",
+                    expected_width=self.expected_width,
                 )
             self.ctrl_state = np.asarray(ctrl, dtype=np.float64).copy()
         super().set_qpos(qpos, ctrl)
 
-    def zero_ctrl(self):
-        super().zero_ctrl()
-        self.ctrl_state[:] = 0.0
+
+class _PersistentMismatchSource:
+    """A minimal ``TrajectorySource`` whose ``ctrl()`` returns a GOOD width-3 vector for frame
+    0 and a mismatched width-5 vector for every frame after -- a source/model disagreement
+    that persists rather than resolving on the next tick, without moving the SESSION's own
+    expected width (which the real ``Session``'s never does -- see ``CtrlTrackingFakeSession``
+    above). Delegates qpos to a real ``ArrayTrajectorySource`` so clip/frame bounds behave
+    exactly like every other replay test here."""
+
+    def __init__(self, qpos):
+        self._qpos_src = ArrayTrajectorySource(qpos)
+        self.has_ctrl = True
+
+    @property
+    def n_clips(self):
+        return self._qpos_src.n_clips
+
+    def clip_length(self, clip):
+        return self._qpos_src.clip_length(clip)
+
+    def qpos(self, clip, frame):
+        return self._qpos_src.qpos(clip, frame)
+
+    def ctrl(self, clip, frame):
+        return np.full(3, 7.0) if frame == 0 else np.full(5, 9.0)
 
 
 def test_ctrl_width_mismatch_zeroes_ctrl_rather_than_leaving_the_stale_value():
@@ -922,9 +940,8 @@ def test_ctrl_width_mismatch_zeroes_ctrl_rather_than_leaving_the_stale_value():
     anything failed. Also confirms the zeroing does NOT change the error classification: still
     a non-pausing 'command' error with playback running, exactly like the width-mismatch test
     above."""
-    good = np.full((2, 10, 3), 7.0, dtype=np.float32)
-    source = ArrayTrajectorySource(
-        np.arange(2 * 10 * 3, dtype=np.float32).reshape(2, 10, 3), ctrl=good
+    source = _PersistentMismatchSource(
+        np.arange(2 * 10 * 3, dtype=np.float32).reshape(2, 10, 3)
     )
     session = CtrlTrackingFakeSession(expected_width=3)
     loop = SimLoop(session, source=source, fps_cap=1000.0, idle_pause_s=None)
@@ -936,9 +953,6 @@ def test_ctrl_width_mismatch_zeroes_ctrl_rather_than_leaving_the_stale_value():
             "the good frame's ctrl must have been applied first"
         )
 
-        # Now every subsequent write mismatches -- e.g. a post-swap disagreement that does
-        # not resolve on its own.
-        session.expected_width = 5
         loop.submit({"t": "replay", "play": True})
         assert wait_until(lambda: loop.playing and loop.error is not None)
         assert loop.error["kind"] == "command"

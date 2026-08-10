@@ -648,18 +648,22 @@ class SimLoop(threading.Thread):
         model's actuator map disagree, e.g. right after a ghost swap the source has not caught
         up to yet -- is a data-shape problem with the ctrl channel, not evidence the pose itself
         is untrustworthy, so it is caught HERE and reported as a non-pausing ``kind='command'``
-        error, then retried with no ctrl so the pose still updates and playback is not stuck.
-        Anything escaping this method instead gets ``_advance_replay``'s/``_step_replay``'s own
+        error, then retried so the pose still updates and playback is not stuck. Anything
+        escaping this method instead gets ``_advance_replay``'s/``_step_replay``'s own
         ``kind='replay'``, paused treatment -- the wrong one for a bad ctrl width, exactly the
         misclassification ``_apply_lock``'s docstring already describes for a bad lock width.
 
-        The retry explicitly ZEROES ctrl first (:meth:`Session.zero_ctrl`) rather than leaving
-        it at whatever the last successfully-applied frame left behind. "We could not apply
-        this frame's commands" must render as NO commands, not the previous frame's: once
-        anything downstream reads ``data.ctrl`` directly (tendon colour/thickness, force arrows
-        computed from the real command -- both planned, not yet built), a frozen-but-plausible
-        stale value would be a confident, WRONG picture with no visible sign anything failed,
-        where zeroed activation is an honest, noticeable one.
+        The retry passes an EXPLICIT all-zero vector, sized to ``exc.expected_width``, through
+        the exact same ``ctrl`` parameter a good vector takes -- not a separate zero-only
+        mutation applied before a plain qpos write. "We could not apply this frame's commands"
+        must render as NO commands, not the previous frame's: once anything downstream reads
+        ``data.ctrl`` directly (tendon colour/thickness, force arrows computed from the real
+        command -- both planned, not yet built), a frozen-but-plausible stale value would be a
+        confident, WRONG picture with no visible sign anything failed. Routing the zero through
+        ``set_qpos``'s own scatter-then-forward is what makes that impossible to get wrong from
+        here: there is no ``Session`` method that zeroes ``data.ctrl`` without the write that
+        pushes it through ``mj_forward`` in the same call, so no future call site can zero
+        ctrl and then forget the solve.
         """
         raw = self._source.qpos(self._clip, frame)
         qpos = apply_locks(raw, self._locks, self._jmap())
@@ -673,8 +677,7 @@ class SimLoop(threading.Thread):
             self._session.set_qpos(qpos, ctrl)
         except CtrlWidthMismatch as exc:
             self._error = {"t": "error", "kind": "command", "msg": str(exc), "paused": False}
-            self._session.zero_ctrl()
-            self._session.set_qpos(qpos)
+            self._session.set_qpos(qpos, np.zeros(exc.expected_width))
 
     def _advance_replay(self) -> None:
         """Write the current frame, then move the playhead one stride if playing.
