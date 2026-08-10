@@ -85,7 +85,16 @@ _LOCK_WIDE_ALT_MODEL = mujoco.MjModel.from_xml_string(_LOCK_WIDE_ALT_XML)
 
 
 class FakeSession:
-    """Duck-typed stand-in for Session: records calls, renders a 1x1 frame."""
+    """Duck-typed stand-in for Session: records calls, renders a 1x1 frame.
+
+    Why a fake rather than a real ``Session``, beyond speed: a real one constructed OFF the
+    loop thread makes the loop's own ``render()`` raise ``EGL_BAD_ACCESS``, because a GL
+    context is thread-affine. The loop reports that as ``kind='render'`` and pauses, which
+    masks whatever the test was actually about behind an unrelated failure -- so a harness
+    that "just uses the real thing" tends to fail for a reason it did not intend to study.
+    Tests needing real rendering therefore build the ``Session`` on the loop thread, or live
+    in ``tests/serve/test_tendon_vis_live.py`` and drive ``Session`` directly instead.
+    """
 
     def __init__(self, diverge_after=None):
         self.width, self.height = 1, 1
