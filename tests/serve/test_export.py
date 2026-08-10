@@ -723,3 +723,88 @@ def test_sidecar_tendon_activation_applied_is_false_when_tendons_disabled(tmp_pa
     assert side["ctrl_frames_provided"] is True
     assert side["tendon_activation_applied"] is False
     assert side["scene_modifiers_applied"] == 0
+
+
+# --- task 5: explicit actuator_color_fn, the export/preview parity fix --------------------
+
+
+_TENDON_VIS_ON = {
+    "enabled": True, "max_width": 0.05, "min_width": 0.001,
+    "min_alpha": 0.05, "baseline": 0.0, "ctrl_full_scale": 1.0,
+}
+
+
+def test_export_honours_an_explicit_actuator_color_fn(tmp_path):
+    """Export parity. ExportJob builds its OWN Visualizer from a deep copy, so an
+    actuator_color_fn monkey-patched onto the live session's viz could never reach it -- which
+    is why the getattr(viz, "actuator_color_fn", None) this replaced was structurally dead, and
+    an exported video stayed red while the preview showed colours."""
+    model = mujoco.MjModel.from_xml_string(_TENDON_MODEL_XML)
+    qpos = model.qpos0.copy().reshape(1, -1)
+    job = ExportJob(
+        model, None,
+        _vis_state_with_tendons(model, _TENDON_VIS_ON),
+        qpos,
+        path=tmp_path / "coloured", fmt="png", width=128, height=96, fps=10,
+        ctrl_frames=np.array([[1.0]]),
+        primary_actuator_names=["m_a"],
+        actuator_color_fn=lambda name: "#0000ff",
+    )
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+    assert list(job._tendon_base_rgba[0, :3]) == pytest.approx([0.0, 0.0, 1.0])
+
+
+def test_export_without_a_color_fn_still_uses_the_red_fallback(tmp_path):
+    model = mujoco.MjModel.from_xml_string(_TENDON_MODEL_XML)
+    qpos = model.qpos0.copy().reshape(1, -1)
+    job = ExportJob(
+        model, None,
+        _vis_state_with_tendons(model, _TENDON_VIS_ON),
+        qpos,
+        path=tmp_path / "red", fmt="png", width=128, height=96, fps=10,
+        ctrl_frames=np.array([[1.0]]),
+        primary_actuator_names=["m_a"],
+    )
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+    assert list(job._tendon_base_rgba[0, :3]) == pytest.approx([0.85, 0.15, 0.15])
+
+
+def test_live_and_export_agree_on_base_rgba_for_the_same_scheme(tmp_path):
+    """Spec §8 test 7. The preview and the exported video must derive tendon colours from the
+    same array; this is the assertion that fails if the two paths are ever given different
+    colour functions or resolve the scheme differently."""
+    from mujoco_visualizer.serve.session import Session
+
+    colour_fn = lambda name: "#0000ff"  # noqa: E731 -- one expression, used twice below
+
+    model = mujoco.MjModel.from_xml_string(_TENDON_MODEL_XML)
+    live = Session(
+        model=model, width=128, height=96,
+        actuator_color_schemes={"s": {"color": colour_fn, "group": lambda n: "g"}},
+    )
+    try:
+        live.viz.vis_state["tendons"].update(_TENDON_VIS_ON)
+        live.viz.vis_state["tendons"]["color_by"] = "s"
+        live.render()
+        live_rgba = live._tendon_base_rgba.copy()
+    finally:
+        live.close()
+
+    export_model = mujoco.MjModel.from_xml_string(_TENDON_MODEL_XML)
+    job = ExportJob(
+        export_model, None,
+        _vis_state_with_tendons(export_model, _TENDON_VIS_ON),
+        export_model.qpos0.copy().reshape(1, -1),
+        path=tmp_path / "parity", fmt="png", width=128, height=96, fps=10,
+        ctrl_frames=np.array([[1.0]]),
+        primary_actuator_names=["m_a"],
+        actuator_color_fn=colour_fn,
+    )
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+    assert list(job._tendon_base_rgba.flatten()) == pytest.approx(list(live_rgba.flatten()))

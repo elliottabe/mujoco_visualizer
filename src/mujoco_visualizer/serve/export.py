@@ -112,6 +112,7 @@ class ExportJob(threading.Thread):
         ctrl_frames: Optional[Sequence[np.ndarray]] = None,
         primary_actuator_names: Optional[Sequence[str]] = None,
         modify_scene_fns: Optional[Sequence[Callable]] = None,
+        actuator_color_fn: Optional[Callable] = None,
     ):
         super().__init__(name="ExportJob", daemon=True)
         # Deep-copy rather than trust the caller: _make_visualizer mutates this model's
@@ -148,6 +149,16 @@ class ExportJob(threading.Thread):
         self._modify_scene_fns = (
             list(modify_scene_fns) if modify_scene_fns is not None else None
         )
+
+        # Resolved colour function for muscle-tendon base colours, or None for the solid-red
+        # fallback. Explicit rather than read off the visualizer: this job builds its OWN
+        # Visualizer from a deep copy (see _make_visualizer), so the
+        # getattr(viz, "actuator_color_fn", None) this replaced could never observe an attribute
+        # a caller had set on the LIVE viz -- exports stayed red while the preview showed
+        # colours. A resolved function, not a scheme name or a registry, because the choice is
+        # already made when the button is pressed; re-resolving here could disagree with the
+        # preview the export was launched from.
+        self._actuator_color_fn = actuator_color_fn
 
         # ctrl_frames is VISUALISATION-ONLY, exactly like Session._vis_ctrl (see
         # Session.set_qpos's docstring for why data.ctrl is never written from a recorded
@@ -308,7 +319,7 @@ class ExportJob(threading.Thread):
             )
 
             self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
-                self._model, getattr(viz, "actuator_color_fn", None)
+                self._model, self._actuator_color_fn
             )
             self._tendon_default_ctrl_full_scale = default_tendon_ctrl_full_scale(
                 self._model, self._tendon_act_to_ten
