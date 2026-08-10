@@ -1258,6 +1258,14 @@ class Session:
                 for name, (_adr, width) in build_joint_qpos_map(self.model).items()
             ],
             "cameras": self.viz.list_cameras(),
+            # Body names for a camera-tracking dropdown. Rebuilt from the CURRENT model every
+            # call -- cheap, one pass over nbody -- for the same reason `joints` is: a
+            # swap_model() is then reflected with no separate invalidation path. The unnamed
+            # fallback mirrors list_cameras', so a client never receives a null in a name list.
+            "bodies": [
+                mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, i) or f"body{i}"
+                for i in range(self.model.nbody)
+            ],
             # Legend data for a tendon-colour panel. Additive: a client that does not know
             # these keys is unaffected.
             "tendon_color_groups": groups,

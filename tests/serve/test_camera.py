@@ -342,3 +342,35 @@ def test_protocol_rejects_malformed_preset_commands(cmd):
 
     with pytest.raises(CommandError):
         parse_command(cmd)
+
+
+# -- bodies, for camera.trackbody's choices --------------------------------------------------
+
+
+def test_scene_message_lists_body_names(sess):
+    bodies = sess.scene_message()["bodies"]
+    assert "box" in bodies
+    # world is body 0 on every model; it is a legitimate track target and is not filtered.
+    assert len(bodies) == sess.model.nbody
+    assert all(isinstance(name, str) and name for name in bodies)
+
+
+def test_bodies_are_rebuilt_from_the_current_model_after_a_swap():
+    """Rebuilt per call, like `joints` and `cameras`, so a model swap is reflected without a
+    separate invalidation path."""
+    alt_xml = _XML.replace('name="box"', 'name="other_box"').replace(
+        'name="box_geom"', 'name="other_box_geom"'
+    ).replace('name="slide"', 'name="other_slide"')
+    s = Session(
+        model=mujoco.MjModel.from_xml_string(_XML),
+        alt_model=mujoco.MjModel.from_xml_string(alt_xml),
+        width=64,
+        height=48,
+    )
+    try:
+        assert "box" in s.scene_message()["bodies"]
+        s.swap_model("alt")
+        assert "other_box" in s.scene_message()["bodies"]
+        assert "box" not in s.scene_message()["bodies"]
+    finally:
+        s.close()
