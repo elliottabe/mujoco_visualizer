@@ -4,8 +4,13 @@ visualisation (see ``tests/test_tendon_activation.py`` for the extracted functio
 
 Unlike every render-only ``vis_state`` group, this one:
 
-1. Is driven by ``data.ctrl`` -- the recorded replay control signal now written there by a
-   sibling task -- not by anything baked into the model ahead of time.
+1. Is driven by ``Session._vis_ctrl``, a visualisation-only vector -- populated by
+   ``Session.set_qpos``'s ``ctrl`` parameter during replay, and poked directly (as a stand-in
+   for that same seam) in the tests below. It is deliberately NOT ``data.ctrl``: an earlier
+   version of this feature read ``data.ctrl`` directly, back when the replay path also wrote
+   the recorded ctrl there before ``mj_forward`` -- task 13c removed that write (it was
+   perturbing the constraint solve for no requested benefit) and moved this feature's own
+   source along with it, onto the store that write left behind.
 2. Must actively RESTORE the model's own tendon_rgba/tendon_width the moment it is disabled,
    every frame it stays disabled, not just leave the last-drawn activation frozen on screen
    (see ``Session._apply_tendon_activation_vis``'s docstring for why "looks plausible" is
@@ -82,20 +87,20 @@ def _tendon_id(model, name):
 def test_tendons_disabled_by_default_render_does_not_change_tendon_state(sess):
     orig_rgba = sess.model.tendon_rgba.copy()
     orig_width = sess.model.tendon_width.copy()
-    sess.data.ctrl[:] = [0.9, 0.9]
+    sess._vis_ctrl[:] = [0.9, 0.9]
     sess.render()
     assert list(sess.model.tendon_rgba.flatten()) == pytest.approx(list(orig_rgba.flatten()))
     assert list(sess.model.tendon_width) == pytest.approx(list(orig_width))
 
 
-# -- enabling drives alpha/width from data.ctrl, and two different ctrl vectors give two
-#    different results -------------------------------------------------------------------------
+# -- enabling drives alpha/width from the visualisation-only ctrl store, and two different
+#    ctrl vectors give two different results ----------------------------------------------------
 
 
-def test_enabling_colours_muscle_tendons_from_data_ctrl(sess):
+def test_enabling_colours_muscle_tendons_from_vis_ctrl(sess):
     t_a = _tendon_id(sess.model, "t_a")
     sess.viz.vis_state["tendons"]["enabled"] = True
-    sess.data.ctrl[:] = [1.0, 0.0]
+    sess._vis_ctrl[:] = [1.0, 0.0]
     sess.render()
     assert sess.model.tendon_rgba[t_a, 3] == pytest.approx(1.0)
     assert sess.model.tendon_width[t_a] == pytest.approx(
@@ -109,12 +114,12 @@ def test_two_different_ctrl_vectors_produce_two_different_alpha_and_width(sess):
     t_a = _tendon_id(sess.model, "t_a")
     sess.viz.vis_state["tendons"]["enabled"] = True
 
-    sess.data.ctrl[:] = [0.1, 0.0]
+    sess._vis_ctrl[:] = [0.1, 0.0]
     sess.render()
     low_alpha = float(sess.model.tendon_rgba[t_a, 3])
     low_width = float(sess.model.tendon_width[t_a])
 
-    sess.data.ctrl[:] = [0.9, 0.0]
+    sess._vis_ctrl[:] = [0.9, 0.0]
     sess.render()
     high_alpha = float(sess.model.tendon_rgba[t_a, 3])
     high_width = float(sess.model.tendon_width[t_a])
@@ -126,7 +131,7 @@ def test_two_different_ctrl_vectors_produce_two_different_alpha_and_width(sess):
 def test_non_muscle_tendon_is_hidden_while_enabled(sess):
     t_free = _tendon_id(sess.model, "t_free")
     sess.viz.vis_state["tendons"]["enabled"] = True
-    sess.data.ctrl[:] = [0.5, 0.5]
+    sess._vis_ctrl[:] = [0.5, 0.5]
     sess.render()
     assert sess.model.tendon_rgba[t_free, 3] == pytest.approx(0.0)
 
@@ -156,7 +161,7 @@ def test_overriding_ctrl_full_scale_changes_alpha_and_width_for_the_same_ctrl(se
     round 1 -- see the task report for the verbatim before/after of ignoring the override."""
     t_a = _tendon_id(sess.model, "t_a")
     sess.viz.vis_state["tendons"]["enabled"] = True
-    sess.data.ctrl[:] = [0.5, 0.0]
+    sess._vis_ctrl[:] = [0.5, 0.0]
 
     sess.viz.vis_state["tendons"]["ctrl_full_scale"] = 1.0
     sess.render()
@@ -175,6 +180,46 @@ def test_overriding_ctrl_full_scale_changes_alpha_and_width_for_the_same_ctrl(se
     assert alpha_at_full_scale_half == pytest.approx(1.0)
 
 
+# -- a rejected-width replay ctrl must render as INERT, not the previous frame's activation -----
+#
+# Mirrors SimLoop._write_replay_qpos's own CtrlWidthMismatch handling end-to-end through a real
+# Session: a rejected-width ctrl is retried through Session.set_qpos with an explicit all-zero
+# vector, sized to CtrlWidthMismatch.expected_width -- never left as whatever _vis_ctrl held
+# from the last GOOD frame. This is the task-13c counterpart of the restore-on-disable test right
+# below: "we could not apply this frame's commands" must render as NO commands (tendons at their
+# floor alpha/width), not a stale-but-plausible activation frozen on screen.
+
+
+def test_ctrl_width_mismatch_retry_leaves_tendons_inert_not_frozen(sess):
+    from mujoco_visualizer.serve.session import CtrlWidthMismatch
+
+    t_a = _tendon_id(sess.model, "t_a")
+    sess.viz.vis_state["tendons"]["enabled"] = True
+    target = sess.model.qpos0.copy()
+
+    # A good frame: activation elevated above the floor -- proves the retry below is actually
+    # clearing something, not vacuously matching an already-inert tendon.
+    sess.set_qpos(target, ctrl=[0.9, 0.0])
+    sess.render()
+    elevated_alpha = float(sess.model.tendon_rgba[t_a, 3])
+    elevated_width = float(sess.model.tendon_width[t_a])
+    assert elevated_alpha > sess.viz.vis_state["tendons"]["min_alpha"]
+
+    # A rejected-width frame -- wrong length for this 2-actuator model -- retried with an
+    # explicit zero vector, exactly as SimLoop._write_replay_qpos does on CtrlWidthMismatch.
+    with pytest.raises(CtrlWidthMismatch) as excinfo:
+        sess.set_qpos(target, ctrl=[0.1, 0.2, 0.3])
+    sess.set_qpos(target, ctrl=[0.0] * excinfo.value.expected_width)
+    sess.render()
+
+    min_alpha = sess.viz.vis_state["tendons"]["min_alpha"]
+    min_width = sess.viz.vis_state["tendons"]["min_width"]
+    assert sess.model.tendon_rgba[t_a, 3] == pytest.approx(min_alpha)
+    assert sess.model.tendon_width[t_a] == pytest.approx(min_width)
+    assert sess.model.tendon_rgba[t_a, 3] != pytest.approx(elevated_alpha)
+    assert sess.model.tendon_width[t_a] != pytest.approx(elevated_width)
+
+
 # -- restore-on-disable: the load-bearing test for this feature ---------------------------------
 
 
@@ -187,7 +232,7 @@ def test_disabling_restores_the_models_own_tendon_state_not_the_last_activation(
     orig_width = sess.model.tendon_width.copy()
 
     sess.viz.vis_state["tendons"]["enabled"] = True
-    sess.data.ctrl[:] = [0.9, 0.9]
+    sess._vis_ctrl[:] = [0.9, 0.9]
     sess.render()
     # Sanity: activation actually moved the model away from its original values, so the
     # restore below is provably doing something, not vacuously matching by never having moved.
@@ -205,7 +250,7 @@ def test_disabling_restores_the_models_own_tendon_state_not_the_last_activation(
 def test_disabling_keeps_restoring_on_every_subsequent_frame_not_just_the_first(sess):
     orig_rgba = sess.model.tendon_rgba.copy()
     sess.viz.vis_state["tendons"]["enabled"] = True
-    sess.data.ctrl[:] = [0.9, 0.9]
+    sess._vis_ctrl[:] = [0.9, 0.9]
     sess.render()
     sess.viz.vis_state["tendons"]["enabled"] = False
     for _ in range(3):
@@ -232,7 +277,7 @@ def test_a_wholesale_partial_tendons_dict_does_not_raise(sess):
     to prove the apply path itself tolerates a partial dict, not merely that apply_render's own
     merge happens to never produce one."""
     sess.viz.vis_state["tendons"] = {"enabled": True}
-    sess.data.ctrl[:] = [0.5, 0.5]
+    sess._vis_ctrl[:] = [0.5, 0.5]
     sess.render()  # must not raise despite max_width/min_width/min_alpha/baseline missing
 
 
@@ -241,7 +286,7 @@ def test_a_wholesale_tendons_dict_with_only_ctrl_full_scale_does_not_raise(sess)
     carrying ONLY the new ``ctrl_full_scale`` key (no ``enabled`` at all) must not raise
     either."""
     sess.viz.vis_state["tendons"] = {"ctrl_full_scale": 0.6}
-    sess.data.ctrl[:] = [0.5, 0.5]
+    sess._vis_ctrl[:] = [0.5, 0.5]
     sess.render()  # must not raise despite enabled/max_width/min_width/min_alpha/baseline missing
 
 
@@ -252,7 +297,7 @@ def test_apply_render_with_a_single_tendons_key_does_not_raise(sess):
     expected_max_width = float(sess.model.tendon_width.max())
 
     sess.apply_render({"tendons.enabled": True})
-    sess.data.ctrl[:] = [0.5, 0.5]
+    sess._vis_ctrl[:] = [0.5, 0.5]
     sess.render()  # must not raise despite max_width/min_width/min_alpha/baseline unmentioned
     assert sess.viz.vis_state["tendons"]["enabled"] is True
     # Unmentioned fields keep their construction-time defaults, not some filled-in placeholder.
@@ -274,7 +319,7 @@ def test_apply_render_with_only_ctrl_full_scale_does_not_raise_and_takes_effect(
     assert sess.viz.vis_state["tendons"]["enabled"] is False  # never mentioned, stayed default
 
     sess.apply_render({"tendons.enabled": True})
-    sess.data.ctrl[:] = [0.5, 0.0]
+    sess._vis_ctrl[:] = [0.5, 0.0]
     sess.render()  # must not raise despite max_width/min_width/min_alpha/baseline unmentioned
     assert sess.model.tendon_rgba[t_a, 3] == pytest.approx(0.5 / 0.6)  # ctrl / ctrl_full_scale
 
@@ -331,14 +376,14 @@ def test_swap_model_rebuilds_the_tendon_map_for_the_smaller_alt_model(tendon_swa
     the task report for the verbatim IndexError this guards against."""
     s = tendon_swap_session
     s.viz.vis_state["tendons"]["enabled"] = True
-    s.data.ctrl[:] = [0.5, 0.5]
+    s._vis_ctrl[:] = [0.5, 0.5]
     s.render()  # primary: exercise the map once before swapping away from it
 
     s.swap_model("alt")
     assert s.model.ntendon == 1
 
     t_c = _tendon_id(s.model, "t_c")
-    s.data.ctrl[:] = [1.0]
+    s._vis_ctrl[:] = [1.0]
     s.render()  # must not raise -- and must colour t_c, the ONLY tendon on this model
     assert s.model.tendon_rgba[t_c, 3] == pytest.approx(1.0)
     assert s.model.tendon_width[t_c] == pytest.approx(
@@ -352,13 +397,13 @@ def test_swap_model_back_and_forth_keeps_the_tendon_map_correct(tendon_swap_sess
 
     s.swap_model("alt")
     t_c = _tendon_id(s.model, "t_c")
-    s.data.ctrl[:] = [1.0]
+    s._vis_ctrl[:] = [1.0]
     s.render()
     assert s.model.tendon_rgba[t_c, 3] == pytest.approx(1.0)
 
     s.swap_model("primary")
     t_a = _tendon_id(s.model, "t_a")
-    s.data.ctrl[:] = [1.0, 0.0]
+    s._vis_ctrl[:] = [1.0, 0.0]
     s.render()
     assert s.model.ntendon == 3
     assert s.model.tendon_rgba[t_a, 3] == pytest.approx(1.0)
@@ -376,7 +421,7 @@ def test_swap_model_rebuilds_the_restore_snapshot_from_the_new_models_own_values
 
     s.swap_model("alt")
     s.viz.vis_state["tendons"]["enabled"] = True
-    s.data.ctrl[:] = [1.0]
+    s._vis_ctrl[:] = [1.0]
     s.render()
     s.viz.vis_state["tendons"]["enabled"] = False
     s.render()

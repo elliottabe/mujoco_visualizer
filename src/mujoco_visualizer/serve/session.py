@@ -52,12 +52,13 @@ class CtrlWidthMismatch(ValueError):
     Carries :attr:`expected_width` so a catcher can build a validly-shaped all-zero ctrl
     vector and hand it straight back through :meth:`Session.set_qpos`'s own ``ctrl``
     parameter -- the same seam a good ctrl vector takes -- rather than reaching for some other,
-    separately-callable way to clear ``data.ctrl``. There is deliberately no such separate
-    method: zeroing ``data.ctrl`` with nothing to immediately push it through ``mj_forward``
-    afterwards is a footgun a future call site could trip over long after the reasoning why
-    that matters has scrolled out of view, so the only zeroing path left is one that is
-    *always* followed, in the same method call, by the qpos write and forward that make it
-    real for this frame.
+    separately-callable way to clear the stored visualisation ctrl. There is deliberately no
+    such separate method: even though this ctrl is visualisation-only now (it does not feed
+    ``mj_forward`` or the constraint solve -- see :meth:`Session.set_qpos`), a zeroing path
+    reachable outside the one call that also writes qpos is still a footgun a future call site
+    could trip over long after the reasoning why that matters has scrolled out of view. So the
+    only zeroing path left is the same one a good ctrl vector takes, in the same method call
+    that writes qpos.
     """
 
     def __init__(self, message: str, expected_width: int):
@@ -492,16 +493,18 @@ class Session:
     def _rebuild_tendon_state(self) -> None:
         """(Re)compute everything :meth:`_apply_tendon_activation_vis` needs from the CURRENTLY
         ACTIVE model: the actuator->tendon map/colours, a snapshot of the model's own
-        tendon_rgba/tendon_width to restore to when the group is disabled, and a fixed
-        per-session FALLBACK reference scale to normalise activation by.
+        tendon_rgba/tendon_width to restore to when the group is disabled, a fixed per-session
+        FALLBACK reference scale to normalise activation by, and the ``_vis_ctrl`` store itself
+        (see below).
 
         Called from ``__init__`` and again from :meth:`swap_model`, exactly like
         :meth:`_build_ctrl_map` right above each call site -- the reference-ghost swap roughly
-        doubles ``ntendon`` (260 -> 520 on the real models), so a map/snapshot built against the
-        OLD model would address the wrong tendons (or go out of range) on the new one. Unlike
-        ``_ctrl_map``, nothing here is matched by NAME across the two models: this map is used
-        only against whichever model is currently active, never to translate an id from one
-        model to the other, so there is no primary/alt pairing to get wrong here.
+        doubles ``ntendon``/``nu`` (260 -> 520 / 272 -> 544 on the real models), so a
+        map/snapshot/store built against the OLD model would address the wrong tendons (or go
+        out of range) on the new one. Unlike ``_ctrl_map``, nothing here is matched by NAME
+        across the two models: this map is used only against whichever model is currently
+        active, never to translate an id from one model to the other, so there is no
+        primary/alt pairing to get wrong here.
 
         ``_tendon_default_ctrl_full_scale`` is fixed once here, not recomputed every frame, and
         is only ever a FALLBACK -- ``_apply_tendon_activation_vis`` prefers
@@ -520,9 +523,25 @@ class Session:
         self._tendon_default_ctrl_full_scale = default_tendon_ctrl_full_scale(
             self.model, self._tendon_act_to_ten
         )
+        # The visualisation-only ctrl vector :meth:`_apply_tendon_activation_vis` reads,
+        # indexed like ``data.ctrl`` on the CURRENTLY ACTIVE model (one entry per actuator,
+        # active-model order) -- see :meth:`set_qpos`, the only writer. Reset to all-zero here,
+        # not merely resized, on every call: a swap changes ``model.nu`` (272 -> 544 on the
+        # real models), so an old-sized array would be the wrong shape for
+        # ``apply_tendon_activation`` below, and carrying over stale VALUES at whatever
+        # addresses happen to still be in range would colour the new model's tendons from the
+        # old model's last activation instead of leaving them inert until the next replay
+        # frame writes a real one -- the same "stale-but-plausible visual" failure mode
+        # :meth:`_apply_tendon_activation_vis` already guards against on disable.
+        self._vis_ctrl = np.zeros(self.model.nu, dtype=np.float64)
 
     def _apply_tendon_activation_vis(self) -> None:
-        """Drive ``vis_state['tendons']`` from ``data.ctrl`` for the frame about to be rendered.
+        """Drive ``vis_state['tendons']`` from :attr:`_vis_ctrl` for the frame about to be
+        rendered -- never from ``data.ctrl``. ``data.ctrl`` holds whatever the constraint solve
+        actually used, which for a replaying viewer is nothing (:meth:`set_qpos` no longer
+        writes it); ``_vis_ctrl`` is the visualisation-only vector :meth:`set_qpos` maintains
+        instead, and is what this method must colour/thicken tendons from regardless of
+        whether physics is stepping or a recorded clip is scrubbing.
 
         Tolerates a PARTIAL ``vis_state['tendons']`` dict -- every field is read with
         ``.get(..., default)``, never indexed directly -- because ``render.set`` merges one
@@ -549,7 +568,7 @@ class Session:
             return
         apply_tendon_activation(
             self.model,
-            self.data.ctrl,
+            self._vis_ctrl,
             self._tendon_act_to_ten,
             self._tendon_base_rgba,
             tendon_width=tendons.get("max_width", 0.003),
@@ -568,18 +587,34 @@ class Session:
         later :meth:`step` restores to -- turning one bad frame into a session that raises
         :class:`Diverged` forever until :meth:`reset`.
 
-        ``ctrl``, when given, is written into ``data.ctrl`` BEFORE ``mj_forward`` runs below --
-        forward is what turns ``ctrl`` into actuator force and the constraint solve, so writing
-        it after would have no effect on this frame. It is scattered onto ``data.ctrl`` through
+        ``ctrl``, when given, is VISUALISATION-ONLY: it is mapped into :attr:`_vis_ctrl` (read
+        by :meth:`_apply_tendon_activation_vis` to grow/shrink and colour muscle tendons) and
+        is deliberately never written to ``data.ctrl``. A recorded rollout's ``ctrl`` is not
+        trustworthy as a physics input during replay -- forces re-derived from state disagree
+        with the rollout's own recorded sensors by roughly 60x at correlation ~0.3 -- so
+        scattering it onto ``data.ctrl`` ahead of the ``mj_forward`` below would perturb the
+        constraint solve, actuator forces, contact forces and sensor values for no benefit;
+        this method used to do exactly that, which is precisely the behaviour removed here.
+        The recorded/trustworthy forces for a replaying viewer come from the rollout's own
+        recorded sensors, rendered by a sibling feature, not from ``mj_forward``.
+
+        The mapping itself is unchanged: ``ctrl`` is scattered into :attr:`_vis_ctrl` through
         :attr:`_ctrl_map` (see :meth:`_build_ctrl_map`), i.e. by actuator NAME against whichever
         model is currently active, not by position -- so this is safe to call unchanged whether
-        or not a reference-ghost overlay is active. ``data.ctrl`` is zeroed first: the
-        reference half of a doubled model is a kinematic overlay that is never driven, so its
-        actuators are deliberately left at zero rather than carrying over whatever they held
-        before.
+        or not a reference-ghost overlay is active. :attr:`_vis_ctrl` is rebuilt from zero on
+        every call (never updated in place): the reference half of a doubled model is a
+        kinematic overlay that is never driven, so its actuators are deliberately left at zero
+        rather than carrying over whatever they held before -- and a primary-ordered name with
+        no match on the active model (``_ctrl_map`` entry ``-1``) is simply never written, same
+        as before.
 
-        Omitting ``ctrl`` (the default) leaves ``data.ctrl`` completely untouched, so every
-        existing caller that only ever wrote qpos keeps behaving exactly as before.
+        Omitting ``ctrl`` (the default) leaves :attr:`_vis_ctrl` completely untouched -- exactly
+        as omitting it used to leave ``data.ctrl`` untouched -- so every existing caller that
+        only ever wrote qpos keeps behaving exactly as before. ``data.ctrl`` itself is never
+        touched by this method at all now, whether or not ``ctrl`` is given: it is left to
+        whatever the physics backend last put there (or, in a replaying session that never
+        steps physics, whatever ``mj_forward`` below computes from that unrelated, unwritten
+        value -- typically zero on a fresh session).
         """
         arr = np.asarray(qpos, dtype=np.float64)
         if not np.isfinite(arr).all():
@@ -592,9 +627,10 @@ class Session:
                     f"({len(self._ctrl_map)},) to match this session's replay ctrl map",
                     expected_width=len(self._ctrl_map),
                 )
-            self.data.ctrl[:] = 0.0
+            vis_ctrl = np.zeros(self.model.nu, dtype=np.float64)
             valid = self._ctrl_map >= 0
-            self.data.ctrl[self._ctrl_map[valid]] = ctrl_arr[valid]
+            vis_ctrl[self._ctrl_map[valid]] = ctrl_arr[valid]
+            self._vis_ctrl = vis_ctrl
         self.data.qpos[:] = arr
         mujoco.mj_forward(self.model, self.data)
         self._snapshot()

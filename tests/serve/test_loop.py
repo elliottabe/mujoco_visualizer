@@ -935,11 +935,11 @@ class _PersistentMismatchSource:
 
 def test_ctrl_width_mismatch_zeroes_ctrl_rather_than_leaving_the_stale_value():
     """"We could not apply this frame's commands" must render as NO commands, not the
-    previous frame's -- once tendon colour/force rendering reads ctrl (an upcoming task), a
-    stale-but-plausible value would be a confident, wrong picture with no visible sign
-    anything failed. Also confirms the zeroing does NOT change the error classification: still
-    a non-pausing 'command' error with playback running, exactly like the width-mismatch test
-    above."""
+    previous frame's -- tendon colour/width rendering now reads exactly this ctrl (see
+    ``Session._apply_tendon_activation_vis``), so a stale-but-plausible value would be a
+    confident, wrong picture with no visible sign anything failed. Also confirms the zeroing
+    does NOT change the error classification: still a non-pausing 'command' error with
+    playback running, exactly like the width-mismatch test above."""
     source = _PersistentMismatchSource(
         np.arange(2 * 10 * 3, dtype=np.float32).reshape(2, 10, 3)
     )
