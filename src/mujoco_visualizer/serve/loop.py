@@ -775,6 +775,12 @@ class SimLoop(threading.Thread):
             # request threads verbatim via latest()/wait_for_frame(), so an aliased inner list
             # would let a reader mutate published, supposedly-immutable loop state in place.
             "locks": {name: list(values) for name, values in self._locks.items()},
+            # Where the camera actually is. Published for the same reason `locks` is -- a
+            # request thread must never reach into live Session state -- and it is what lets a
+            # client seed its drag handler from reality instead of a literal (see
+            # static/viewer.js, which starts at az=90/el=-20 and therefore teleports the view
+            # on the first drag).
+            "camera": self._session.camera_state(),
         }
         if replay is not None:
             # rtf stays 0 in replay mode: nothing advances data.time, and reporting a

@@ -869,6 +869,33 @@ class Session:
         """
         return self._camera
 
+    def camera_state(self) -> Dict:
+        """The camera as the client needs to see it, for ``frame_meta``.
+
+        Every field is read with a default rather than indexed, because a settings preset may
+        mention only some of this group's keys (same reason
+        :meth:`_apply_tendon_activation_vis` tolerates a partial ``tendons`` dict).
+
+        ``named`` and ``selected`` are BOTH reported and are genuinely different values:
+        ``named`` is whatever ``vis_state['camera']['named']`` holds, while ``selected`` is
+        :attr:`camera` -- the named override that actually wins at render time. A settings file
+        can pin ``named`` to a model camera while the free camera is what is on screen, so a
+        client that showed only ``named`` would misreport which camera it is looking through.
+        """
+        cam = self.viz.vis_state.get("camera", {})
+        return {
+            "mode": cam.get("mode", "free"),
+            "free_type": cam.get("free_type", "free"),
+            "azimuth": float(cam.get("azimuth", 180.0)),
+            "elevation": float(cam.get("elevation", -30.0)),
+            "distance": float(cam.get("distance", 0.3)),
+            "lookat": [float(v) for v in cam.get("lookat", [0.0, 0.0, 0.0])],
+            "trackbody": cam.get("trackbody", ""),
+            "fixedcamid": cam.get("fixedcamid", ""),
+            "named": cam.get("named", ""),
+            "selected": self.camera,
+        }
+
     @property
     def active_model_name(self) -> str:
         return self._active_model

@@ -165,6 +165,16 @@ class FakeSession:
     def set_camera(self, **kw):
         self.camera_calls.append(kw)
 
+    def camera_state(self):
+        # _publish() now reads this every tick (see Session.camera_state), so the fake needs
+        # a stand-in with the same shape -- any dict-with-these-keys is fine since nothing in
+        # this file asserts on its contents, only that publishing a frame doesn't blow up.
+        return {
+            "mode": "free", "free_type": "free", "azimuth": 180.0, "elevation": -30.0,
+            "distance": 0.3, "lookat": [0.0, 0.0, 0.0], "trackbody": "", "fixedcamid": "",
+            "named": "", "selected": None,
+        }
+
     def apply_render(self, settings):
         self.render_calls.append(settings)
 
