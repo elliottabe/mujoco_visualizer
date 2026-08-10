@@ -578,6 +578,21 @@ class Session:
         self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
             self.model, scheme.get("color")
         )
+        # Drop actuators that no primary ctrl column maps to. _vis_ctrl is written ONLY by
+        # set_qpos through _ctrl_map, so such an actuator's activation is zero for the life of
+        # the session and its tendon carries no signal -- on the fly reference-ghost pair that
+        # is 260 dim duplicates drawn directly over the muscles they mimic.
+        # apply_tendon_activation already hides every tendon absent from act_to_ten.values(),
+        # so excluding here IS hiding; no new code path.
+        # Stated in terms of the ctrl map rather than a name suffix so this package needs no
+        # knowledge of what a ghost is. On a single-model session every primary name matches and
+        # nothing is dropped.
+        driven = {int(i) for i in self._ctrl_map if int(i) >= 0}
+        self._tendon_act_to_ten = {
+            act_id: ten_id
+            for act_id, ten_id in self._tendon_act_to_ten.items()
+            if act_id in driven
+        }
         self._tendon_color_scheme = scheme_name
 
     def _apply_tendon_activation_vis(self) -> None:

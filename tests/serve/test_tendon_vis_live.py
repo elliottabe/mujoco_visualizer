@@ -353,8 +353,13 @@ _ALT_XML = """
       <site site="anchor_c"/><site site="tip_c"/>
     </spatial>
   </tendon>
+  <!-- Named "m_a", matching primary's first actuator, not "m_c" like the tendon/site/body it
+       drives -- so task 4's ctrl-map exclusion filter does not hide this fixture's tendon (the
+       tests below are about the map surviving a SHAPE change and _vis_ctrl's swap-time reset,
+       not about unmatched-actuator behaviour, which tests/serve/test_tendon_color_schemes.py
+       covers on a deliberately fully-unmatched alt model). -->
   <actuator>
-    <motor name="m_c" tendon="t_c" ctrlrange="-1 1"/>
+    <motor name="m_a" tendon="t_c" ctrlrange="-1 1"/>
   </actuator>
 </mujoco>
 """

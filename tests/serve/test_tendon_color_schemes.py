@@ -199,3 +199,48 @@ def test_a_colour_functions_own_alpha_is_ignored():
     finally:
         dim.close()
         bright.close()
+
+
+# -- actuators no ctrl column drives are excluded, so their tendons are hidden ----------------
+#
+# On the fly pair this is the reference ghost: alt_model roughly doubles nu (272 -> 544) and
+# ntendon (260 -> 520), the tendon map is built from the ACTIVE model so all 544 actuators enter
+# it, but _ctrl_map matches by NAME over the 272 primary names and the ghost's carry a suffix --
+# so no primary column resolves to them. _vis_ctrl is only ever written through that map, so
+# their activation is zero for the life of the session: 260 dim duplicate tendons drawn on top of
+# the real ones, carrying no signal. Stated here without reference to ghosts, because that is how
+# it is implemented.
+
+# Renames the tendons' `tendon="..."` transmission-target references on the actuators too --
+# not just their own `name="..."` -- otherwise the alt model fails to compile at all (a
+# `<motor>` left pointing at a tendon name that no longer exists), before Session is ever
+# constructed.
+_ALT_XML = _XML.replace('name="t_a"', 'name="t_a_alt"').replace(
+    'name="t_b"', 'name="t_b_alt"'
+).replace('tendon="t_a"', 'tendon="t_a_alt"').replace(
+    'tendon="t_b"', 'tendon="t_b_alt"'
+).replace('name="m_a"', 'name="m_a_alt"').replace('name="m_b"', 'name="m_b_alt"')
+
+
+def test_actuators_absent_from_the_ctrl_map_are_excluded_and_their_tendons_hidden():
+    """An actuator no primary ctrl column maps to has structurally-zero activation, so its
+    tendon carries no information and must not be drawn."""
+    primary = mujoco.MjModel.from_xml_string(_XML)
+    alt = mujoco.MjModel.from_xml_string(_ALT_XML)
+    s = Session(model=primary, alt_model=alt, width=64, height=48,
+                actuator_color_schemes=_SCHEMES)
+    try:
+        s.swap_model("alt")
+        # Every actuator on the alt model is named *_alt, so none of the primary names match.
+        assert s._tendon_act_to_ten == {}
+        s.viz.vis_state["tendons"]["enabled"] = True
+        s.render()
+        assert list(s.model.tendon_rgba[:, 3]) == pytest.approx([0.0] * s.model.ntendon)
+    finally:
+        s.close()
+
+
+def test_a_single_model_session_drops_nothing(sess):
+    """The exclusion must be invisible when every primary name matches -- which is every
+    stock, single-model session."""
+    assert len(sess._tendon_act_to_ten) == 2
