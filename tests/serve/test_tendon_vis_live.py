@@ -131,6 +131,50 @@ def test_non_muscle_tendon_is_hidden_while_enabled(sess):
     assert sess.model.tendon_rgba[t_free, 3] == pytest.approx(0.0)
 
 
+# -- ctrl_full_scale: a TUNABLE reference, not a measured max (fix round 1) --------------------
+#
+# actuator_ctrlrange is a THEORETICAL ceiling -- on the real fly model it is 1.05 across all 258
+# tendon-driving actuators, but a trained policy's actual |ctrl| occupies a small fraction of
+# that ceiling (measured on rollout clip 65, frames 200-320: p50 0.0246, p90 0.0555, p99 0.1442,
+# max 0.6287). Normalising against 1.05 therefore renders essentially every tendon near minimum
+# width/alpha almost all the time. The fix is an overridable vis_state['tendons']['ctrl_
+# full_scale'] knob (default: this fixture's own ctrlrange-derived 1.0) -- a caller holding the
+# real rollout (the launcher) is expected to replace it with a measured |ctrl| percentile.
+
+
+def test_ctrl_full_scale_defaults_to_the_ctrlrange_derived_value(sess):
+    from mujoco_visualizer.visualizer import default_tendon_ctrl_full_scale
+
+    assert sess.viz.vis_state["tendons"]["ctrl_full_scale"] == pytest.approx(
+        default_tendon_ctrl_full_scale(sess.model)
+    )
+    assert sess.viz.vis_state["tendons"]["ctrl_full_scale"] == pytest.approx(1.0)
+
+
+def test_overriding_ctrl_full_scale_changes_alpha_and_width_for_the_same_ctrl(sess):
+    """The load-bearing 'the knob changes the resulting alpha/width' reversion test for fix
+    round 1 -- see the task report for the verbatim before/after of ignoring the override."""
+    t_a = _tendon_id(sess.model, "t_a")
+    sess.viz.vis_state["tendons"]["enabled"] = True
+    sess.data.ctrl[:] = [0.5, 0.0]
+
+    sess.viz.vis_state["tendons"]["ctrl_full_scale"] = 1.0
+    sess.render()
+    alpha_at_full_scale_1 = float(sess.model.tendon_rgba[t_a, 3])
+    width_at_full_scale_1 = float(sess.model.tendon_width[t_a])
+
+    sess.viz.vis_state["tendons"]["ctrl_full_scale"] = 0.5
+    sess.render()
+    alpha_at_full_scale_half = float(sess.model.tendon_rgba[t_a, 3])
+    width_at_full_scale_half = float(sess.model.tendon_width[t_a])
+
+    # ctrl=0.5 normalised against full_scale=1.0 gives raw=0.5; against full_scale=0.5 it
+    # saturates to raw=1.0 -- strictly brighter/wider with the smaller reference.
+    assert alpha_at_full_scale_half > alpha_at_full_scale_1
+    assert width_at_full_scale_half > width_at_full_scale_1
+    assert alpha_at_full_scale_half == pytest.approx(1.0)
+
+
 # -- restore-on-disable: the load-bearing test for this feature ---------------------------------
 
 
@@ -192,6 +236,15 @@ def test_a_wholesale_partial_tendons_dict_does_not_raise(sess):
     sess.render()  # must not raise despite max_width/min_width/min_alpha/baseline missing
 
 
+def test_a_wholesale_tendons_dict_with_only_ctrl_full_scale_does_not_raise(sess):
+    """The fix-round-1 sibling of the test above, added at the coordinator's request: a dict
+    carrying ONLY the new ``ctrl_full_scale`` key (no ``enabled`` at all) must not raise
+    either."""
+    sess.viz.vis_state["tendons"] = {"ctrl_full_scale": 0.6}
+    sess.data.ctrl[:] = [0.5, 0.5]
+    sess.render()  # must not raise despite enabled/max_width/min_width/min_alpha/baseline missing
+
+
 def test_apply_render_with_a_single_tendons_key_does_not_raise(sess):
     # Captured BEFORE render(): rendering while enabled mutates model.tendon_width for the
     # muscle tendons, so reading the model's OWN widths back afterwards would no longer show
@@ -212,6 +265,18 @@ def test_apply_render_with_only_baseline_leaves_other_tendons_fields_untouched(s
     assert sess.viz.vis_state["tendons"]["min_alpha"] == pytest.approx(0.33)
     assert sess.viz.vis_state["tendons"]["baseline"] == pytest.approx(0.2)
     assert sess.viz.vis_state["tendons"]["enabled"] is False  # never mentioned, stayed default
+
+
+def test_apply_render_with_only_ctrl_full_scale_does_not_raise_and_takes_effect(sess):
+    t_a = _tendon_id(sess.model, "t_a")
+    sess.apply_render({"tendons.ctrl_full_scale": 0.6})
+    assert sess.viz.vis_state["tendons"]["ctrl_full_scale"] == pytest.approx(0.6)
+    assert sess.viz.vis_state["tendons"]["enabled"] is False  # never mentioned, stayed default
+
+    sess.apply_render({"tendons.enabled": True})
+    sess.data.ctrl[:] = [0.5, 0.0]
+    sess.render()  # must not raise despite max_width/min_width/min_alpha/baseline unmentioned
+    assert sess.model.tendon_rgba[t_a, 3] == pytest.approx(0.5 / 0.6)  # ctrl / ctrl_full_scale
 
 
 # -- protocol: 'tendons' must be an accepted render.set root -------------------------------------

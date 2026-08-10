@@ -21,6 +21,7 @@ from mujoco_visualizer import Visualizer
 from mujoco_visualizer.visualizer import (
     apply_tendon_activation,
     build_actuator_tendon_map,
+    default_tendon_ctrl_full_scale,
 )
 
 # Two tendon-driving actuators (t_a wide, t_b narrow -- distinctive, not MuJoCo's own default
@@ -202,9 +203,11 @@ def test_apply_tendon_activation_is_idempotent_no_snapshot_needed_between_calls(
 # -- vis_state['tendons'] must read model.tendon_width, never hardcode -------------------------
 
 
-def test_vis_state_tendons_group_exists_with_all_five_fields(viz):
+def test_vis_state_tendons_group_exists_with_all_six_fields(viz):
     tendons = viz.vis_state["tendons"]
-    assert set(tendons) == {"enabled", "max_width", "min_width", "min_alpha", "baseline"}
+    assert set(tendons) == {
+        "enabled", "max_width", "min_width", "min_alpha", "baseline", "ctrl_full_scale",
+    }
 
 
 def test_vis_state_tendons_width_defaults_come_from_the_models_own_tendon_width(viz):
@@ -223,6 +226,82 @@ def test_vis_state_tendons_defaults_to_disabled(viz):
     assert viz.vis_state["tendons"]["enabled"] is False
 
 
+# -- ctrl_full_scale: a TUNABLE reference, not a measured max (fix round 1) --------------------
+#
+# ``actuator_ctrlrange`` is a THEORETICAL ceiling: on the real fly model it is 1.05 across all
+# 258 tendon-driving actuators, but a trained policy's actual |ctrl| occupies a small fraction
+# of it (see default_tendon_ctrl_full_scale's docstring for the measured percentiles). This
+# fixture's actuators (ctrlrange -1..1) give a default of 1.0 -- deliberately not 1.05, so a
+# test asserting "1.0" here cannot be satisfied by accidentally hardcoding the real fly's own
+# number instead of actually deriving it from ctrlrange.
+
+
+def test_default_tendon_ctrl_full_scale_matches_the_models_own_ctrlrange(viz):
+    act_to_ten, _ = build_actuator_tendon_map(viz.model)
+    assert default_tendon_ctrl_full_scale(viz.model, act_to_ten) == pytest.approx(1.0)
+    # Also correct with no precomputed map supplied (builds its own internally).
+    assert default_tendon_ctrl_full_scale(viz.model) == pytest.approx(1.0)
+
+
+def test_default_tendon_ctrl_full_scale_uses_the_larger_of_the_two_ctrlrange_bounds():
+    xml = """
+    <mujoco>
+      <worldbody>
+        <site name="a" pos="0 0 0.4" size="0.01"/>
+        <body name="box" pos="0 0 0.6">
+          <joint name="j" type="slide" axis="0 0 1"/>
+          <geom type="box" size="0.05 0.05 0.05"/>
+          <site name="tip" pos="0 0 0" size="0.01"/>
+        </body>
+      </worldbody>
+      <tendon>
+        <spatial name="t"><site site="a"/><site site="tip"/></spatial>
+      </tendon>
+      <actuator>
+        <motor name="m" tendon="t" ctrlrange="-1.05 1"/>
+      </actuator>
+    </mujoco>
+    """
+    model = mujoco.MjModel.from_xml_string(xml)
+    # Mirrors the real fly's own asymmetric ctrlrange (-1.05 .. 1) -- the max of the two
+    # |bounds| (1.05), not just the upper bound (1) or the lower bound's magnitude alone.
+    assert default_tendon_ctrl_full_scale(model) == pytest.approx(1.05)
+
+
+def test_default_tendon_ctrl_full_scale_falls_back_to_one_with_no_limited_actuators():
+    xml = """
+    <mujoco>
+      <worldbody>
+        <site name="a" pos="0 0 0.4" size="0.01"/>
+        <body name="box" pos="0 0 0.6">
+          <joint name="j" type="slide" axis="0 0 1"/>
+          <geom type="box" size="0.05 0.05 0.05"/>
+          <site name="tip" pos="0 0 0" size="0.01"/>
+        </body>
+      </worldbody>
+      <tendon>
+        <spatial name="t"><site site="a"/><site site="tip"/></spatial>
+      </tendon>
+      <actuator>
+        <motor name="m" tendon="t"/>
+      </actuator>
+    </mujoco>
+    """
+    model = mujoco.MjModel.from_xml_string(xml)
+    assert bool(model.actuator_ctrllimited[0]) is False  # sanity: genuinely unlimited
+    assert default_tendon_ctrl_full_scale(model) == pytest.approx(1.0)
+
+
+def test_vis_state_tendons_ctrl_full_scale_defaults_to_the_ctrlrange_derived_value(viz):
+    """The load-bearing assertion for fix round 1: vis_state must be populated with the
+    computed default at construction time, not a bare hardcoded 1.0 that happens to coincide
+    with it for this fixture."""
+    assert viz.vis_state["tendons"]["ctrl_full_scale"] == pytest.approx(
+        default_tendon_ctrl_full_scale(viz.model)
+    )
+    assert viz.vis_state["tendons"]["ctrl_full_scale"] == pytest.approx(1.0)
+
+
 def test_a_model_with_no_tendons_still_gets_sane_tendons_defaults(tmp_path):
     path = tmp_path / "bare.xml"
     path.write_text("<mujoco><worldbody><geom type='box' size='.1 .1 .1'/></worldbody></mujoco>")
@@ -230,6 +309,7 @@ def test_a_model_with_no_tendons_still_gets_sane_tendons_defaults(tmp_path):
     try:
         assert v.vis_state["tendons"]["max_width"] == pytest.approx(0.003)
         assert v.vis_state["tendons"]["min_width"] == pytest.approx(0.0005)
+        assert v.vis_state["tendons"]["ctrl_full_scale"] == pytest.approx(1.0)
     finally:
         v.close()
 

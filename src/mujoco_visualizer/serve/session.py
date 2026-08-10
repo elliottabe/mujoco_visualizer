@@ -30,6 +30,7 @@ from mujoco_visualizer.visualizer import (
     _apply_forces_vis,
     apply_tendon_activation,
     build_actuator_tendon_map,
+    default_tendon_ctrl_full_scale,
 )
 
 
@@ -470,7 +471,7 @@ class Session:
         """(Re)compute everything :meth:`_apply_tendon_activation_vis` needs from the CURRENTLY
         ACTIVE model: the actuator->tendon map/colours, a snapshot of the model's own
         tendon_rgba/tendon_width to restore to when the group is disabled, and a fixed
-        per-session ``ctrl_max`` to normalise activation by.
+        per-session FALLBACK reference scale to normalise activation by.
 
         Called from ``__init__`` and again from :meth:`swap_model`, exactly like
         :meth:`_build_ctrl_map` right above each call site -- the reference-ghost swap roughly
@@ -480,29 +481,23 @@ class Session:
         only against whichever model is currently active, never to translate an id from one
         model to the other, so there is no primary/alt pairing to get wrong here.
 
-        ``ctrl_max`` is fixed once here, not recomputed every frame: it is the largest
-        ``|ctrlrange|`` bound declared by any tendon-driving, ctrl-limited actuator on this
-        model, falling back to 1.0 if none of them declare one. A per-FRAME max (the live
-        loop's ctrl has no lookahead across frames the way ``render_video_pan``'s whole ``ctrls``
-        array does) would make every frame's single brightest muscle equally bright regardless
-        of how active the animal actually is that frame -- a quiet frame would look identical
-        to a maximal one. Anchoring to the model's own declared control range instead gives an
-        absolute scale that a quiet frame renders as quiet.
+        ``_tendon_default_ctrl_full_scale`` is fixed once here, not recomputed every frame, and
+        is only ever a FALLBACK -- ``_apply_tendon_activation_vis`` prefers
+        ``vis_state['tendons']['ctrl_full_scale']`` whenever that key is present (it always is,
+        after ``Visualizer.__init__`` populates it with this exact value; this attribute is what
+        a legacy settings file saved before that key existed would fall back to instead of
+        raising). See :func:`default_tendon_ctrl_full_scale` for why this model-only ceiling is
+        a poor normalisation reference on real data, and why the fix is an overridable knob
+        rather than recomputing anything from ``data.ctrl`` here.
         """
         self._tendon_act_to_ten, self._tendon_base_rgba = build_actuator_tendon_map(
             self.model, getattr(self.viz, "actuator_color_fn", None)
         )
         self._tendon_orig_rgba = self.model.tendon_rgba.copy()
         self._tendon_orig_width = self.model.tendon_width.copy()
-        bounds = [
-            max(
-                abs(float(self.model.actuator_ctrlrange[a, 0])),
-                abs(float(self.model.actuator_ctrlrange[a, 1])),
-            )
-            for a in self._tendon_act_to_ten
-            if bool(self.model.actuator_ctrllimited[a])
-        ]
-        self._tendon_ctrl_max = max(bounds) if bounds else 1.0
+        self._tendon_default_ctrl_full_scale = default_tendon_ctrl_full_scale(
+            self.model, self._tendon_act_to_ten
+        )
 
     def _apply_tendon_activation_vis(self) -> None:
         """Drive ``vis_state['tendons']`` from ``data.ctrl`` for the frame about to be rendered.
@@ -518,6 +513,12 @@ class Session:
         natural "end of clip" the way ``render_video_pan`` does to restore once after its last
         frame -- leaving the LAST frame's activation frozen on screen the moment the toggle
         flips off would be a confident, wrong picture with nothing to signal it changed.
+
+        ``ctrl_max`` is ``vis_state['tendons']['ctrl_full_scale']`` when present -- a caller
+        holding the real rollout (the launcher) is expected to override it with a measured
+        ``|ctrl|`` percentile -- falling back to ``self._tendon_default_ctrl_full_scale`` (the
+        model-only ceiling computed in :meth:`_rebuild_tendon_state`) only for a settings file
+        that predates this key.
         """
         tendons = self.viz.vis_state.get("tendons", {})
         if not tendons.get("enabled", False):
@@ -533,7 +534,7 @@ class Session:
             tendon_min_width=tendons.get("min_width", 0.0005),
             tendon_alpha_min=tendons.get("min_alpha", 0.05),
             tendon_baseline=tendons.get("baseline", 0.0),
-            ctrl_max=self._tendon_ctrl_max,
+            ctrl_max=tendons.get("ctrl_full_scale", self._tendon_default_ctrl_full_scale),
         )
 
     def set_qpos(self, qpos: Sequence[float], ctrl: Optional[Sequence[float]] = None) -> None:

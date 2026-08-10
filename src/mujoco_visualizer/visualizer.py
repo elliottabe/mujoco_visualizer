@@ -284,6 +284,54 @@ def apply_tendon_activation(
         model.tendon_width[ten_id] = tendon_min_width + width_range * norm
 
 
+def default_tendon_ctrl_full_scale(
+    model: mujoco.MjModel,
+    act_to_ten: Optional[Dict[int, int]] = None,
+) -> float:
+    """The model-only default for ``apply_tendon_activation``'s ``ctrl_max``: the largest
+    ``|ctrlrange|`` bound declared by any tendon-driving, ctrl-limited actuator on *model*, or
+    ``1.0`` if none declare one. *act_to_ten*, when already available (e.g. a caller that has
+    already called :func:`build_actuator_tendon_map`), is reused instead of rebuilding it.
+
+    THIS IS A THEORETICAL CEILING, NOT A MEASURED ONE, and on the real fly model it is a
+    misleading one on its own: ``actuator_ctrlrange`` over the 258 tendon-driving actuators
+    (all ctrl-limited) spans -1.05 to 1, so this returns 1.05 -- but a trained policy's actual
+    ``|ctrl|`` occupies only a small fraction of that ceiling. Measured on a real rollout
+    (clip 65, frames 200-320)::
+
+        |ctrl| p50  = 0.0246   -> normalised against 1.05: 0.023
+               p90  = 0.0555   ->                          0.053
+               p99  = 0.1442   ->                          0.137
+               max  = 0.6287   ->                          0.599
+
+    Normalising against 1.05 therefore renders essentially every tendon near minimum width and
+    alpha almost all the time -- a uniformly dim, inert-looking picture that shows almost none
+    of the variation it exists to show, the same trap as MuJoCo's native force arrows being
+    invisible at their principled-but-wrong-scale default.
+
+    This function/value is only ever meant to be vis_state['tendons']['ctrl_full_scale']'s
+    FALLBACK default -- what a viewer with no rollout loaded has nothing better to show. A
+    caller that HAS the actual data (the serve-layer launcher, which loads the rollout) should
+    override ``vis_state['tendons']['ctrl_full_scale']`` with a measured percentile of
+    ``|ctrl|`` across it instead of trusting this ceiling. That override is intentionally not
+    done here, or anywhere per-frame: recomputing it from ``data.ctrl`` inside the apply path
+    (per-frame, or a running max) would reintroduce exactly the problem a fixed reference value
+    exists to avoid -- every frame's brightest muscle would render equally bright regardless of
+    how active the animal actually is, making a quiet frame indistinguishable from a loud one.
+    """
+    if act_to_ten is None:
+        act_to_ten, _ = build_actuator_tendon_map(model)
+    bounds = [
+        max(
+            abs(float(model.actuator_ctrlrange[a, 0])),
+            abs(float(model.actuator_ctrlrange[a, 1])),
+        )
+        for a in act_to_ten
+        if bool(model.actuator_ctrllimited[a])
+    ]
+    return max(bounds) if bounds else 1.0
+
+
 def get_wing_fluid_idxs(model: mujoco.MjModel, suffix='') -> List[int]:
     """Return geom ids of the wing fluid geoms (left, right) in *model*."""
     out = []
@@ -649,6 +697,15 @@ class Visualizer:
             # render_video_pan's own long-standing defaults (0.003/0.0005) -- there is nothing
             # else to read, and this group is inert on such a model anyway (``enabled`` stays
             # off and there is nothing for it to colour).
+            # ``ctrl_full_scale`` is a REFERENCE/full-scale |ctrl| value for normalisation, not
+            # a measured one -- see ``default_tendon_ctrl_full_scale``'s docstring for the
+            # measured gap on the real fly (ctrlrange ceiling 1.05 vs. a trained policy's
+            # actual |ctrl| sitting at p50 0.0246 / p90 0.0555 / p99 0.1442 / max 0.6287 on a
+            # real rollout) that makes this model-only default look uniformly dim on real
+            # data. It is deliberately overridable: a caller holding the actual rollout (the
+            # serve-layer launcher) should replace it with a measured percentile of |ctrl|
+            # across that rollout -- this key exists so a viewer with nothing else to go on
+            # still has a principled model-only fallback.
             'tendons': {
                 'enabled':   False,
                 'max_width': (
@@ -659,6 +716,7 @@ class Visualizer:
                 ),
                 'min_alpha': 0.05,
                 'baseline':  0.0,
+                'ctrl_full_scale': default_tendon_ctrl_full_scale(self.model),
             },
             'camera_presets': {},
         }
