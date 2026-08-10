@@ -26,6 +26,7 @@ COMMANDS = frozenset(
         "sim",
         "speed",
         "camera",
+        "camera_preset",
         "render",
         "settings",
         "stream",
@@ -205,6 +206,17 @@ def parse_command(raw, user_settings_dir: Optional[str] = None) -> Dict:
         if len(out) == 1:
             raise CommandError("'camera' needs 'named' or at least one of az/el/dist/lookat")
         return out
+
+    if kind == "camera_preset":
+        op = cmd.get("op")
+        if op not in ("save", "delete"):
+            raise CommandError("'camera_preset.op' must be 'save' or 'delete'")
+        name = cmd.get("name")
+        if not isinstance(name, str) or not PRESET_NAME_RE.match(name):
+            raise CommandError(
+                f"'camera_preset.name' must match {PRESET_NAME_RE.pattern}, got {name!r}"
+            )
+        return {"t": "camera_preset", "op": op, "name": name}
 
     if kind == "render":
         values = cmd.get("set")

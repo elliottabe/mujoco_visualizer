@@ -264,6 +264,14 @@ class SimLoop(threading.Thread):
             self._substeps = cmd["substeps_per_frame"]
         elif kind == "camera":
             self._session.set_camera(**{k: v for k, v in cmd.items() if k != "t"})
+        elif kind == "camera_preset":
+            # ValueError (bad name, unknown preset) surfaces as a non-pausing kind:"command"
+            # error, the same convention as a rejected lock -- playback keeps running and the
+            # banner explains, rather than the viewer stopping over a mistyped name.
+            if cmd["op"] == "save":
+                self._session.save_camera_preset(cmd["name"])
+            else:
+                self._session.delete_camera_preset(cmd["name"])
         elif kind == "render":
             self._session.apply_render(cmd["set"])
         elif kind == "settings":

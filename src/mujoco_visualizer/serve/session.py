@@ -948,6 +948,44 @@ class Session:
             "selected": self.camera,
         }
 
+    # The seven fields Visualizer._resolve_preset actually reads. Deliberately NOT the whole
+    # camera dict: `mode` and `named` describe which camera is currently SELECTED, which is not
+    # a property of the shot being saved, and storing them would let loading a preset silently
+    # change the selection too.
+    _PRESET_CAMERA_FIELDS = (
+        "azimuth", "elevation", "distance", "lookat", "free_type", "trackbody", "fixedcamid",
+    )
+
+    def save_camera_preset(self, name: str) -> None:
+        """Snapshot the current free camera into ``vis_state['camera_presets'][name]``.
+
+        A deep copy, so the preset is a shot rather than a live view of the camera -- without
+        it every preset would alias the same dict and all of them would follow the next drag.
+
+        Persistence needs no code here: ``Visualizer.save_settings`` already emits
+        ``camera_presets`` and ``load_settings`` merges it, so a preset survives a restart via
+        the Settings tab's existing save.
+        """
+        if not PRESET_NAME_RE.match(name or ""):
+            raise ValueError(
+                f"camera preset name must match {PRESET_NAME_RE.pattern!r}, got {name!r}"
+            )
+        state = self.camera_state()
+        presets = self.viz.vis_state.setdefault("camera_presets", {})
+        presets[name] = copy.deepcopy(
+            {field: state[field] for field in self._PRESET_CAMERA_FIELDS}
+        )
+
+    def delete_camera_preset(self, name: str) -> None:
+        """Remove a saved camera. Names what exists when *name* does not, because the only
+        other outcome is a button that appears to do nothing."""
+        presets = self.viz.vis_state.setdefault("camera_presets", {})
+        if name not in presets:
+            raise ValueError(
+                f"no camera preset {name!r}; available: {sorted(presets)}"
+            )
+        del presets[name]
+
     @property
     def active_model_name(self) -> str:
         return self._active_model
