@@ -190,6 +190,18 @@ def parse_command(raw, user_settings_dir: Optional[str] = None) -> Dict:
                     )
                 lookat_values.append(float(v))
             out["lookat"] = lookat_values
+        if "pan" in cmd:
+            pan = cmd["pan"]
+            if not isinstance(pan, (list, tuple)) or len(pan) != 2:
+                raise CommandError("'camera.pan' must be 2 numbers [dx, dy]")
+            pan_values = []
+            for i, v in enumerate(pan):
+                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                    raise CommandError(
+                        f"'camera.pan' element {i} must be a number, got {type(v).__name__}"
+                    )
+                pan_values.append(float(v))
+            out["pan"] = pan_values
         if len(out) == 1:
             raise CommandError("'camera' needs 'named' or at least one of az/el/dist/lookat")
         return out

@@ -14,6 +14,7 @@ touching this file.
 """
 
 import copy
+import math
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -90,6 +91,34 @@ _CAMERA_WIRE_KEYS = {
     "dist": "distance",
     "lookat": "lookat",
 }
+
+# Metres of lookat travel per pixel of drag, per unit of camera distance. Multiplied by
+# `distance` at use so a drag moves the same APPARENT amount at any zoom -- a fixed metres-per
+# -pixel gain that feels right at distance 0.3 is imperceptible at 3.0. The value itself is a
+# feel constant, not a measurement.
+_PAN_GAIN_PER_PIXEL = 0.002
+
+
+def camera_basis(azimuth_deg: float, elevation_deg: float):
+    """``(forward, right, up)`` unit vectors for a free camera at *azimuth_deg*/*elevation_deg*.
+
+    Mirrors the angle convention ``Visualizer._cfg_to_mjvcamera`` hands to MuJoCo: azimuth is
+    measured about world +z from +x, elevation above the xy-plane. ``right`` is deliberately
+    horizontal (``right[2] == 0``) -- it is the screen-horizontal axis, and a component in z
+    would make a sideways pan slide the view up or down as a side effect.
+
+    Public and module-level rather than a method, so a test can assert orthonormality without
+    constructing a Session, and so nothing has to reach into a private helper to pan.
+    """
+    az = math.radians(float(azimuth_deg))
+    el = math.radians(float(elevation_deg))
+    forward = np.array(
+        [math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)],
+        dtype=float,
+    )
+    right = np.array([-math.sin(az), math.cos(az), 0.0], dtype=float)
+    up = np.cross(forward, right)
+    return forward, right, up
 
 _FATAL_WARNINGS = (
     mujoco.mjtWarning.mjWARN_BADQPOS,
@@ -772,9 +801,12 @@ class Session:
         self._renderer = self.viz.make_renderer(height=self.height, width=self.width)
         old.close()
 
-    def set_camera(self, named: Optional[str] = None, **kw) -> None:
+    def set_camera(
+        self, named: Optional[str] = None, pan: Optional[Sequence[float]] = None, **kw
+    ) -> None:
         """Point the camera. ``named`` selects a named camera/preset; keyword args
-        (az/el/dist/lookat) update the free camera in ``vis_state``.
+        (az/el/dist/lookat) update the free camera in ``vis_state``; ``pan`` is a
+        screen-space ``[dx, dy]`` drag translated into a world-space ``lookat`` move.
 
         The wire names are translated to the ``vis_state['camera']`` keys that
         ``Visualizer._cfg_to_mjvcamera`` actually reads (see :data:`_CAMERA_WIRE_KEYS`).
@@ -787,6 +819,26 @@ class Session:
             return
         self._camera = None
         cam = self.viz.vis_state.setdefault("camera", {})
+        if pan is not None:
+            # Screen-space -> world, in the camera's OWN basis. Done here, not in the browser,
+            # because only this side knows the current azimuth/elevation; a client-side version
+            # would be a second implementation of _cfg_to_mjvcamera's orientation maths and free
+            # to drift from it.
+            #
+            # Sign convention: dragging right moves the scene right (the camera translates
+            # left), and dragging down moves the scene down. Screen y grows downward, hence
+            # +dy maps to +up.
+            dx, dy = float(pan[0]), float(pan[1])
+            _forward, right, up = camera_basis(
+                cam.get("azimuth", 180.0), cam.get("elevation", -30.0)
+            )
+            scale = _PAN_GAIN_PER_PIXEL * float(cam.get("distance", 0.3))
+            lookat = np.asarray(
+                [float(v) for v in cam.get("lookat", [0.0, 0.0, 0.0])], dtype=float
+            )
+            lookat = lookat + scale * (-dx * right + dy * up)
+            cam["lookat"] = [float(v) for v in lookat]
+            cam["mode"] = "free"
         touched = False
         for key, value in kw.items():
             if value is None:
