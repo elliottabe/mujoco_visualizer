@@ -26,6 +26,7 @@ from mujoco_visualizer.render_settings import PRESET_NAME_RE
 from mujoco_visualizer.serve.backends import CpuBackend, PhysicsBackend, UnknownKeyframe
 from mujoco_visualizer.serve.controls import actuator_group_map, build_control_tree
 from mujoco_visualizer.serve.locks import build_joint_qpos_map
+from mujoco_visualizer.visualizer import _apply_forces_vis
 
 
 class Diverged(RuntimeError):
@@ -65,7 +66,8 @@ _FATAL_WARNINGS = (
 
 
 def _carry_vis_state_across_swap(vis_state: Dict, model: mujoco.MjModel) -> Dict:
-    """Drop ``geom_colors`` entries that don't exist on *model*, in place; return *vis_state*.
+    """Drop ``geom_colors`` entries that don't exist on *model*, and re-apply ``forces`` onto
+    *model*, in place; return *vis_state*.
 
     Category colours, lighting, floor, flags and camera are all model-agnostic and carry
     across a swap unchanged. ``geom_colors`` is the one exception: it is keyed by geom id, and
@@ -81,6 +83,18 @@ def _carry_vis_state_across_swap(vis_state: Dict, model: mujoco.MjModel) -> Dict
     ``"5" < model.ngeom`` raises TypeError, which surfaced as the ghost toggle failing rather
     than as anything to do with colours. A key that is not an int at all is dropped rather
     than raising: it cannot name a geom, so it can only be junk.
+
+    ``forces`` is the opposite kind of trap: nothing here needs FIXING to stay valid on the
+    new model (all five fields are plain floats, meaningful on any model) -- but nothing
+    APPLIES them either. ``forces`` lives on ``MjModel.vis``, not on the per-render
+    ``MjvOption``, so it is not "model-agnostic" the way lighting/floor/camera are: it lives on
+    the model object itself, and ``rebind_model`` (called by ``swap_model`` just before this
+    function) points at a brand-new model carrying its OWN MJCF vis values, not the ones
+    ``vis_state`` still claims. Left alone, the new model would silently render with its own
+    MJCF's force-arrow scaling regardless of what the user had dialled in -- structurally the
+    same trap that a stale joint map shipped as (see ``loop.py``'s lock revalidation across a
+    swap) -- so it is written back here, directly, rather than left to whatever the next
+    render happens to do.
     """
     geom_colors = vis_state.get("geom_colors")
     if geom_colors:
@@ -93,6 +107,9 @@ def _carry_vis_state_across_swap(vis_state: Dict, model: mujoco.MjModel) -> Dict
             if 0 <= index < model.ngeom:
                 kept[index] = hexcolor
         vis_state["geom_colors"] = kept
+    forces = vis_state.get("forces")
+    if forces:
+        _apply_forces_vis(forces, model)
     return vis_state
 
 

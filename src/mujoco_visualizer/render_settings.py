@@ -30,7 +30,9 @@ import mujoco
 import numpy as np
 
 from mujoco_visualizer.visualizer import (
+    _apply_forces_vis,
     _az_el_to_dir,
+    _dir_to_az_el,
     _hex_to_rgb,
     _make_sky_pixels,
     _rgb_to_hex,
@@ -140,13 +142,14 @@ def apply_settings(
     apply_lighting: bool = True,
     apply_floor: bool = True,
     apply_skybox: bool = True,
+    apply_forces: bool = True,
     body_name_substring: Optional[str] = None,
 ) -> dict:
     """Apply a settings dict to a MuJoCo model (mutates model in place).
 
-    This handles geom colors, lighting, floor material, and skybox texture.
-    Returns internal state needed for correct color reset (keep if you plan
-    to call apply_settings again with different settings on the same model).
+    This handles geom colors, lighting, floor material, skybox texture, and force/torque arrow
+    scaling. Returns internal state needed for correct color reset (keep if you plan to call
+    apply_settings again with different settings on the same model).
 
     Args:
         model: MuJoCo model to modify.
@@ -155,6 +158,10 @@ def apply_settings(
         apply_lighting: Whether to apply lighting settings.
         apply_floor: Whether to apply floor material settings.
         apply_skybox: Whether to apply skybox gradient.
+        apply_forces: Whether to apply force/torque arrow scaling (``model.vis.map``/
+            ``model.vis.scale``). ``build_scene_option`` already turns
+            ``mjVIS_CONTACTFORCE`` arrows on via ``vis_flags`` -- without this, they render
+            at whatever scale ``model.vis`` happens to hold instead of the settings dict's.
         body_name_substring: Optional substring filter. When set, only geoms
             whose parent body name contains this substring are recolored
             (and their materials baked). Intended for multi-instance scenes
@@ -256,42 +263,104 @@ def apply_settings(
                 model.geom_rgba[i, 3] = orig_geom_rgba[i, 3] * alpha
 
     # Apply lighting
+    #
+    # Every field below is written only if the caller's dict mentions it -- a raw settings
+    # dict (unlike Visualizer.vis_state, which always holds every key from __init__ onward) may
+    # legitimately be partial, e.g. {'lights': [{'active': True}]} to toggle one light without
+    # restating its colour. Fewer ENTRIES than model.nlight was already fine (the loop below
+    # only ever touches indices the list actually has); the gap was a partial dict WITHIN one
+    # entry. dir_az/dir_el is a pair backing the single light_dir vector: mentioning only one
+    # half decomposes the model's current direction (_dir_to_az_el is the exact inverse of the
+    # write below) and recomposes it with the mentioned half substituted in, rather than either
+    # dropping the mentioned half or resetting the other to zero.
     if apply_lighting and 'lighting' in settings:
         lighting = settings['lighting']
         for i, ld in enumerate(lighting.get('lights', [])):
             if i >= model.nlight:
                 break
-            model.light_active[i] = int(ld['active'])
-            model.light_ambient[i] = ld['ambient']
-            model.light_diffuse[i] = ld['diffuse']
-            model.light_specular[i] = ld['specular']
-            model.light_dir[i] = _az_el_to_dir(ld['dir_az'], ld['dir_el'])
+            if 'active' in ld:
+                model.light_active[i] = int(ld['active'])
+            if 'ambient' in ld:
+                model.light_ambient[i] = ld['ambient']
+            if 'diffuse' in ld:
+                model.light_diffuse[i] = ld['diffuse']
+            if 'specular' in ld:
+                model.light_specular[i] = ld['specular']
+            if 'dir_az' in ld or 'dir_el' in ld:
+                cur_az, cur_el = _dir_to_az_el(model.light_dir[i])
+                model.light_dir[i] = _az_el_to_dir(
+                    ld.get('dir_az', cur_az), ld.get('dir_el', cur_el)
+                )
         hl = lighting.get('headlight')
         if hl:
-            model.vis.headlight.active = int(hl['active'])
-            model.vis.headlight.ambient[:] = hl['ambient']
-            model.vis.headlight.diffuse[:] = hl['diffuse']
-            model.vis.headlight.specular[:] = hl['specular']
+            if 'active' in hl:
+                model.vis.headlight.active = int(hl['active'])
+            if 'ambient' in hl:
+                model.vis.headlight.ambient[:] = hl['ambient']
+            if 'diffuse' in hl:
+                model.vis.headlight.diffuse[:] = hl['diffuse']
+            if 'specular' in hl:
+                model.vis.headlight.specular[:] = hl['specular']
 
     # Apply floor
+    #
+    # 'color' and 'alpha' both land in the same geom_rgba/mat_rgba 4-vector, so mentioning only
+    # one means reading the other back off the model first (geom_rgba is exactly what the
+    # previous apply -- or the MJCF, on a model never touched by this function -- left there).
+    # Neither key present skips the geom_rgba/mat_rgba write entirely, not a rewrite with the
+    # same values. texrepeat_x/texrepeat_y is the same kind of pair as lights' dir_az/dir_el,
+    # just a plain 2-vector rather than a direction needing az/el decomposition.
     if apply_floor and floor_geom_id is not None and 'floor' in settings:
         fld = settings['floor']
-        rgb = _hex_to_rgb(fld['color'])
-        model.geom_rgba[floor_geom_id] = [*rgb, fld['alpha']]
+        if 'color' in fld or 'alpha' in fld:
+            rgb = _hex_to_rgb(fld['color']) if 'color' in fld else list(
+                model.geom_rgba[floor_geom_id, :3]
+            )
+            alpha = fld['alpha'] if 'alpha' in fld else float(model.geom_rgba[floor_geom_id, 3])
+            model.geom_rgba[floor_geom_id] = [*rgb, alpha]
+            if floor_mat_id is not None:
+                model.mat_rgba[floor_mat_id] = [*rgb, alpha]
         if floor_mat_id is not None:
-            model.mat_rgba[floor_mat_id] = [*rgb, fld['alpha']]
-            model.mat_texrepeat[floor_mat_id] = [fld['texrepeat_x'], fld['texrepeat_y']]
-            model.mat_reflectance[floor_mat_id] = fld['reflectance']
-            model.mat_shininess[floor_mat_id] = fld['shininess']
-            model.mat_emission[floor_mat_id] = fld['emission']
+            if 'texrepeat_x' in fld or 'texrepeat_y' in fld:
+                cur_tx, cur_ty = map(float, model.mat_texrepeat[floor_mat_id])
+                model.mat_texrepeat[floor_mat_id] = [
+                    fld.get('texrepeat_x', cur_tx), fld.get('texrepeat_y', cur_ty)
+                ]
+            if 'reflectance' in fld:
+                model.mat_reflectance[floor_mat_id] = fld['reflectance']
+            if 'shininess' in fld:
+                model.mat_shininess[floor_mat_id] = fld['shininess']
+            if 'emission' in fld:
+                model.mat_emission[floor_mat_id] = fld['emission']
 
     # Apply skybox
+    #
+    # sky_top/sky_bot are deliberately NOT given the permissive "write only what's present"
+    # treatment the other four groups got in round 3. That rule assumes the unmentioned value
+    # can be read back exactly from the model; a gradient's ends cannot be, because there is
+    # no dedicated model field for either one -- _make_sky_pixels bakes both into every texel
+    # of a rendered cube map. An earlier version of this block sampled the texture to
+    # reconstruct whichever colour was not mentioned; that was exact only on a texture whose
+    # width and height//6 were both odd, off by roughly 1-2/255 otherwise, and drifted further
+    # on every repeated partial update since each call re-sampled an already slightly-off
+    # value -- "leave the rest at the model's current value" silently was not what it did.
+    # Being permissive here would be a silent lie about a precision this function cannot
+    # deliver, so sky_top/sky_bot are instead an ATOMIC PAIR: applied when both are present,
+    # rejected with a ValueError naming both keys when exactly one is (before any pixel is
+    # touched), and left alone -- same as every other unrecognised key in this function, e.g.
+    # a dict that only carries 'show' -- when neither is present.
     if apply_skybox and skybox_tex_id >= 0 and 'skybox' in settings:
         sky = settings['skybox']
+        has_top, has_bot = 'sky_top' in sky, 'sky_bot' in sky
+        if has_top != has_bot:
+            given = 'sky_top' if has_top else 'sky_bot'
+            raise ValueError(
+                "'skybox' requires both 'sky_top' and 'sky_bot' together -- a gradient cannot "
+                f"be specified with only one end; got {given!r} without the other"
+            )
         pixels = _make_sky_pixels(
-            model, skybox_tex_id,
-            _hex_to_rgb(sky['sky_top']), _hex_to_rgb(sky['sky_bot'])
-        )
+            model, skybox_tex_id, _hex_to_rgb(sky['sky_top']), _hex_to_rgb(sky['sky_bot'])
+        ) if has_top and has_bot else None
         if pixels is not None:
             h = int(model.tex_height[skybox_tex_id])
             w = int(model.tex_width[skybox_tex_id])
@@ -309,6 +378,10 @@ def apply_settings(
                 tex_buf = getattr(model, 'tex_rgb', None)
             if tex_buf is not None:
                 tex_buf[adr:adr + len(flat)] = flat
+
+    # Apply force/torque arrow scaling
+    if apply_forces and 'forces' in settings:
+        _apply_forces_vis(settings['forces'], model)
 
     return {
         'geom_categories': geom_categories,

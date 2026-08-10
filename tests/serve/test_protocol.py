@@ -387,6 +387,27 @@ def test_render_accepts_every_known_root():
         assert cmd["set"] == {f"{root}.x": 1}
 
 
+def test_vis_state_roots_contains_exactly_the_roots_vis_state_actually_has():
+    """``test_render_accepts_every_known_root`` above iterates whatever is CURRENTLY in
+    ``_VIS_STATE_ROOTS``, so it can only prove "every listed root works" -- it can never catch
+    a root missing from the set entirely, because a set with an entry silently dropped just
+    has one fewer thing to iterate over, and the loop notices nothing. Removing ``"forces"``
+    from ``_VIS_STATE_ROOTS`` leaves the WHOLE suite (337/337) green, which is exactly the
+    "test parameterised over the data structure it's meant to guard" trap.
+
+    This test pins the expected membership as an explicit literal instead, independent of
+    ``_VIS_STATE_ROOTS`` itself, so an entry going missing changes what this literal does NOT
+    contain rather than what there is to iterate over."""
+    from mujoco_visualizer.serve.protocol import _VIS_STATE_ROOTS
+
+    expected = {
+        "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
+        "camera", "camera_presets", "lighting", "floor", "skybox", "ghost",
+        "geom_render_state", "forces",
+    }
+    assert _VIS_STATE_ROOTS == expected
+
+
 def test_render_accepts_a_bare_key_whose_name_is_itself_a_known_root():
     """``alpha`` is a scalar at the top of ``vis_state``, not a container to descend into, so
     addressing it with no sub-key is legitimate -- exactly how ``apply_render`` already treats
