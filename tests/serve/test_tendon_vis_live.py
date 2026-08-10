@@ -428,3 +428,39 @@ def test_swap_model_rebuilds_the_restore_snapshot_from_the_new_models_own_values
 
     assert list(s.model.tendon_rgba.flatten()) == pytest.approx(list(alt_orig_rgba.flatten()))
     assert list(s.model.tendon_width) == pytest.approx(list(alt_orig_width))
+
+
+def test_swap_model_resets_vis_ctrl_so_the_freshly_swapped_model_renders_inert_not_stale(
+    tendon_swap_session,
+):
+    """Fix round 1: the swap-time reset of ``Session._vis_ctrl`` (inside
+    ``_rebuild_tendon_state``) had nothing exercising it in isolation. Every swap test above
+    pokes ``_vis_ctrl``/``data.ctrl`` freshly AFTER calling ``swap_model``, so none of them can
+    tell "reset on swap" apart from "never reset, but the very next write happens to cover it
+    anyway" -- dropping the reset keeps the whole suite green. This test renders BEFORE the
+    swap (driving activation up) and again immediately AFTER it, with no new frame written on
+    the new model in between, which is exactly the gap a dropped reset falls through: without
+    it, a freshly swapped model -- one no recorded replay frame has driven at all -- renders a
+    bright, plausible tendon left over from the model that was active before the swap."""
+    s = tendon_swap_session
+    t_a = _tendon_id(s.model, "t_a")
+    s.viz.vis_state["tendons"]["enabled"] = True
+
+    target = s.model.qpos0.copy()
+    s.set_qpos(target, ctrl=[0.9, 0.0])
+    s.render()
+    driven_alpha = float(s.model.tendon_rgba[t_a, 3])
+    driven_width = float(s.model.tendon_width[t_a])
+    min_alpha = s.viz.vis_state["tendons"]["min_alpha"]
+    min_width = s.viz.vis_state["tendons"]["min_width"]
+    # Sanity: activation actually moved away from the floor, so the assertions below prove the
+    # reset happened rather than vacuously matching a tendon that was already at rest.
+    assert driven_alpha > min_alpha
+    assert driven_width > min_width
+
+    s.swap_model("alt")
+    t_c = _tendon_id(s.model, "t_c")
+    s.render()  # no replay frame written on the new model -- this must not carry anything over
+
+    assert s.model.tendon_rgba[t_c, 3] == pytest.approx(min_alpha)
+    assert s.model.tendon_width[t_c] == pytest.approx(min_width)

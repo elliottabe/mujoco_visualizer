@@ -356,22 +356,38 @@ def test_set_qpos_with_ctrl_never_touches_data_ctrl_or_the_solve(sess):
     """The load-bearing pin for task 13c: replay's ``ctrl`` is visualisation-only now, and must
     never reach ``data.ctrl`` or the constraint solve it feeds.
 
+    The baseline is seeded NONZERO first -- ``set_ctrl``+``step``, exactly like the sibling
+    test above -- rather than read off the fresh fixture's already-zero ``data.ctrl``. Fix
+    round 1: capturing a zero baseline let a version that reintroduced only HALF of the removed
+    write (``self.data.ctrl[:] = 0.0``, with the scatter line that follows it removed or a
+    no-op) pass this test by coincidence -- ``data.ctrl`` stayed all-zero either way, so the
+    ``assert_array_equal`` below could not tell "never touched" apart from "touched and reset
+    to the same zero it already held". A nonzero baseline makes any write to ``data.ctrl``
+    visible, in either direction.
+
     Before this task, ``set_qpos`` scattered ``ctrl`` into ``data.ctrl`` BEFORE ``mj_forward``,
     so ``actuator_force`` (a quantity ``mj_forward`` COMPUTES from ``ctrl`` -- gain*ctrl for a
-    motor) reflected it. This asserts the opposite on both counts: ``data.ctrl`` itself must be
-    byte-for-byte unchanged by the call, and ``actuator_force`` -- the more load-bearing half,
-    since it fails even in a broken version where ``data.ctrl`` itself happens to look
-    untouched but ``ctrl`` was scattered somewhere else that still reaches the solve -- must
-    stay exactly what it was before, despite a nonzero ``ctrl`` having been supplied.
-    Reintroducing the old scatter-into-``data.ctrl``-before-``mj_forward`` write must turn this
-    red; see the task report for the verbatim failure.
+    motor, with no dependence on qpos for this fixture's plain ``<motor>`` actuators) reflected
+    it. This checks that BOTH ``data.ctrl`` and ``actuator_force`` stay exactly what the seeded
+    interactive ctrl alone produced, despite a DIFFERENT, nonzero ``ctrl`` having also been
+    supplied to ``set_qpos`` -- not that either reads as some fixed constant. This only pins
+    the two specific quantities asserted below (``data.ctrl`` and ``actuator_force``); it would
+    not catch a version that reached the solve through some other quantity entirely (e.g.
+    ``data.qfrc_applied``), which is a gap a separate assertion would be needed to close, not a
+    property this test claims to have. Reintroducing either half of the old
+    scatter-into-``data.ctrl``-before-``mj_forward`` write must turn this red; see the task
+    report for the verbatim failure.
     """
-    target = sess.model.qpos0.copy()
+    sess.set_ctrl({"coxa_T1_left": 0.7})
+    sess.step(1)  # composes ctrl and writes it into data.ctrl via the backend
     before_ctrl = sess.data.ctrl.copy()
+    before_force = sess.data.actuator_force.copy()
+    assert before_ctrl[0] != 0.0, "the seeded baseline must be nonzero for this pin to mean anything"
+
+    target = sess.model.qpos0.copy()
     sess.set_qpos(target, ctrl=[0.4, -0.6])
     np.testing.assert_array_equal(sess.data.ctrl, before_ctrl)
-    assert sess.data.actuator_force[0] == pytest.approx(0.0)
-    assert sess.data.actuator_force[1] == pytest.approx(0.0)
+    np.testing.assert_allclose(sess.data.actuator_force, before_force)
 
 
 def test_set_qpos_with_ctrl_still_drives_the_visualisation_only_store(sess):

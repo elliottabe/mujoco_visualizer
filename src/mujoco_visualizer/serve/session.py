@@ -611,10 +611,11 @@ class Session:
         Omitting ``ctrl`` (the default) leaves :attr:`_vis_ctrl` completely untouched -- exactly
         as omitting it used to leave ``data.ctrl`` untouched -- so every existing caller that
         only ever wrote qpos keeps behaving exactly as before. ``data.ctrl`` itself is never
-        touched by this method at all now, whether or not ``ctrl`` is given: it is left to
-        whatever the physics backend last put there (or, in a replaying session that never
-        steps physics, whatever ``mj_forward`` below computes from that unrelated, unwritten
-        value -- typically zero on a fresh session).
+        touched by this method at all now, whether or not ``ctrl`` is given: ``mj_forward``
+        below reads ``data.ctrl`` to compute derived quantities (``actuator_force`` and
+        friends) but does not write it, so it is simply left at whatever the physics backend
+        or the interactive-slider path (:meth:`_compose_ctrl`, via :meth:`step`) last put there
+        -- typically zero on a session that has never stepped or received a slider command.
         """
         arr = np.asarray(qpos, dtype=np.float64)
         if not np.isfinite(arr).all():
