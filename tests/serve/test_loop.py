@@ -85,7 +85,16 @@ _LOCK_WIDE_ALT_MODEL = mujoco.MjModel.from_xml_string(_LOCK_WIDE_ALT_XML)
 
 
 class FakeSession:
-    """Duck-typed stand-in for Session: records calls, renders a 1x1 frame."""
+    """Duck-typed stand-in for Session: records calls, renders a 1x1 frame.
+
+    Why a fake rather than a real ``Session``, beyond speed: a real one constructed OFF the
+    loop thread makes the loop's own ``render()`` raise ``EGL_BAD_ACCESS``, because a GL
+    context is thread-affine. The loop reports that as ``kind='render'`` and pauses, which
+    masks whatever the test was actually about behind an unrelated failure -- so a harness
+    that "just uses the real thing" tends to fail for a reason it did not intend to study.
+    Tests needing real rendering therefore build the ``Session`` on the loop thread, or live
+    in ``tests/serve/test_tendon_vis_live.py`` and drive ``Session`` directly instead.
+    """
 
     def __init__(self, diverge_after=None):
         self.width, self.height = 1, 1
@@ -935,11 +944,11 @@ class _PersistentMismatchSource:
 
 def test_ctrl_width_mismatch_zeroes_ctrl_rather_than_leaving_the_stale_value():
     """"We could not apply this frame's commands" must render as NO commands, not the
-    previous frame's -- once tendon colour/force rendering reads ctrl (an upcoming task), a
-    stale-but-plausible value would be a confident, wrong picture with no visible sign
-    anything failed. Also confirms the zeroing does NOT change the error classification: still
-    a non-pausing 'command' error with playback running, exactly like the width-mismatch test
-    above."""
+    previous frame's -- tendon colour/width rendering now reads exactly this ctrl (see
+    ``Session._apply_tendon_activation_vis``), so a stale-but-plausible value would be a
+    confident, wrong picture with no visible sign anything failed. Also confirms the zeroing
+    does NOT change the error classification: still a non-pausing 'command' error with
+    playback running, exactly like the width-mismatch test above."""
     source = _PersistentMismatchSource(
         np.arange(2 * 10 * 3, dtype=np.float32).reshape(2, 10, 3)
     )

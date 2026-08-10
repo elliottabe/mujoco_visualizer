@@ -656,14 +656,14 @@ class SimLoop(threading.Thread):
         The retry passes an EXPLICIT all-zero vector, sized to ``exc.expected_width``, through
         the exact same ``ctrl`` parameter a good vector takes -- not a separate zero-only
         mutation applied before a plain qpos write. "We could not apply this frame's commands"
-        must render as NO commands, not the previous frame's: once anything downstream reads
-        ``data.ctrl`` directly (tendon colour/thickness, force arrows computed from the real
-        command -- both planned, not yet built), a frozen-but-plausible stale value would be a
-        confident, WRONG picture with no visible sign anything failed. Routing the zero through
-        ``set_qpos``'s own scatter-then-forward is what makes that impossible to get wrong from
-        here: there is no ``Session`` method that zeroes ``data.ctrl`` without the write that
-        pushes it through ``mj_forward`` in the same call, so no future call site can zero
-        ctrl and then forget the solve.
+        must render as NO commands, not the previous frame's: ``Session._apply_tendon_
+        activation_vis`` reads exactly the vector this call maps into ``Session._vis_ctrl``
+        (never ``data.ctrl``, which replay does not write at all -- see ``Session.set_qpos``),
+        so a frozen-but-plausible stale value there would be a confident, WRONG picture with no
+        visible sign anything failed. Routing the zero through ``set_qpos``'s own seam is what
+        makes that impossible to get wrong from here: there is no ``Session`` method that zeroes
+        ``_vis_ctrl`` on its own, so no future call site can zero ctrl and then forget to also
+        apply the qpos write in the same call.
         """
         raw = self._source.qpos(self._clip, frame)
         qpos = apply_locks(raw, self._locks, self._jmap())

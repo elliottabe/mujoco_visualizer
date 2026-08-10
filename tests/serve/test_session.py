@@ -352,15 +352,56 @@ def test_set_qpos_with_no_ctrl_leaves_data_ctrl_untouched(sess):
     np.testing.assert_array_equal(sess.data.ctrl, before)
 
 
-def test_set_qpos_writes_ctrl_before_forward_so_actuator_force_reflects_it(sess):
-    """Proves ctrl actually reaches the constraint solve, not merely that data.ctrl holds the
-    value: actuator_force is a quantity mj_forward COMPUTES from ctrl (gain*ctrl for a motor),
-    so this fails if the write happened after forward, or not at all, even in a broken version
-    where data.ctrl itself looks correct."""
+def test_set_qpos_with_ctrl_never_touches_data_ctrl_or_the_solve(sess):
+    """The load-bearing pin for task 13c: replay's ``ctrl`` is visualisation-only now, and must
+    never reach ``data.ctrl`` or the constraint solve it feeds.
+
+    The baseline is seeded NONZERO first -- ``set_ctrl``+``step``, exactly like the sibling
+    test above -- rather than read off the fresh fixture's already-zero ``data.ctrl``. Fix
+    round 1: capturing a zero baseline let a version that reintroduced only HALF of the removed
+    write (``self.data.ctrl[:] = 0.0``, with the scatter line that follows it removed or a
+    no-op) pass this test by coincidence -- ``data.ctrl`` stayed all-zero either way, so the
+    ``assert_array_equal`` below could not tell "never touched" apart from "touched and reset
+    to the same zero it already held". A nonzero baseline makes any write to ``data.ctrl``
+    visible, in either direction.
+
+    Before this task, ``set_qpos`` scattered ``ctrl`` into ``data.ctrl`` BEFORE ``mj_forward``,
+    so ``actuator_force`` (a quantity ``mj_forward`` COMPUTES from ``ctrl`` -- gain*ctrl for a
+    motor, with no dependence on qpos for this fixture's plain ``<motor>`` actuators) reflected
+    it. This checks that BOTH ``data.ctrl`` and ``actuator_force`` stay exactly what the seeded
+    interactive ctrl alone produced, despite a DIFFERENT, nonzero ``ctrl`` having also been
+    supplied to ``set_qpos`` -- not that either reads as some fixed constant. This only pins
+    the two specific quantities asserted below (``data.ctrl`` and ``actuator_force``); it would
+    not catch a version that reached the solve through some other quantity entirely (e.g.
+    ``data.qfrc_applied``), which is a gap a separate assertion would be needed to close, not a
+    property this test claims to have. Reintroducing either half of the old
+    scatter-into-``data.ctrl``-before-``mj_forward`` write must turn this red; see the task
+    report for the verbatim failure.
+    """
+    sess.set_ctrl({"coxa_T1_left": 0.7})
+    sess.step(1)  # composes ctrl and writes it into data.ctrl via the backend
+    before_ctrl = sess.data.ctrl.copy()
+    before_force = sess.data.actuator_force.copy()
+    assert before_ctrl[0] != 0.0, "the seeded baseline must be nonzero for this pin to mean anything"
+
     target = sess.model.qpos0.copy()
     sess.set_qpos(target, ctrl=[0.4, -0.6])
-    assert sess.data.actuator_force[0] == pytest.approx(0.4)
-    assert sess.data.actuator_force[1] == pytest.approx(-0.6)
+    np.testing.assert_array_equal(sess.data.ctrl, before_ctrl)
+    np.testing.assert_allclose(sess.data.actuator_force, before_force)
+
+
+def test_set_qpos_with_ctrl_still_drives_the_visualisation_only_store(sess):
+    """The counterpart to the pin above: ``ctrl`` is not simply discarded -- it lands in
+    :attr:`Session._vis_ctrl`, active-model-ordered, exactly where it used to land in
+    ``data.ctrl``. Two different vectors must produce two different stored results (the same
+    'activation actually varies with ctrl' property task 14's tendon tests pin for the render
+    side -- see ``tests/serve/test_tendon_vis_live.py``), not just 'something changed'."""
+    target = sess.model.qpos0.copy()
+    sess.set_qpos(target, ctrl=[0.4, -0.6])
+    np.testing.assert_allclose(sess._vis_ctrl, [0.4, -0.6])
+
+    sess.set_qpos(target, ctrl=[0.9, 0.1])
+    np.testing.assert_allclose(sess._vis_ctrl, [0.9, 0.1])
 
 
 def test_set_qpos_rejects_a_wrong_width_ctrl(sess):
@@ -385,19 +426,21 @@ def test_ctrl_width_mismatch_carries_the_expected_width(sess):
 
 
 def test_set_qpos_has_no_zero_ctrl_style_sibling_that_bypasses_the_solve(sess):
-    """A rejected ctrl must only ever be clearable BY writing qpos (and so calling
-    mj_forward) in the same call. A name-specific check (``not hasattr(sess, "zero_ctrl")``)
-    only guards against THAT exact name coming back -- a ``reset_ctrl``-shaped reinstatement
-    would slip straight past it -- so this scans every public member for anything that even
-    LOOKS like a ctrl-mutating method, and only allows the ones that are legitimately
-    unrelated to the replay ctrl channel this task guards:
+    """A rejected ctrl must only ever be clearable BY writing qpos in the same call -- there
+    must be no separate method that zeroes the visualisation-only ctrl store on its own. A
+    name-specific check (``not hasattr(sess, "zero_ctrl")``) only guards against THAT exact
+    name coming back -- a ``reset_ctrl``-shaped reinstatement would slip straight past it -- so
+    this scans every public member for anything that even LOOKS like a ctrl-mutating method,
+    and only allows the ones that are legitimately unrelated to the replay ctrl channel this
+    task guards:
 
     - ``set_ctrl``/``set_ctrl_mode`` are the pre-existing INTERACTIVE-slider entry points
-      (composed via ``_compose_ctrl`` and applied on the next :meth:`Session.step`, not
-      written directly to ``data.ctrl`` the way replay's ctrl channel is).
+      (composed via ``_compose_ctrl`` and applied to ``data.ctrl`` on the next
+      :meth:`Session.step` via the physics backend -- physics ctrl, not the replay/visualisation
+      channel this task guards).
     - ``set_qpos`` is not a "sibling" of a zero-only method -- it IS the seam: the one place
-      that writes ``ctrl`` (when given one) and always follows with the qpos write and
-      ``mj_forward`` that make it real, in the same call.
+      that writes ``ctrl`` (when given one) into the visualisation-only store, always in the
+      same call as the qpos write and ``mj_forward``.
 
     Anything else with "ctrl" in its name is exactly the shape of method this task removed
     (``zero_ctrl``) and must not have reappeared under a different name.
@@ -472,9 +515,14 @@ def ctrl_map_session():
         s.close()
 
 
-def _force_by_name(model, data, name):
+def _vis_ctrl_by_name(model, session, name):
+    """The mapped value :meth:`Session.set_qpos` stored in :attr:`Session._vis_ctrl` for
+    actuator *name*, active-model-ordered -- the visualisation-only counterpart of the
+    ``data.actuator_force`` this file used to read before task 13c, which this same call no
+    longer perturbs at all (see ``test_set_qpos_with_ctrl_never_touches_data_ctrl_or_the_
+    solve``)."""
     aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
-    return float(data.actuator_force[aid])
+    return float(session._vis_ctrl[aid])
 
 
 def test_ctrl_maps_by_actuator_name_on_the_primary_model(ctrl_map_session):
@@ -482,9 +530,9 @@ def test_ctrl_maps_by_actuator_name_on_the_primary_model(ctrl_map_session):
     qpos = s.model.qpos0.copy()
     # Ordered exactly as the PRIMARY model declares its own actuators: m_a, m_b, m_c.
     s.set_qpos(qpos, ctrl=[1.0, 2.0, 3.0])
-    assert _force_by_name(s.model, s.data, "m_a") == pytest.approx(1.0)
-    assert _force_by_name(s.model, s.data, "m_b") == pytest.approx(2.0)
-    assert _force_by_name(s.model, s.data, "m_c") == pytest.approx(3.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_a") == pytest.approx(1.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_b") == pytest.approx(2.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_c") == pytest.approx(3.0)
 
 
 def test_ctrl_maps_by_name_not_position_on_the_scrambled_doubled_model(ctrl_map_session):
@@ -494,20 +542,21 @@ def test_ctrl_maps_by_name_not_position_on_the_scrambled_doubled_model(ctrl_map_
     on the CURRENTLY ACTIVE model -- and the un-driven '_ref' half must stay untouched."""
     s = ctrl_map_session
     s.swap_model("alt")
-    # Seed data.ctrl with an obviously-wrong value BEFORE the write below. A freshly-swapped
-    # MjData already starts at ctrl == 0, so without this the three `m_*_ref == 0.0`
-    # assertions below would pass whether or not set_qpos's own zero-fill (`self.data.ctrl[:]
-    # = 0.0`) ever ran -- there would be nothing non-zero for it to have cleared.
-    s.data.ctrl[:] = 5.0
+    # Seed the visualisation-only store with an obviously-wrong value BEFORE the write below.
+    # A freshly-swapped Session already starts _vis_ctrl at zero (see _rebuild_tendon_state),
+    # so without this the three `m_*_ref == 0.0` assertions below would pass whether or not
+    # set_qpos's own zero-fill (a fresh `np.zeros(self.model.nu)` per call) ever ran -- there
+    # would be nothing non-zero for it to have cleared.
+    s._vis_ctrl[:] = 5.0
     qpos = s.model.qpos0.copy()
     s.set_qpos(qpos, ctrl=[1.0, 2.0, 3.0])  # still primary-ordered: m_a=1, m_b=2, m_c=3
-    assert _force_by_name(s.model, s.data, "m_a") == pytest.approx(1.0)
-    assert _force_by_name(s.model, s.data, "m_b") == pytest.approx(2.0)
-    assert _force_by_name(s.model, s.data, "m_c") == pytest.approx(3.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_a") == pytest.approx(1.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_b") == pytest.approx(2.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_c") == pytest.approx(3.0)
     # The reference half is a kinematic overlay, never driven: it must stay at zero.
-    assert _force_by_name(s.model, s.data, "m_a_ref") == pytest.approx(0.0)
-    assert _force_by_name(s.model, s.data, "m_b_ref") == pytest.approx(0.0)
-    assert _force_by_name(s.model, s.data, "m_c_ref") == pytest.approx(0.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_a_ref") == pytest.approx(0.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_b_ref") == pytest.approx(0.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_c_ref") == pytest.approx(0.0)
 
 
 def test_ctrl_map_rebuilds_on_swap_back_even_when_the_forward_map_would_be_out_of_range(
@@ -523,7 +572,7 @@ def test_ctrl_map_rebuilds_on_swap_back_even_when_the_forward_map_would_be_out_o
     s = ctrl_map_session
     s.swap_model("alt")
     # If the forward rebuild had been skipped, `_ctrl_map` here would still be the identity
-    # `[0, 1, 2]` built at __init__ for primary -- writing THAT onto alt's data.ctrl silently
+    # `[0, 1, 2]` built at __init__ for primary -- writing THAT onto alt's _vis_ctrl silently
     # lands on whatever actuators happen to sit at ids 0/1/2 (m_c, m_a_ref, m_b -- see
     # _CTRL_ALT_XML), not m_a/m_b/m_c. The name-based map must instead point at m_a/m_b/m_c's
     # ACTUAL ids on alt.
@@ -536,9 +585,9 @@ def test_ctrl_map_rebuilds_on_swap_back_even_when_the_forward_map_would_be_out_o
     s.swap_model("primary")
     qpos = s.model.qpos0.copy()
     s.set_qpos(qpos, ctrl=[1.0, 2.0, 3.0])
-    assert _force_by_name(s.model, s.data, "m_a") == pytest.approx(1.0)
-    assert _force_by_name(s.model, s.data, "m_b") == pytest.approx(2.0)
-    assert _force_by_name(s.model, s.data, "m_c") == pytest.approx(3.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_a") == pytest.approx(1.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_b") == pytest.approx(2.0)
+    assert _vis_ctrl_by_name(s.model, s, "m_c") == pytest.approx(3.0)
 
 
 # Every ctrl-map fixture above has an alt model containing EVERY primary actuator name, so
@@ -592,7 +641,7 @@ def test_ctrl_map_skips_an_unmatched_primary_name_rather_than_wrapping_onto_the_
     for it must be -1 -- and ``set_qpos`` must SKIP that entry rather than let numpy's
     negative-index wraparound write ``m_missing``'s value into whatever actuator sits LAST on
     this model. Here that is ``m_real`` itself (id 0 on a single-actuator alt model, so
-    ``data.ctrl[-1]`` IS ``data.ctrl[0]``): without the ``valid = self._ctrl_map >= 0`` filter,
+    ``_vis_ctrl[-1]`` IS ``_vis_ctrl[0]``): without the ``valid = self._ctrl_map >= 0`` filter,
     ``m_missing``'s value (2.0) would overwrite ``m_real``'s correct one (1.0), because it is
     scattered SECOND in ``self._ctrl_map``'s own primary order. No other ctrl-map fixture in
     this file can ever produce a -1 (their alt models contain every primary name), so this one
@@ -604,8 +653,8 @@ def test_ctrl_map_skips_an_unmatched_primary_name_rather_than_wrapping_onto_the_
 
     qpos = s.model.qpos0.copy()
     s.set_qpos(qpos, ctrl=[1.0, 2.0])  # m_real=1.0, m_missing=2.0 (unmatched)
-    assert _force_by_name(s.model, s.data, "m_real") == pytest.approx(1.0), (
-        "m_missing's value must not have wrapped around via data.ctrl[-1] onto m_real's slot"
+    assert _vis_ctrl_by_name(s.model, s, "m_real") == pytest.approx(1.0), (
+        "m_missing's value must not have wrapped around via _vis_ctrl[-1] onto m_real's slot"
     )
 
 
