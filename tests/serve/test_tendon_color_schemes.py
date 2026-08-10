@@ -244,3 +244,51 @@ def test_a_single_model_session_drops_nothing(sess):
     """The exclusion must be invisible when every primary name matches -- which is every
     stock, single-model session."""
     assert len(sess._tendon_act_to_ten) == 2
+
+
+# -- legend aggregates -------------------------------------------------------------------------
+
+
+def test_scene_message_reports_group_colours_and_counts(sess):
+    sess.viz.vis_state["tendons"]["color_by"] = "byname"
+    scene = sess.scene_message()
+    assert scene["tendon_color_groups"] == {
+        "first": {"color": "#0000ff", "count": 1},
+        "second": {"color": "#ffff00", "count": 1},
+    }
+    assert scene["tendon_unclassified"] == 0
+
+
+def test_legend_counts_only_the_actuators_that_are_actually_drawn():
+    """Counted over the ctrl-map-filtered act_to_ten, not over model.nu -- otherwise a
+    reference-ghost session would report double what is on screen."""
+    primary = mujoco.MjModel.from_xml_string(_XML)
+    alt = mujoco.MjModel.from_xml_string(_ALT_XML)
+    s = Session(model=primary, alt_model=alt, width=64, height=48,
+                actuator_color_schemes=_SCHEMES)
+    try:
+        s.viz.vis_state["tendons"]["color_by"] = "byname"
+        s.swap_model("alt")
+        scene = s.scene_message()
+        assert scene["tendon_color_groups"] == {}
+        assert scene["tendon_unclassified"] == 0
+    finally:
+        s.close()
+
+
+def test_unclassified_actuators_are_counted_separately(sess):
+    sess._actuator_color_schemes["partial"] = {
+        "color": lambda n: "#0000ff" if n == "m_a" else "#888888",
+        "group": lambda n: "first" if n == "m_a" else "unknown",
+    }
+    sess.viz.vis_state["tendons"]["color_by"] = "partial"
+    scene = sess.scene_message()
+    assert scene["tendon_color_groups"] == {"first": {"color": "#0000ff", "count": 1}}
+    assert scene["tendon_unclassified"] == 1
+
+
+def test_uniform_scheme_reports_no_groups(sess):
+    sess.viz.vis_state["tendons"]["color_by"] = "uniform"
+    scene = sess.scene_message()
+    assert scene["tendon_color_groups"] == {}
+    assert scene["tendon_unclassified"] == 0

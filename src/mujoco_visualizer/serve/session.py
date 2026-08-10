@@ -15,7 +15,7 @@ touching this file.
 
 import copy
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import mujoco
 import numpy as np
@@ -1036,6 +1036,38 @@ class Session:
 
     # -- description -----------------------------------------------------------
 
+    def _tendon_legend(self) -> Tuple[Dict[str, Dict[str, object]], int]:
+        """``({group: {"color": hex, "count": n}}, unclassified_count)`` for the active scheme.
+
+        Computed HERE rather than in the browser because the grouping rule is a Python callable
+        the caller supplied; reimplementing it in JavaScript would be a second implementation of
+        one rule, free to drift from the colours actually rendered.
+
+        Counted over ``_tendon_act_to_ten`` -- the ctrl-map-filtered map that decides what is
+        actually drawn -- not over ``model.nu``, so a reference-ghost session reports what is on
+        screen rather than double it. A scheme with no ``group`` function (``uniform``, or an
+        unregistered name) reports nothing: there is no legend to draw for one colour.
+        """
+        scheme_name = self.viz.vis_state.get("tendons", {}).get("color_by", "function")
+        scheme = self._actuator_color_schemes.get(scheme_name, {})
+        group_fn, color_fn = scheme.get("group"), scheme.get("color")
+        if group_fn is None or color_fn is None:
+            return {}, 0
+
+        groups: Dict[str, Dict[str, object]] = {}
+        unclassified = 0
+        for act_id in sorted(self._tendon_act_to_ten):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, act_id)
+            if name is None:
+                continue
+            group = group_fn(name)
+            if group in ("unknown", "non_leg"):
+                unclassified += 1
+                continue
+            entry = groups.setdefault(group, {"color": color_fn(name), "count": 0})
+            entry["count"] += 1
+        return groups, unclassified
+
     def scene_message(self) -> Dict:
         """Description the client builds its whole UI from -- a SNAPSHOT, not a live view.
 
@@ -1054,6 +1086,7 @@ class Session:
         should answer, not raise.
         """
         backend = getattr(self, "backend", None)
+        groups, unclassified = self._tendon_legend()
         return {
             "t": "scene",
             "nq": int(self.model.nq),
@@ -1071,6 +1104,10 @@ class Session:
                 for name, (_adr, width) in build_joint_qpos_map(self.model).items()
             ],
             "cameras": self.viz.list_cameras(),
+            # Legend data for a tendon-colour panel. Additive: a client that does not know
+            # these keys is unaffected.
+            "tendon_color_groups": groups,
+            "tendon_unclassified": unclassified,
             "presets": self.viz.list_presets(),
             "settings": copy.deepcopy(self.viz.vis_state),
             # Flat names, not the {"name", "origin"} dicts list_available_settings()
