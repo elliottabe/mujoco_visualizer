@@ -403,9 +403,28 @@ def test_vis_state_roots_contains_exactly_the_roots_vis_state_actually_has():
     expected = {
         "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
         "camera", "camera_presets", "lighting", "floor", "skybox", "ghost",
-        "geom_render_state", "forces", "tendons",
+        "geom_render_state", "forces", "tendons", "force_arrows",
     }
     assert _VIS_STATE_ROOTS == expected
+
+
+def test_force_arrows_is_accepted_and_rejected_once_the_root_is_removed(monkeypatch):
+    """Both directions pinned in one test: accepted while 'force_arrows' is registered in
+    ``_VIS_STATE_ROOTS``, rejected the moment it is not -- so this test would itself fail if
+    the entry were ever silently dropped, unlike a test that only iterates the (possibly
+    already-shrunk) set."""
+    import mujoco_visualizer.serve.protocol as protocol_mod
+
+    cmd = parse_command({"t": "render", "set": {"force_arrows.enabled": True}})
+    assert cmd["set"] == {"force_arrows.enabled": True}
+
+    monkeypatch.setattr(
+        protocol_mod,
+        "_VIS_STATE_ROOTS",
+        protocol_mod._VIS_STATE_ROOTS - {"force_arrows"},
+    )
+    with pytest.raises(CommandError, match="force_arrows"):
+        parse_command({"t": "render", "set": {"force_arrows.enabled": True}})
 
 
 def test_render_accepts_a_bare_key_whose_name_is_itself_a_known_root():

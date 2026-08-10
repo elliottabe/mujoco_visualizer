@@ -15,7 +15,7 @@ touching this file.
 
 import copy
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import mujoco
 import numpy as np
@@ -171,6 +171,7 @@ class Session:
         backend: Optional[PhysicsBackend] = None,
         alt_model: Optional[mujoco.MjModel] = None,
         user_settings_dir: Optional[Path] = None,
+        scene_modifiers: Optional[Sequence[Callable]] = None,
         **viz_kwargs,
     ):
         # Where `save_settings_as` writes named presets, and where `load_settings` looks for
@@ -186,6 +187,27 @@ class Session:
         # already-absolute directory.
         self.user_settings_dir = (
             Path(user_settings_dir).resolve() if user_settings_dir is not None else None
+        )
+
+        # Extra per-frame scene decoration (e.g. recorded force-sensor arrows drawn via
+        # ``add_arrow_to_scene``): forwarded verbatim to ``Visualizer.render_with``'s existing
+        # ``modify_scene_fns`` by :meth:`render` below, on every call -- the LIVE path only,
+        # by construction, since this list lives on ``Session`` and ``ExportJob`` (serve/
+        # export.py) builds its own independent ``Visualizer`` on its own thread and never
+        # touches a ``Session`` at all. An export therefore does NOT currently honour anything
+        # registered here; see :meth:`render`'s docstring for why this is flagged as a finding
+        # rather than worked around in this seam.
+        #
+        # A plain mutable list, not a private attribute behind add/remove methods: callers
+        # already compose ``modify_scene_fns`` as "a sequence of callables" everywhere else in
+        # this package (``render_with``, ``render_video``, ``render_video_pan``), and a caller
+        # here needs nothing beyond append/remove/clear/reassign, all of which a list already
+        # gives for free. The constructor argument seeds it for a caller that knows its
+        # modifiers up front; mutating the attribute after construction (``session.
+        # scene_modifiers.append(fn)``) is equally supported and is how a caller that discovers
+        # or toggles a modifier later (e.g. the force-arrows launcher) is expected to use it.
+        self.scene_modifiers: List[Callable] = (
+            list(scene_modifiers) if scene_modifiers is not None else []
         )
 
         self.viz = Visualizer(
@@ -606,8 +628,23 @@ class Session:
     # -- rendering -------------------------------------------------------------
 
     def render(self) -> np.ndarray:
+        """Render the current frame, including whatever :attr:`scene_modifiers` holds.
+
+        Forwarded to :meth:`Visualizer.render_with`'s existing ``modify_scene_fns`` -- this is
+        the ONLY seam that exists for extra per-frame scene geometry (e.g. recorded
+        force-sensor arrows) on the live path. It does NOT reach an export: ``ExportJob``
+        (serve/export.py) builds its own ``Visualizer`` from a ``vis_state`` snapshot on its
+        own thread and calls ``render_with`` with no ``modify_scene_fns`` at all -- it has no
+        parameter for one, and nothing here changes that. An exported video therefore
+        currently lacks whatever :attr:`scene_modifiers` draws in the live preview; wiring
+        ``ExportJob`` to accept and forward its own ``modify_scene_fns`` is a structurally
+        separate change (a different class, a different thread, a different constructor) and
+        is left as a follow-up rather than worked around here.
+        """
         self._apply_tendon_activation_vis()
-        return self.viz.render_with(self._renderer, camera=self._camera)
+        return self.viz.render_with(
+            self._renderer, camera=self._camera, modify_scene_fns=self.scene_modifiers
+        )
 
     def encode(self, frame: np.ndarray) -> bytes:
         return simplejpeg.encode_jpeg(
