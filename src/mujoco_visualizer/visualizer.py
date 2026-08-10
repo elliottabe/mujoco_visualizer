@@ -69,7 +69,8 @@ def _rgb_to_hex(rgb: Sequence[float]) -> str:
 
 
 def _apply_forces_vis(forces: dict, model: mujoco.MjModel) -> None:
-    """Write the five force/torque arrow-scaling fields in *forces* onto *model.vis*.
+    """Write whichever of the five force/torque arrow-scaling fields *forces* mentions onto
+    *model.vis*, leaving any field it does not mention at whatever the model already holds.
 
     These fields (``map.force``/``map.torque``/``scale.forcewidth``/``scale.contactwidth``/
     ``scale.contactheight``) control ``mjVIS_CONTACTFORCE`` arrow length and width, but unlike
@@ -77,17 +78,34 @@ def _apply_forces_vis(forces: dict, model: mujoco.MjModel) -> None:
     ``MjvOption`` -- so there is no scene-option flag to flip, and no reason to expect a fresh
     render to pick these up on its own after the model object itself changes.
 
+    Partial-dict tolerance is deliberate, not an oversight: :func:`render_settings.apply_settings`
+    hands this function a raw settings dict from a caller who may reasonably type
+    ``{'forces': {'map_force': 0.07}}`` -- the one field they are tuning, not all five. Requiring
+    every key crashed that call with a bare ``KeyError``. The fix is NOT to fill the other four
+    from MuJoCo's library defaults before calling this -- that would silently overwrite whatever
+    the MJCF set for every field the caller did not mention, which is exactly the hardcode
+    hazard requirement 1 (initialise ``vis_state`` from the model, never a constant) exists to
+    prevent, one call later. ``Visualizer._apply_forces`` and
+    ``session._carry_vis_state_across_swap`` both always pass a complete dict (``vis_state``
+    holds all five keys from ``__init__`` onward), so this is unobservable from either of them --
+    only :func:`apply_settings`'s raw, caller-supplied dict can be partial.
+
     That is exactly why this is a free function rather than only a ``Visualizer`` method:
-    :meth:`Visualizer._apply_forces` calls it against ``self.model`` on every render, and
-    ``session._carry_vis_state_across_swap`` calls it again, directly against the freshly
-    swapped-in model, because that model's own MJCF may set entirely different values and a
-    swap does not otherwise touch it at all.
+    :meth:`Visualizer._apply_forces` calls it against ``self.model`` on every render,
+    ``session._carry_vis_state_across_swap`` calls it again directly against the freshly
+    swapped-in model, and ``render_settings.apply_settings`` calls it a third time against a
+    caller-supplied settings dict that need not be complete.
     """
-    model.vis.map.force          = forces['map_force']
-    model.vis.map.torque         = forces['map_torque']
-    model.vis.scale.forcewidth   = forces['scale_forcewidth']
-    model.vis.scale.contactwidth = forces['scale_contactwidth']
-    model.vis.scale.contactheight = forces['scale_contactheight']
+    if 'map_force' in forces:
+        model.vis.map.force = forces['map_force']
+    if 'map_torque' in forces:
+        model.vis.map.torque = forces['map_torque']
+    if 'scale_forcewidth' in forces:
+        model.vis.scale.forcewidth = forces['scale_forcewidth']
+    if 'scale_contactwidth' in forces:
+        model.vis.scale.contactwidth = forces['scale_contactwidth']
+    if 'scale_contactheight' in forces:
+        model.vis.scale.contactheight = forces['scale_contactheight']
 
 
 def _make_sky_pixels(

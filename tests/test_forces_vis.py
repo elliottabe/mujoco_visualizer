@@ -290,3 +290,48 @@ def test_apply_settings_apply_forces_false_skips_the_write():
     }}, apply_forces=False)
 
     assert model.vis.map.force == pytest.approx(original)
+
+
+# -- a partial 'forces' dict must not crash -----------------------------------------------------
+#
+# apply_settings is the public, notebook-facing entry point, and a partial group is the natural
+# thing to hand it: {'forces': {'map_force': 0.07}} is what someone tuning just the arrow length
+# actually types, not all five fields. _apply_forces_vis must write only the keys present and
+# leave the rest at whatever the model already holds -- filling in MuJoCo's own library defaults
+# for the unmentioned fields would reintroduce the exact hardcode-instead-of-read-the-model bug
+# requirement 1 exists to prevent, just one call later.
+
+
+def test_apply_settings_with_a_partial_forces_dict_updates_only_the_mentioned_fields():
+    from mujoco_visualizer.render_settings import apply_settings
+
+    xml = (
+        "<mujoco><visual><map force='9.0' torque='0.5'/>"
+        "<scale forcewidth='0.2' contactwidth='0.4' contactheight='0.06'/></visual>"
+        "<worldbody><geom type='box' size='.1 .1 .1'/></worldbody></mujoco>"
+    )
+    model = mujoco.MjModel.from_xml_string(xml)
+
+    apply_settings(model, {"forces": {"map_force": 0.0664, "scale_forcewidth": 0.25}})
+
+    assert model.vis.map.force == pytest.approx(0.0664)          # mentioned: changed
+    assert model.vis.scale.forcewidth == pytest.approx(0.25)     # mentioned: changed
+    # unmentioned: untouched -- still the model's own MJCF values, not a library default
+    assert model.vis.map.torque == pytest.approx(0.5)
+    assert model.vis.scale.contactwidth == pytest.approx(0.4)
+    assert model.vis.scale.contactheight == pytest.approx(0.06)
+
+
+def test_apply_settings_with_a_single_key_forces_dict_updates_only_that_field():
+    """The single-key case is what a user actually types -- {'map_force': ...} alone -- so it
+    gets its own test rather than relying on the two-key case above to stand in for it."""
+    from mujoco_visualizer.render_settings import apply_settings
+
+    xml = "<mujoco><visual><map force='9.0' torque='0.5'/></visual>" \
+          "<worldbody><geom type='box' size='.1 .1 .1'/></worldbody></mujoco>"
+    model = mujoco.MjModel.from_xml_string(xml)
+
+    apply_settings(model, {"forces": {"map_force": 0.07}})
+
+    assert model.vis.map.force == pytest.approx(0.07)
+    assert model.vis.map.torque == pytest.approx(0.5)  # untouched
