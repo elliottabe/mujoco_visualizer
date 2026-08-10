@@ -224,12 +224,43 @@ def test_saving_twice_overwrites_rather_than_duplicating(sess):
 
 
 def test_a_preset_is_a_snapshot_not_a_live_view(sess):
-    """It must not track later camera movement -- otherwise every preset is the same camera."""
+    """It must not track later camera movement -- otherwise every preset is the same camera.
+
+    Exercises the ordinary path a client actually takes: a later ``set_camera`` call, which
+    reassigns ``lookat`` rather than mutating it in place. See
+    ``test_a_preset_survives_in_place_mutation_of_the_live_camera_dict`` for the in-place
+    mutation case, which this call shape can never reach.
+    """
     sess.set_camera(az=10.0, lookat=[0.0, 0.0, 0.0])
     sess.save_camera_preset("frozen")
     sess.set_camera(az=99.0, lookat=[9.0, 9.0, 9.0])
     stored = sess.viz.vis_state["camera_presets"]["frozen"]
     assert stored["azimuth"] == pytest.approx(10.0)
+    assert stored["lookat"] == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_a_preset_survives_in_place_mutation_of_the_live_camera_dict(sess):
+    """The property that actually matters: a saved preset is isolated from later mutation of
+    the live camera, including mutation that never goes through ``set_camera`` at all.
+
+    ``camera_state()`` already returns a fresh dict and a fresh ``lookat`` list on every
+    call, and ``set_camera`` always reassigns ``cam["lookat"]`` rather than mutating it -- so
+    today isolation holds even before ``save_camera_preset``'s own ``copy.deepcopy`` runs.
+    That deep copy is defence in depth, not the thing this test is pinning; what matters is
+    the end-to-end guarantee below, covering both the in-place path (mutating the existing
+    list object ``set_camera`` would never produce) and the reassignment path.
+    """
+    sess.set_camera(az=10.0, lookat=[0.0, 0.0, 0.0])
+    sess.save_camera_preset("frozen")
+
+    # In-place: mutate the existing list object directly, never reassign it.
+    sess.viz.vis_state["camera"]["lookat"][0] = 9.9
+    stored = sess.viz.vis_state["camera_presets"]["frozen"]
+    assert stored["lookat"] == pytest.approx([0.0, 0.0, 0.0])
+
+    # Reassignment, via the ordinary client-facing call.
+    sess.set_camera(lookat=[8.0, 8.0, 8.0])
+    stored = sess.viz.vis_state["camera_presets"]["frozen"]
     assert stored["lookat"] == pytest.approx([0.0, 0.0, 0.0])
 
 
@@ -276,6 +307,11 @@ def test_presets_ride_the_settings_round_trip(sess, tmp_path):
     try:
         fresh.viz.load_settings(bundle)
         assert "persisted" in fresh.viz.vis_state["camera_presets"]
+        # Not just the key: a bug that preserved the name but dropped its fields (e.g. an
+        # empty dict, or a partial merge) would still pass the membership check above.
+        assert fresh.viz.vis_state["camera_presets"]["persisted"]["azimuth"] == pytest.approx(
+            77.0
+        )
     finally:
         fresh.close()
 

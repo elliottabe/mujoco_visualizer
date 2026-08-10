@@ -959,8 +959,13 @@ class Session:
     def save_camera_preset(self, name: str) -> None:
         """Snapshot the current free camera into ``vis_state['camera_presets'][name]``.
 
-        A deep copy, so the preset is a shot rather than a live view of the camera -- without
-        it every preset would alias the same dict and all of them would follow the next drag.
+        Isolation from later camera movement comes today from :meth:`camera_state` itself: it
+        builds a fresh dict and a fresh ``lookat`` list on every call, and :meth:`set_camera`
+        always reassigns ``cam["lookat"]`` rather than mutating it in place, so nothing here
+        aliases anything ``set_camera`` will touch next. The ``copy.deepcopy`` below is
+        defence in depth on top of that, not the thing currently doing the work -- cheap
+        insurance against a future ``camera_state`` that starts handing back a live reference
+        instead of a fresh one.
 
         Persistence needs no code here: ``Visualizer.save_settings`` already emits
         ``camera_presets`` and ``load_settings`` merges it, so a preset survives a restart via
