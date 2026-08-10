@@ -20,7 +20,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import mujoco
 import numpy as np
@@ -191,6 +191,145 @@ def add_arrow_to_scene(
         to=np.asarray(to, dtype=float),
     )
     scene.ngeom += 1
+
+
+def build_actuator_tendon_map(
+    model: mujoco.MjModel,
+    actuator_color_fn: Optional[Callable] = None,
+) -> Tuple[Dict[int, int], np.ndarray]:
+    """``{actuator id: tendon id}`` for every actuator whose transmission is a tendon, plus a
+    ``(model.nu, 4)`` base RGBA array carrying each such actuator's colour.
+
+    Pure and read-only -- never mutates *model*. Built from ``actuator_trntype ==
+    mjTRN_TENDON`` and ``actuator_trnid[i, 0]``, i.e. from whichever model is passed in, never
+    by position against some other model -- so a caller that keeps this map cached across a
+    reference-ghost swap (``ntendon``/``nu`` roughly doubling) MUST call this again on the new
+    model rather than reusing the old map's ids against it.
+
+    *actuator_color_fn*, when given, is called as ``(name: str) -> color`` where *color* is a
+    hex string (e.g. ``'#d84a2e'``) or an RGBA 4-tuple; an actuator it does not cover, or no
+    function at all, falls back to solid red -- the same fallback
+    :meth:`Visualizer.render_video_pan` already used before this map-building loop was
+    extracted out of it.
+    """
+    act_to_ten: Dict[int, int] = {}
+    base_rgba = np.zeros((model.nu, 4), dtype=np.float32)
+    _mjTRN_TENDON = int(mujoco.mjtTrn.mjTRN_TENDON)
+    for i in range(model.nu):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
+        if name is None:
+            continue
+        trntype = int(model.actuator_trntype[i])
+        trnid = model.actuator_trnid[i, 0]
+        if trntype == _mjTRN_TENDON and 0 <= trnid < model.ntendon:
+            act_to_ten[i] = trnid
+            if actuator_color_fn is not None:
+                clr = actuator_color_fn(name)
+                if isinstance(clr, str):
+                    clr = _hex_to_rgb(clr) + [1.0]
+                base_rgba[i] = clr
+            else:
+                base_rgba[i] = [0.85, 0.15, 0.15, 1.0]
+    return act_to_ten, base_rgba
+
+
+def apply_tendon_activation(
+    model: mujoco.MjModel,
+    ctrl: Sequence[float],
+    act_to_ten: Dict[int, int],
+    base_rgba: np.ndarray,
+    *,
+    tendon_width: float = 0.003,
+    tendon_min_width: float = 0.0005,
+    tendon_alpha_min: float = 0.05,
+    tendon_baseline: float = 0.0,
+    ctrl_max: float = 1.0,
+) -> None:
+    """Colour and thicken muscle tendons by ``|ctrl|`` activation, for one frame.
+
+    Writes ``model.tendon_rgba`` (alpha) and ``model.tendon_width`` in place -- nothing is
+    returned. Every tendon NOT in ``act_to_ten.values()`` is hidden (``tendon_rgba[:, 3] =
+    0.0``) on every call, so this function is self-contained and idempotent per frame: a
+    caller need not separately hide non-muscle tendons once up front before the first call.
+
+    For each muscle actuator/tendon pair, ``|ctrl[act_id]| / ctrl_max`` is clipped to
+    ``[0, 1]``, blended with ``tendon_baseline`` (so e.g. 0.3 keeps low activations visibly
+    above ``tendon_min_width``/``tendon_alpha_min`` rather than fading to nothing), and the
+    result drives BOTH the tendon's alpha (floored at ``tendon_alpha_min``) and its width
+    (interpolated between ``tendon_min_width`` and ``tendon_width``).
+
+    ``ctrl_max`` is a single caller-supplied scalar, not computed here: this function has no
+    lookahead across frames (see :meth:`Visualizer.render_video_pan`, which computes it once
+    from the whole ``ctrls`` clip, and the live-serving path in ``serve/session.py``, which
+    computes it once from the model's own actuator ``ctrlrange`` -- see that module's
+    docstring for why a per-frame recomputed max is the wrong choice).
+
+    Does NOT snapshot or restore the model's original tendon_rgba/tendon_width -- that is the
+    caller's responsibility (both existing callers need different "off" semantics: render_video_
+    pan restores once after its whole clip, the live viewer restores every frame tendons are
+    disabled).
+    """
+    ctrl = np.asarray(ctrl, dtype=float)
+    muscle_ten_ids = set(act_to_ten.values())
+    for t in range(model.ntendon):
+        if t not in muscle_ten_ids:
+            model.tendon_rgba[t, 3] = 0.0
+    width_range = tendon_width - tendon_min_width
+    denom = max(float(ctrl_max), 1e-8)
+    for act_id, ten_id in act_to_ten.items():
+        raw = float(np.clip(abs(ctrl[act_id]) / denom, 0.0, 1.0))
+        norm = tendon_baseline + (1.0 - tendon_baseline) * raw
+        alpha = max(norm, tendon_alpha_min)
+        model.tendon_rgba[ten_id] = base_rgba[act_id] * np.array([1, 1, 1, alpha])
+        model.tendon_width[ten_id] = tendon_min_width + width_range * norm
+
+
+def default_tendon_ctrl_full_scale(
+    model: mujoco.MjModel,
+    act_to_ten: Optional[Dict[int, int]] = None,
+) -> float:
+    """The model-only default for ``apply_tendon_activation``'s ``ctrl_max``: the largest
+    ``|ctrlrange|`` bound declared by any tendon-driving, ctrl-limited actuator on *model*, or
+    ``1.0`` if none declare one. *act_to_ten*, when already available (e.g. a caller that has
+    already called :func:`build_actuator_tendon_map`), is reused instead of rebuilding it.
+
+    THIS IS A THEORETICAL CEILING, NOT A MEASURED ONE, and on the real fly model it is a
+    misleading one on its own: ``actuator_ctrlrange`` over the 258 tendon-driving actuators
+    (all ctrl-limited) spans -1.05 to 1, so this returns 1.05 -- but a trained policy's actual
+    ``|ctrl|`` occupies only a small fraction of that ceiling. Measured on a real rollout
+    (clip 65, frames 200-320)::
+
+        |ctrl| p50  = 0.0246   -> normalised against 1.05: 0.023
+               p90  = 0.0555   ->                          0.053
+               p99  = 0.1442   ->                          0.137
+               max  = 0.6287   ->                          0.599
+
+    Normalising against 1.05 therefore renders essentially every tendon near minimum width and
+    alpha almost all the time -- a uniformly dim, inert-looking picture that shows almost none
+    of the variation it exists to show, the same trap as MuJoCo's native force arrows being
+    invisible at their principled-but-wrong-scale default.
+
+    This function/value is only ever meant to be vis_state['tendons']['ctrl_full_scale']'s
+    FALLBACK default -- what a viewer with no rollout loaded has nothing better to show. A
+    caller that HAS the actual data (the serve-layer launcher, which loads the rollout) should
+    override ``vis_state['tendons']['ctrl_full_scale']`` with a measured percentile of
+    ``|ctrl|`` across it instead of trusting this ceiling. That override is intentionally not
+    done here, or anywhere per-frame: recomputing it from ``data.ctrl`` inside the apply path
+    (per-frame, or a running max) would reintroduce exactly the problem a fixed reference value
+    exists to avoid -- every frame's brightest muscle would render equally bright regardless of
+    how active the animal actually is, making a quiet frame indistinguishable from a loud one.
+    """
+    if act_to_ten is None:
+        act_to_ten, _ = build_actuator_tendon_map(model)
+    bounds = [
+        max(
+            abs(float(model.actuator_ctrlrange[a, 0])),
+            abs(float(model.actuator_ctrlrange[a, 1])),
+        )
+        for a in act_to_ten
+        if bool(model.actuator_ctrllimited[a])
+    ]
+    return max(bounds) if bounds else 1.0
 
 
 def get_wing_fluid_idxs(model: mujoco.MjModel, suffix='') -> List[int]:
@@ -549,6 +688,36 @@ class Visualizer:
                 'scale_contactwidth': float(self.model.vis.scale.contactwidth),
                 'scale_contactheight': float(self.model.vis.scale.contactheight),
             },
+            # Muscle-tendon activation colouring/thickening (see ``apply_tendon_activation``).
+            # ``max_width``/``min_width`` are read from ``self.model.tendon_width`` -- NOT
+            # hardcoded -- for the same reason ``forces`` above reads ``self.model.vis``: the
+            # fly's MJCF ships tendon widths (min ~0.00015, max ~0.003) that a hardcoded
+            # default would silently overwrite the moment a Visualizer is constructed. A model
+            # with no tendons at all has no widths to read, so it falls back to
+            # render_video_pan's own long-standing defaults (0.003/0.0005) -- there is nothing
+            # else to read, and this group is inert on such a model anyway (``enabled`` stays
+            # off and there is nothing for it to colour).
+            # ``ctrl_full_scale`` is a REFERENCE/full-scale |ctrl| value for normalisation, not
+            # a measured one -- see ``default_tendon_ctrl_full_scale``'s docstring for the
+            # measured gap on the real fly (ctrlrange ceiling 1.05 vs. a trained policy's
+            # actual |ctrl| sitting at p50 0.0246 / p90 0.0555 / p99 0.1442 / max 0.6287 on a
+            # real rollout) that makes this model-only default look uniformly dim on real
+            # data. It is deliberately overridable: a caller holding the actual rollout (the
+            # serve-layer launcher) should replace it with a measured percentile of |ctrl|
+            # across that rollout -- this key exists so a viewer with nothing else to go on
+            # still has a principled model-only fallback.
+            'tendons': {
+                'enabled':   False,
+                'max_width': (
+                    float(self.model.tendon_width.max()) if self.model.ntendon else 0.003
+                ),
+                'min_width': (
+                    float(self.model.tendon_width.min()) if self.model.ntendon else 0.0005
+                ),
+                'min_alpha': 0.05,
+                'baseline':  0.0,
+                'ctrl_full_scale': default_tendon_ctrl_full_scale(self.model),
+            },
             'camera_presets': {},
         }
 
@@ -725,7 +894,7 @@ class Visualizer:
         # default __init__ set, never an error and never a synthesized value.
         for key in ('colors', 'geom_colors', 'alpha', 'vis_flags',
                     'geom_groups', 'site_groups', 'camera', 'lighting',
-                    'floor', 'skybox', 'ghost', 'forces'):
+                    'floor', 'skybox', 'ghost', 'forces', 'tendons'):
             if key in settings:
                 if isinstance(settings[key], dict) and isinstance(self.vis_state.get(key), dict):
                     self.vis_state[key] = {**self.vis_state[key], **settings[key]}
@@ -778,6 +947,7 @@ class Visualizer:
             'floor':             copy.deepcopy(self.vis_state['floor']),
             'skybox':            copy.deepcopy(self.vis_state['skybox']),
             'forces':            copy.deepcopy(self.vis_state['forces']),
+            'tendons':           copy.deepcopy(self.vis_state['tendons']),
             'geom_render_state': geom_render_state,
             'camera_presets':    self.vis_state.get('camera_presets', {}),
             # .get(..., {}), not ['ghost'], because this key was added after every existing
@@ -1258,37 +1428,16 @@ class Visualizer:
         # Optional muscle visualization
         show_muscles = ctrls is not None
         orig_tendon_rgba = orig_tendon_width = act_to_ten = base_rgba = None
+        ctrl_max = 1.0
         if show_muscles:
             ctrls = np.asarray(ctrls)
             # mjVIS_TENDON defaults to on in a freshly-built MjvOption() (verified), which
             # is what render_with constructs per frame, so no explicit override is needed.
             # Resolve color function: parameter > self attribute > solid red.
             _color_fn = actuator_color_fn or getattr(self, 'actuator_color_fn', None)
-            act_to_ten = {}
-            base_rgba = np.zeros((self.model.nu, 4), dtype=np.float32)
-            _mjTRN_TENDON = int(mujoco.mjtTrn.mjTRN_TENDON)
-            for i in range(self.model.nu):
-                name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
-                if name is None:
-                    continue
-                trntype = int(self.model.actuator_trntype[i])
-                trnid = self.model.actuator_trnid[i, 0]
-                if trntype == _mjTRN_TENDON and 0 <= trnid < self.model.ntendon:
-                    act_to_ten[i] = trnid
-                    if _color_fn is not None:
-                        clr = _color_fn(name)
-                        if isinstance(clr, str):
-                            clr = _hex_to_rgb(clr) + [1.0]
-                        base_rgba[i] = clr
-                    else:
-                        base_rgba[i] = [0.85, 0.15, 0.15, 1.0]
+            act_to_ten, base_rgba = build_actuator_tendon_map(self.model, _color_fn)
             orig_tendon_rgba = self.model.tendon_rgba.copy()
             orig_tendon_width = self.model.tendon_width.copy()
-            muscle_ten_ids = set(act_to_ten.values())
-            for t in range(self.model.ntendon):
-                if t not in muscle_ten_ids:
-                    self.model.tendon_rgba[t, 3] = 0.0
-            width_range = tendon_width - tendon_min_width
             # Normalize to global max across all timesteps
             ctrl_max = max(float(np.abs(ctrls).max()), 1e-8)
 
@@ -1301,15 +1450,17 @@ class Visualizer:
             mujoco.mj_forward(self.model, self.data)
 
             if show_muscles and act_to_ten is not None:
-                ctrl_i = ctrls[i]
-                for act_id, ten_id in act_to_ten.items():
-                    raw = float(np.clip(abs(ctrl_i[act_id]) / ctrl_max, 0.0, 1.0))
-                    norm = tendon_baseline + (1.0 - tendon_baseline) * raw
-                    alpha = max(norm, tendon_alpha_min)
-                    self.model.tendon_rgba[ten_id] = (
-                        base_rgba[act_id] * np.array([1, 1, 1, alpha])
-                    )
-                    self.model.tendon_width[ten_id] = tendon_min_width + width_range * norm
+                apply_tendon_activation(
+                    self.model,
+                    ctrls[i],
+                    act_to_ten,
+                    base_rgba,
+                    tendon_width=tendon_width,
+                    tendon_min_width=tendon_min_width,
+                    tendon_alpha_min=tendon_alpha_min,
+                    tendon_baseline=tendon_baseline,
+                    ctrl_max=ctrl_max,
+                )
 
             frames.append(
                 self.render_with(
