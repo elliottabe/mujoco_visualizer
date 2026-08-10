@@ -131,3 +131,112 @@ def test_internal_qpos_array_is_frozen():
 
     with pytest.raises(ValueError, match="read-only"):
         src._qpos[0, 0, 0] = 999.0
+
+
+# -- ctrl channel --------------------------------------------------------------
+#
+# has_ctrl is the explicit query a consumer must check before ever calling ctrl() -- a source
+# with none must stay a fully valid TrajectorySource, so has_ctrl defaults to False rather
+# than ctrl() being discovered by catching whatever calling it on a ctrl-less source raises.
+
+
+def make_ctrl(n_clips=3, n_frames=5, nu=2):
+    """Distinct value per (clip, frame, actuator), offset from qpos's own range so a mix-up
+    between the two channels is visible, not plausible."""
+    return (
+        100_000
+        + np.arange(n_clips * n_frames * nu, dtype=np.float32).reshape(n_clips, n_frames, nu)
+    )
+
+
+def test_source_with_no_ctrl_reports_has_ctrl_false():
+    src = ArrayTrajectorySource(make_qpos())
+    assert src.has_ctrl is False
+
+
+class _BareThreeMemberSource:
+    """The ORIGINAL ``TrajectorySource`` shape -- exactly ``n_clips``/``clip_length``/``qpos``,
+    predating the ctrl channel entirely. No ``has_ctrl``, no ``ctrl``.
+
+    ``ArrayTrajectorySource`` cannot stand in for this: it defines both ``has_ctrl`` and
+    ``ctrl`` itself, so it would satisfy ``isinstance(src, TrajectorySource)`` even in a
+    (buggy) world where those two members were added directly onto the base protocol and made
+    MANDATORY for every implementor -- ``@runtime_checkable`` checks structural presence of
+    every declared member, so a legacy three-member source is the only thing that can actually
+    catch that regression.
+    """
+
+    def __init__(self, qpos):
+        self._src = ArrayTrajectorySource(qpos)
+
+    @property
+    def n_clips(self) -> int:
+        return self._src.n_clips
+
+    def clip_length(self, clip: int) -> int:
+        return self._src.clip_length(clip)
+
+    def qpos(self, clip: int, frame: int) -> np.ndarray:
+        return self._src.qpos(clip, frame)
+
+
+def test_a_bare_legacy_source_still_satisfies_the_protocol():
+    """A source with only the three original members -- no has_ctrl, no ctrl -- must still be
+    a complete, valid TrajectorySource: the ctrl channel is optional, not a new required
+    member every implementor must supply."""
+    src = _BareThreeMemberSource(make_qpos())
+    assert isinstance(src, TrajectorySource)
+
+
+def test_a_source_with_ctrl_also_satisfies_the_richer_ctrl_protocol():
+    from mujoco_visualizer.serve.replay import CtrlTrajectorySource
+
+    src = ArrayTrajectorySource(make_qpos(), ctrl=make_ctrl())
+    assert isinstance(src, CtrlTrajectorySource)
+
+
+def test_source_with_ctrl_reports_has_ctrl_true_and_matching_width():
+    src = ArrayTrajectorySource(make_qpos(n_clips=3, n_frames=5, nq=4), ctrl=make_ctrl(nu=2))
+    assert src.has_ctrl is True
+    assert src.nu == 2
+
+
+def test_ctrl_returns_the_requested_frame_as_float64():
+    q = make_qpos(n_clips=3, n_frames=5, nq=4)
+    c = make_ctrl(n_clips=3, n_frames=5, nu=2)
+    src = ArrayTrajectorySource(q, ctrl=c)
+    got = src.ctrl(1, 3)
+    np.testing.assert_array_equal(got, c[1, 3])
+    assert got.dtype == np.float64
+
+
+def test_ctrl_returns_a_copy_not_a_view():
+    src = ArrayTrajectorySource(make_qpos(), ctrl=make_ctrl())
+    got = src.ctrl(0, 0)
+    got[:] = -1.0
+    second = src.ctrl(0, 0)
+    assert not np.allclose(got, second), "mutating the returned array reached the shared store"
+
+
+def test_ctrl_out_of_range_frame_raises_indexerror():
+    src = ArrayTrajectorySource(
+        make_qpos(n_frames=5), ctrl=make_ctrl(n_frames=5), lengths=np.array([5, 2, 3])
+    )
+    with pytest.raises(IndexError, match="frame 3 out of range"):
+        src.ctrl(1, 3)
+
+
+def test_ctrl_rejects_wrong_ndim():
+    with pytest.raises(ValueError, match="3-D"):
+        ArrayTrajectorySource(make_qpos(), ctrl=np.zeros((3, 5)))
+
+
+def test_ctrl_rejects_a_clip_or_frame_count_mismatch_with_qpos():
+    with pytest.raises(ValueError, match="n_clips, n_frames"):
+        ArrayTrajectorySource(make_qpos(n_clips=3, n_frames=5), ctrl=make_ctrl(n_clips=2, n_frames=5))
+
+
+def test_calling_ctrl_on_a_ctrl_less_source_raises_rather_than_returning_junk():
+    src = ArrayTrajectorySource(make_qpos())
+    with pytest.raises(ValueError, match="has_ctrl"):
+        src.ctrl(0, 0)
