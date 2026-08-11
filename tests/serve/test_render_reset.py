@@ -135,7 +135,18 @@ def test_reset_restores_every_root_to_its_launch_value(sess):
 
 def test_reset_does_not_write_geom_render_state(sess):
     """R5. `geom_render_state` is a raw gid->rgba cache baked against one model topology;
-    `load_settings` already refuses to apply it, and reset must not either."""
+    `load_settings` already refuses to apply it, and reset must not either.
+
+    `vis_state` has no `geom_render_state` root at construction, so `_reset_baseline` never
+    has the key -- the sentinel assertion below, on its own, cannot fail: RESET_KEYS excluding
+    the root or not makes no observable difference if the baseline never had anything to
+    restore from. Two guards fix that: `geom_render_state` is asserted out of RESET_KEYS
+    directly, and a value is seeded into `_reset_baseline` so a reset that (bug) restored every
+    baseline key wholesale instead of filtering by RESET_KEYS would overwrite the sentinel and
+    get caught.
+    """
+    assert "geom_render_state" not in RESET_KEYS
+    sess._reset_baseline["geom_render_state"] = {"1": [0.9, 0.9, 0.9, 1.0]}
     sentinel = {"999": [0.1, 0.2, 0.3, 0.4]}
     sess.viz.vis_state["geom_render_state"] = sentinel
     sess.reset_render_settings()
@@ -193,14 +204,24 @@ def test_reset_is_a_no_op_when_nothing_changed(sess):
 
 
 def test_the_baseline_survives_a_clip_swap(sess):
-    """T5. The hazard: `_carry_vis_state_across_swap` MUTATES its argument in place. Handing it
-    the baseline would permanently prune the baseline's own `geom_colors` on the first reset
-    after a swap, and every later reset would restore less than it should -- silently.
+    """T5 / R7. What this covers: the carry runs against ``self.model`` -- the CURRENT model,
+    not the launch one -- so a geom id that is in range on the model the baseline was captured
+    against, but out of range on a model swapped in later, gets pruned from what is actually
+    restored to ``vis_state``. `_carry_vis_state_across_swap` does this by REASSIGNING
+    `vis_state["geom_colors"]` to a filtered dict; it does not mutate the inner dict in place,
+    so a shallow copy of ``_reset_baseline`` already survives it untouched. (An earlier version
+    of this docstring claimed the carry mutates in place -- it doesn't; that was wrong.)
+
+    This test does NOT cover baseline immutability: whether an edit made through `apply_render`
+    after a reset can reach back into `_reset_baseline` is
+    `test_a_later_edit_cannot_reach_back_into_the_baseline`'s job, not this one. Do not read T5
+    as making that test redundant.
 
     Reproduced end to end: put a high-id geom override into the BASELINE, swap DOWN to the alt
     model (fewer geoms, so the carry legitimately prunes it), reset there, swap back UP, and
     reset again. The final reset must still restore the override -- which it can only do if the
-    baseline was never the thing the carry pruned.
+    baseline still holds it, i.e. if pruning against the alt model's `ngeom` only ever affected
+    the RESTORED copy, never `_reset_baseline` itself.
 
     The override is written into `_reset_baseline` directly rather than through `apply_render`
     + a re-capture: the baseline is captured once in __init__ and there is no re-capture API, so
@@ -209,7 +230,7 @@ def test_the_baseline_survives_a_clip_swap(sess):
     """
     assert sess._models["alt"].ngeom < sess._models["primary"].ngeom, (
         "the alt model must have FEWER geoms than the primary, or the carry never prunes and "
-        "this test cannot detect the in-place mutation it exists for"
+        "this test cannot detect the id being pruned against the wrong model"
     )
     high_id = sess._models["primary"].ngeom - 1
     assert high_id >= sess._models["alt"].ngeom, (
@@ -227,8 +248,8 @@ def test_the_baseline_survives_a_clip_swap(sess):
     sess.swap_model("primary")
     sess.reset_render_settings()
     assert sess.viz.vis_state["geom_colors"] == {high_id: "#0f0f0f"}, (
-        "the baseline was mutated in place by the earlier reset -- it no longer holds the "
-        "override it was captured with"
+        "the baseline no longer holds the override it was captured with -- pruning against "
+        "the alt model leaked from the restored copy back into _reset_baseline itself"
     )
 
 

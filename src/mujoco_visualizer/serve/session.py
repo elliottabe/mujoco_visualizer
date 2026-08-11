@@ -399,9 +399,9 @@ class Session:
         # anatomy config, the `settings` bundle) have all run by this point, and step 4 --
         # scripts/rollout_viewer/launch.py's `apply_fly_camera_default` -- writes only `camera`
         # keys, which RESET_KEYS excludes. So this is already the state a reset must return to,
-        # with no second capture point for a caller to forget. That last claim is load-bearing
-        # and is pinned by tests/rollout_viewer/test_render_reset_baseline.py in the parent repo,
-        # not left as an assumption here.
+        # with no second capture point for a caller to forget. That last claim is load-bearing;
+        # a test in the parent repo's rollout-viewer suite is intended to pin it, but does not
+        # exist yet as of this commit -- this comment states the intent, not a verified fact.
         self._reset_baseline = copy.deepcopy(self.viz.vis_state)
 
     # -- controller -----------------------------------------------------------
@@ -1618,6 +1618,16 @@ class Session:
         camera, and does not disarm a path. That is the opposite choice from
         :meth:`load_settings`, which replaces the camera outright -- deliberate, because the
         Settings tab owns the look and the Camera tab owns the camera.
+
+        Deliberately does NOT call ``self.viz._apply_all()``. ``_apply_all`` returns True only
+        when the skybox texture was actually regenerated, and ``render_with`` is the ONLY site
+        that calls ``mujoco.mjr_uploadTexture`` -- gated on exactly that return value. Calling
+        ``_apply_all()`` here would regenerate the texture and latch its fingerprint early, so
+        the very next ``render_with``'s own ``_apply_all()`` call would see no change and skip
+        the upload: the canvas would keep showing the pre-reset sky indefinitely. Leaving
+        vis_state updated and letting the next render apply it is exactly what
+        :meth:`apply_render` already does for the same reason; the reset still takes effect on
+        the next rendered frame.
         """
         restored = copy.deepcopy(
             {k: v for k, v in self._reset_baseline.items() if k in RESET_KEYS}
@@ -1625,7 +1635,6 @@ class Session:
         _carry_vis_state_across_swap(restored, self.model)
         changed = any(self.viz.vis_state.get(k) != v for k, v in restored.items())
         self.viz.vis_state.update(restored)
-        self.viz._apply_all()
         return changed
 
     def save_settings_as(self, name: str) -> Path:
