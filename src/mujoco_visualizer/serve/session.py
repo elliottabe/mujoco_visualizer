@@ -1599,10 +1599,16 @@ class Session:
         reset and is not one. Replacing each root wholesale is what makes an entry the baseline
         never had disappear.
 
-        The deep copy comes BEFORE ``_carry_vis_state_across_swap``, which mutates its argument
-        in place. Handing it :attr:`_reset_baseline` directly would permanently prune the
-        baseline's own ``geom_colors`` the first time a reset ran after a clip change, and every
-        later reset would silently restore less than it should, with nothing to say so.
+        The deep copy is NOT for ``_carry_vis_state_across_swap``'s benefit -- that function
+        REASSIGNS ``vis_state["geom_colors"] = kept`` rather than mutating the inner dict, so
+        even a shallow, top-level copy of ``_reset_baseline`` already survives it untouched.
+        The deep copy exists for what happens two lines down: ``self.viz.vis_state.update(
+        restored)`` would otherwise splice the baseline's own inner dicts (``floor``,
+        ``ghost``, ``geom_colors``, ...) straight into ``vis_state`` by reference. The very next
+        ordinary ``apply_render`` call then writes through that shared dict and silently moves
+        the launch state itself -- every later reset would "restore" the edited value, with
+        nothing to say the baseline had moved. Do not remove the deep copy on the reasoning that
+        the carry is harmless; the carry never was the hazard.
 
         The carry runs against ``self.model`` -- the CURRENT model, not the launch one --
         because ``geom_colors`` is keyed by geom id and a clip swap changes ``ngeom``.

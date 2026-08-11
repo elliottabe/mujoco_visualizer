@@ -230,3 +230,26 @@ def test_the_baseline_survives_a_clip_swap(sess):
         "the baseline was mutated in place by the earlier reset -- it no longer holds the "
         "override it was captured with"
     )
+
+
+def test_a_later_edit_cannot_reach_back_into_the_baseline(sess):
+    """R6. The real erosion path -- and NOT the one the brief originally described.
+
+    `vis_state.update(restored)` aliases the baseline's inner dicts into `vis_state` unless
+    `restored` was deep-copied, and then an ordinary later `apply_render` writes through the
+    shared dict and silently rewrites the launch state. Every subsequent reset would restore
+    the edited value, with nothing to say the baseline had moved.
+
+    The carry is NOT the hazard here: `_carry_vis_state_across_swap` reassigns
+    `vis_state["geom_colors"]` rather than mutating the inner dict, so a shallow copy already
+    survives it. Only aliasing through `update` erodes the baseline.
+    """
+    launch = copy.deepcopy(sess._reset_baseline)
+    sess.reset_render_settings()
+    sess.apply_render({"floor.reflectance": 0.99, "ghost.alpha": 0.11})
+    sess.apply_render({"geom_colors.0": "#abcdef"})
+    assert sess._reset_baseline == launch, (
+        "an edit made after a reset reached back into the baseline -- vis_state is aliasing "
+        "the baseline's inner dicts, so the launch state is no longer what the viewer launched "
+        "with"
+    )
