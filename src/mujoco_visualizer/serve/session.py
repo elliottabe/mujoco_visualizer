@@ -209,6 +209,18 @@ def _carry_vis_state_across_swap(vis_state: Dict, model: mujoco.MjModel) -> Dict
     return vis_state
 
 
+# The vis_state roots `Session.reset_render_settings` restores. Deliberately NOT every root:
+# `camera`/`camera_presets` belong to the Camera tab (a reset must not move the view or delete a
+# saved camera), and `geom_render_state` is a raw gid->rgba cache baked against one model
+# topology -- `load_settings` already refuses to apply it for that reason, and reset follows the
+# same rule. Named here rather than written inline at the one call site so the tests and the
+# reset cannot drift into disagreeing about the set.
+RESET_KEYS = (
+    "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
+    "lighting", "floor", "skybox", "ghost", "forces", "tendons", "force_arrows",
+)
+
+
 class Session:
     """Owns the simulation and how it is drawn.
 
@@ -381,6 +393,16 @@ class Session:
         # whole model collapsed at the origin, on every backend.
         mujoco.mj_forward(self.model, self.data)
         self._snapshot()
+
+        # The render settings as they stand right now, for `reset_render_settings`. Captured
+        # HERE and nowhere else: steps 1-3 of initialisation (model-derived defaults, the
+        # anatomy config, the `settings` bundle) have all run by this point, and step 4 --
+        # scripts/rollout_viewer/launch.py's `apply_fly_camera_default` -- writes only `camera`
+        # keys, which RESET_KEYS excludes. So this is already the state a reset must return to,
+        # with no second capture point for a caller to forget. That last claim is load-bearing
+        # and is pinned by tests/rollout_viewer/test_render_reset_baseline.py in the parent repo,
+        # not left as an assumption here.
+        self._reset_baseline = copy.deepcopy(self.viz.vis_state)
 
     # -- controller -----------------------------------------------------------
 
@@ -1563,6 +1585,42 @@ class Session:
         # Disarmed AFTER the load, not before: a load that raises (unwritable/corrupt file)
         # must leave the session exactly as it was, path included.
         self._disarm_camera_path()
+
+    def reset_render_settings(self) -> bool:
+        """Restore the :data:`RESET_KEYS` roots of ``vis_state`` to their launch values.
+
+        Returns whether anything actually changed, which is how a client tells "you were
+        already at the launch state" apart from "the reset failed" -- see the
+        ``settings_epoch`` note in the design spec §5.4.
+
+        REPLACE, not merge, and that is the entire substance of this method.
+        :meth:`load_settings` merges (``{**current, **incoming}`` per root), so re-loading the
+        startup preset leaves every edit the preset does not mention in place: it looks like a
+        reset and is not one. Replacing each root wholesale is what makes an entry the baseline
+        never had disappear.
+
+        The deep copy comes BEFORE ``_carry_vis_state_across_swap``, which mutates its argument
+        in place. Handing it :attr:`_reset_baseline` directly would permanently prune the
+        baseline's own ``geom_colors`` the first time a reset ran after a clip change, and every
+        later reset would silently restore less than it should, with nothing to say so.
+
+        The carry runs against ``self.model`` -- the CURRENT model, not the launch one --
+        because ``geom_colors`` is keyed by geom id and a clip swap changes ``ngeom``.
+
+        Camera state is untouched: ``camera``, ``camera_presets`` and the armed camera path all
+        sit outside RESET_KEYS, so a reset does not move the view, does not delete a saved
+        camera, and does not disarm a path. That is the opposite choice from
+        :meth:`load_settings`, which replaces the camera outright -- deliberate, because the
+        Settings tab owns the look and the Camera tab owns the camera.
+        """
+        restored = copy.deepcopy(
+            {k: v for k, v in self._reset_baseline.items() if k in RESET_KEYS}
+        )
+        _carry_vis_state_across_swap(restored, self.model)
+        changed = any(self.viz.vis_state.get(k) != v for k, v in restored.items())
+        self.viz.vis_state.update(restored)
+        self.viz._apply_all()
+        return changed
 
     def save_settings_as(self, name: str) -> Path:
         """Save the current render settings as a NAMED preset in this session's
