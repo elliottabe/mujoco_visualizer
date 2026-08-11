@@ -136,15 +136,139 @@ def test_an_empty_camera_list_disarms(sess):
     assert sess.camera_path is None
 
 
-def test_camera_list_for_returns_exactly_n_cameras(sess):
+@pytest.mark.parametrize("n", [1, 2, 7, 1588])
+@pytest.mark.parametrize(
+    "weights, loop",
+    [
+        (None, False),        # 3 equal segments
+        ([1.0, 2.0, 1.0], False),
+        (None, True),         # 4 segments: the wrap-around one is appended
+        ([1.0, 2.0, 1.0], True),  # weights AND loop together
+    ],
+)
+def test_camera_list_for_returns_exactly_n_cameras(sess, n, weights, loop):
+    """Spec section 11 test 1, at its full width: n in {1, 2, 7, 1588} crossed with weights
+    ``None`` / ``[1, 2, 1]`` / ``loop=True``.
+
+    The narrowed version of this test (n in {2, 7, 120, 1588}, weights [1, 2] only) is why a
+    real defect shipped: `make_pan_cameras`' old `max(1, round(w / total_w * n))` allocation
+    returned MORE than n cameras whenever the non-last segments rounded up to n or beyond
+    between them, and every case that exposes it needs either a small n or three-plus segments
+    with uneven weights -- exactly what the narrowing removed. n = 1 and n = 2 with [1, 2, 1] or
+    loop=True are the cases that failed before `allocate_segment_frames`.
+
+    n = 1 and n = 2 are also the cases with FEWER FRAMES THAN SEGMENTS, where some keyframe
+    provably cannot be visited. The contract is still exactly n cameras -- one frame renders one
+    camera -- so a zero-length segment is the correct outcome there and is asserted as such in
+    `test_allocate_segment_frames_*` below.
+    """
+    # A 3-weight list means 3 segments, which is 4 presets unlooped but only 3 looped (the
+    # wrap-around segment is the third). `weights=None` imposes no such constraint.
+    names = ["a", "b", "c"] if (weights is not None and loop) else ["a", "b", "c", "d"]
+    for name, az in zip(names, (0.0, 90.0, 180.0, 270.0)):
+        _save(sess, name, az=az)
+    sess.set_camera_path(names, weights=weights, loop=loop)
+
+    cams = sess.camera_list_for(n)
+    assert len(cams) == n, (
+        f"camera_list_for({n}) returned {len(cams)} cameras for weights={weights}, loop={loop}; "
+        "the preview clamps its index into an over-long list while ExportJob refuses it, so the "
+        "user previews a shot they cannot export"
+    )
+    assert all(isinstance(c, mujoco.MjvCamera) for c in cams)
+
+
+def test_camera_list_for_refuses_a_list_that_is_not_exactly_n(sess, monkeypatch):
+    """The contract's own boundary check. `camera_list_for` promises "exactly n_frames" and
+    INHERITS that from `make_pan_cameras`' allocation; when the allocation broke it, the failure
+    surfaced three layers away as `ExportJob.__init__` complaining about a "camera sequence"
+    length -- internals the user cannot act on, for a path whose preview worked. So the promise
+    now fails at the boundary that makes it, naming both numbers.
+
+    Forced by stubbing `make_pan_cameras`, because `allocate_segment_frames` makes the real
+    allocation exact: the point is that a FUTURE regression there is caught here rather than in
+    an export.
+    """
     _save(sess, "a", az=0.0)
     _save(sess, "b", az=90.0)
-    _save(sess, "c", az=180.0)
-    sess.set_camera_path(["a", "b", "c"], weights=[1.0, 2.0])
-    for n in (2, 7, 120, 1588):
-        cams = sess.camera_list_for(n)
-        assert len(cams) == n
-        assert all(isinstance(c, mujoco.MjvCamera) for c in cams)
+    sess.set_camera_path(["a", "b"])
+    monkeypatch.setattr(
+        sess.viz, "make_pan_cameras",
+        lambda *a, **k: [mujoco.MjvCamera() for _ in range(9)],
+    )
+    with pytest.raises(ValueError, match="camera_list_for") as exc:
+        sess.camera_list_for(20)
+    assert "9" in str(exc.value) and "20" in str(exc.value), str(exc.value)
+
+
+# -- the allocation itself ---------------------------------------------------------------------
+#
+# `make_pan_cameras`' per-segment split is the thing that makes "exactly n cameras" true, so it
+# is tested directly as well as through camera_list_for: the interesting cases (hundreds of
+# weight/frame combinations) are cheap here and would each cost a full camera build there.
+
+
+@pytest.mark.parametrize("n_segs", [1, 2, 3, 4, 5])
+def test_allocate_segment_frames_always_sums_to_total_frames(n_segs):
+    """The invariant, swept over the whole reachable space named in the review: weights 1-6 over
+    2-4 segments with n small is where the old rule broke, so sweep wider than that."""
+    import itertools
+
+    from mujoco_visualizer.visualizer import allocate_segment_frames
+
+    for weights in itertools.product(range(1, 7), repeat=n_segs):
+        for n in list(range(1, 40)) + [120, 351, 399, 1588]:
+            counts = allocate_segment_frames([float(w) for w in weights], n)
+            assert sum(counts) == n, (weights, n, counts)
+            assert len(counts) == n_segs
+            assert all(c >= 0 for c in counts), (weights, n, counts)
+
+
+@pytest.mark.parametrize("n_segs", [2, 3, 4, 5])
+def test_every_segment_gets_a_frame_once_there_are_enough_frames(n_segs):
+    """The old `max(1, ...)` floor's INTENT -- every keyframe is visited -- kept wherever it is
+    affordable, which is whenever n >= the number of segments. This is what
+    `test_each_segments_first_frame_is_its_start_keyframe` depends on, and a pathological weight
+    ratio must not break it: [1, 100] over 3 frames is [1, 2], not [0, 3]."""
+    import itertools
+
+    from mujoco_visualizer.visualizer import allocate_segment_frames
+
+    for weights in itertools.product((1.0, 3.0, 100.0), repeat=n_segs):
+        for n in range(n_segs, n_segs + 20):
+            counts = allocate_segment_frames(list(weights), n)
+            assert min(counts) >= 1, (weights, n, counts)
+    assert allocate_segment_frames([1.0, 100.0], 3) == [1, 2]
+
+
+def test_a_segment_may_get_no_frames_when_there_are_fewer_frames_than_segments():
+    """The deliberate concession, and the reason it is the right one: with n < n_segs some
+    keyframes CANNOT be visited (one frame renders one camera), so a zero-length segment is
+    honest arithmetic. The alternative the old floor chose was returning more cameras than there
+    are frames -- a list nothing can render -- which is strictly worse than skipping a keyframe.
+    """
+    from mujoco_visualizer.visualizer import allocate_segment_frames
+
+    counts = allocate_segment_frames([1.0, 2.0, 1.0], 1)
+    assert sum(counts) == 1
+    assert counts.count(0) == 2
+    counts = allocate_segment_frames([1.0, 1.0, 1.0, 1.0], 2)
+    assert sum(counts) == 2
+    assert counts.count(0) == 2
+
+
+def test_allocate_segment_frames_is_proportional_where_it_can_be_exact():
+    """Not merely exact -- exact AND still the proportional split when one exists, which is what
+    keeps the path editor's readout meaningful rather than just self-consistent."""
+    from mujoco_visualizer.visualizer import allocate_segment_frames
+
+    assert allocate_segment_frames([1.0, 3.0], 100) == [25, 75]
+    assert allocate_segment_frames([1.0, 1.0, 1.0, 1.0], 40) == [10, 10, 10, 10]
+    # The review's own repro: 5 presets, weights [3, 6, 6, 1], n = 20 (a 1588-frame trim at
+    # stride 80). The old rule made this 21 frames' worth of cameras.
+    counts = allocate_segment_frames([3.0, 6.0, 6.0, 1.0], 20)
+    assert sum(counts) == 20, counts
+    assert counts == [4, 8, 7, 1], counts
 
 
 def test_each_segments_first_frame_is_its_start_keyframe(sess):
@@ -175,12 +299,36 @@ def test_the_final_keyframe_is_approached_but_not_reached(sess):
 
 def test_azimuth_takes_the_short_way_round_zero(sess):
     """_lerp_angle uses the shortest signed difference, so 350 -> 10 must pass through 0, not
-    through 180. This is the single likeliest silent defect in an interpolated pan."""
+    through 180. This is the single likeliest silent defect in an interpolated pan.
+
+    The property is stated on the RAW, unwrapped value, which climbs 350 -> 370: `_lerp_angle`
+    returns ``a + diff * t`` with ``diff = +20`` and never wraps its result. The spec originally
+    described this as "stays within [350, 360] union [0, 10]", which is wrong about this
+    implementation -- the same correction Figure A's expectation needed -- and the assertion that
+    encoded it (``cam.azimuth >= 349.9 or cam.azimuth <= 10.1``) was satisfied by anything at or
+    above 349.9, so it would have passed an azimuth that ran away to 700. It did catch a sweep
+    through 180, which is the headline defect, but it pinned nothing about the magnitude.
+
+    Pinned here instead: monotonically rising, bounded by the two keyframes' unwrapped values,
+    and nowhere near 180.
+    """
     _save(sess, "late", az=350.0)
     _save(sess, "early", az=10.0)
     sess.set_camera_path(["late", "early"])
-    for cam in sess.camera_list_for(60):
-        assert cam.azimuth >= 349.9 or cam.azimuth <= 10.1
+    azimuths = [cam.azimuth for cam in sess.camera_list_for(60)]
+
+    assert azimuths[0] == pytest.approx(350.0)
+    # Rising, and confined to the 20-degree arc from 350 to 370 -- crossing the wrap point at
+    # 360 rather than jumping discontinuously to stay inside [0, 360).
+    assert all(b >= a for a, b in zip(azimuths, azimuths[1:])), "not monotonically rising"
+    assert min(azimuths) >= 350.0 and max(azimuths) < 370.0, (min(azimuths), max(azimuths))
+    assert max(azimuths) > 360.0, (
+        "the trace never crossed 360, so it did not actually exercise the wrap point"
+    )
+    # The headline defect: the long way round, through 180.
+    assert all(not (20.0 < a % 360.0 < 340.0) for a in azimuths), (
+        "the pan swept the long way round through 180"
+    )
 
 
 def test_segment_weights_split_the_frames_proportionally(sess):
@@ -650,3 +798,273 @@ def test_set_camera_path_empty_list_still_disarms():
         assert sess._camera_list_cache is None
     finally:
         sess.close()
+
+
+# -- D8, third writer: the Camera tab's fields arrive as `render.set`, not as `{t:"camera"}` --
+#
+# azimuth/elevation/distance/lookat/free_type/trackbody/fixedcamid are GENERATED controls, so a
+# browser sends `{t:"render", set:{"camera.azimuth": 271}}` and it lands in `apply_render` --
+# which bypassed `set_camera` and therefore every disarm site. Measured before the fix: the path
+# stayed armed, `camera_state` echoed 271 back so the field looked accepted, the rendered camera
+# stayed on the path at 0.0, and a later drag touching only elevation applied the stashed 271
+# retroactively. `active_camera()` states the precedence for readers; `apply_render` now states
+# it for writers.
+
+
+def test_a_render_set_to_a_camera_key_disarms_an_armed_path_and_actually_renders(sess):
+    """Both halves matter and the second is the one the review measured: disarming is not enough
+    if the typed azimuth still does not reach the renderer."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    cams = sess.camera_list_for(20)
+    sess.set_camera_object(cams[0])
+    assert sess.camera_path is not None
+    armed_frame = sess.render().copy()
+
+    sess.apply_render({"camera.azimuth": 271.0})
+
+    assert sess.camera_path is None, "a camera.* render.set must disarm the path"
+    assert sess._camera_object is None
+    # The camera actually resolved for rendering carries the typed azimuth -- not either
+    # preset's (0.0 or 90.0), and not merely a vis_state value nothing reads.
+    resolved = sess.viz.get_camera(override=sess.active_camera())
+    assert isinstance(resolved, mujoco.MjvCamera)
+    assert resolved.azimuth == pytest.approx(271.0)
+    # ...and the pixels move, which is the claim "typing in one moves the view" (spec 12).
+    assert not np.array_equal(armed_frame, sess.render()), (
+        "the typed azimuth changed no pixels -- a control the user can change with visibly no "
+        "effect is the defect this fix exists to remove"
+    )
+
+
+@pytest.mark.parametrize(
+    "dotted, value",
+    [
+        ("camera.azimuth", 271.0),
+        ("camera.elevation", -12.0),
+        ("camera.distance", 1.25),
+        ("camera.lookat.0", 0.05),
+        ("camera.free_type", "free"),
+        ("camera.mode", "free"),
+        ("camera.named", ""),
+    ],
+)
+def test_every_camera_group_key_disarms_not_just_the_positional_ones(sess, dotted, value):
+    """Keyed on the dotted key's ROOT, deliberately, rather than on a list of individual keys:
+    any write into the `camera` group is the user driving the camera, and a per-key allowlist is
+    how the next generated camera field becomes the next silent special case."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    sess.apply_render({dotted: value})
+    assert sess.camera_path is None, f"{dotted} left the path armed"
+
+
+def test_a_render_set_to_a_non_camera_key_leaves_an_armed_path_alone(sess):
+    """The other side of the rule: a look change is not a camera move. Without this, arming a
+    path and then touching any render setting at all would silently drop the path."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    sess.apply_render({"floor.alpha": 0.5, "shadows": False})
+    assert sess.camera_path is not None, (
+        "a non-camera render setting disarmed the path; only writes into the camera group are "
+        "the user taking the camera"
+    )
+    assert sess.viz.vis_state["floor"]["alpha"] == 0.5
+
+
+def test_the_disarm_happens_once_per_batch_not_once_per_key(sess):
+    """A drag arrives as a multi-key batch. Disarming per key would drop the path list and its
+    memoised camera list several times for one user action; the check runs before the merge."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    calls = []
+    original = sess._disarm_camera_path
+    sess._disarm_camera_path = lambda: (calls.append(1), original())[1]
+    sess.apply_render(
+        {"camera.azimuth": 30.0, "camera.elevation": -5.0, "camera.distance": 0.7}
+    )
+    assert len(calls) == 1, f"disarmed {len(calls)} times for one batch"
+
+
+# -- frame_meta must report the camera that is actually RENDERING ----------------------------
+#
+# `SimLoop._publish` overwrites only `path_frame` on the block `camera_state()` returns, and that
+# block read `vis_state['camera']` -- so while a path drove the camera the client was told the
+# wrong position. Measured mid-scrub on a 20 -> 300 degree path: screen az=-20.0 dist=0.900,
+# frame_meta az=20.0 dist=0.400. `rollout.js` seeds its orbit from `serverCamera.azimuth` and
+# its wheel from `serverCamera.distance`, so the first drag jumped ~40 degrees and the first
+# wheel tick snapped the zoom -- the teleport this branch exists to fix, through another door.
+
+
+def test_frame_meta_reports_the_injected_path_camera_not_vis_state(sess):
+    """Driven through the real `SimLoop._publish`, so this is the published block itself rather
+    than `camera_state()` reasoned about in isolation."""
+    from mujoco_visualizer.serve.loop import SimLoop
+    from mujoco_visualizer.serve.replay import ArrayTrajectorySource
+
+    _save(sess, "start", az=20.0, dist=0.4)
+    _save(sess, "end", az=300.0, dist=1.4)
+    # Put vis_state back on the FIRST keyframe, so a block that reports vis_state reports a
+    # plausible-looking but wrong camera (az 20 / dist 0.4) rather than an obviously stale one.
+    sess.set_camera(az=20.0, el=-20.0, dist=0.4)
+    sess.set_camera_path(["start", "end"])
+
+    qpos = np.zeros((1, 21, sess.model.nq))
+    loop = SimLoop(sess, source=ArrayTrajectorySource(qpos))
+    loop._playing = True
+    try:
+        loop._frame = 10
+        loop._published_frame = 10
+        loop._publish()
+
+        injected = sess.active_camera()
+        assert isinstance(injected, mujoco.MjvCamera), "no path camera was injected"
+        block = loop._meta["camera"]
+        assert block["path_frame"] == 10
+
+        assert block["azimuth"] == pytest.approx(injected.azimuth % 360.0)
+        assert block["elevation"] == pytest.approx(injected.elevation)
+        assert block["distance"] == pytest.approx(injected.distance)
+        assert block["lookat"] == pytest.approx(list(injected.lookat))
+
+        # ...and specifically NOT vis_state's, which is what shipped.
+        vis = sess.viz.vis_state["camera"]
+        assert block["distance"] != pytest.approx(vis["distance"]), (
+            "the published distance still matches vis_state; the client's wheel would snap the "
+            "zoom on the first tick"
+        )
+        assert block["azimuth"] != pytest.approx(vis["azimuth"]), (
+            "the published azimuth still matches vis_state; the client's first drag would jump"
+        )
+    finally:
+        loop.stop()
+
+
+def test_a_reported_path_azimuth_is_normalised_into_the_control_range(sess):
+    """`_lerp_angle` follows the shortest signed arc without wrapping, so a 350 -> 10 segment
+    genuinely climbs to 370 and a 10 -> 200 one goes negative. `camera.azimuth`'s generated
+    control range is 0-360, so a raw value outside it would be clamped by the field -- the
+    reported angle is normalised to the same physical angle inside the range."""
+    _save(sess, "late", az=350.0)
+    _save(sess, "early", az=10.0)
+    sess.set_camera_path(["late", "early"])
+    cams = sess.camera_list_for(60)
+    raw = [c.azimuth for c in cams]
+    assert max(raw) > 360.0, "fixture no longer produces an out-of-range azimuth"
+    for cam in cams:
+        sess.set_camera_object(cam)
+        reported = sess.camera_state()["azimuth"]
+        assert 0.0 <= reported < 360.0, reported
+        assert reported == pytest.approx(cam.azimuth % 360.0)
+
+
+def test_camera_state_still_reports_vis_state_with_no_path_armed(sess):
+    """The fix must not change the free-camera case, which is every non-path frame."""
+    sess.set_camera(az=137.0, el=-11.0, dist=0.63)
+    block = sess.camera_state()
+    assert block["azimuth"] == pytest.approx(137.0)
+    assert block["elevation"] == pytest.approx(-11.0)
+    assert block["distance"] == pytest.approx(0.63)
+
+
+def test_saving_a_preset_snapshots_the_free_camera_not_an_injected_path_camera(sess):
+    """A preset stores az/el/dist/lookat NEXT TO free_type/trackbody/fixedcamid, and those three
+    only ever come from vis_state -- an injected MjvCamera carries resolved ids, not names. So
+    preset-saving deliberately keeps reading the free camera even though `camera_state()` now
+    reports the rendering one; mixing the two could mint a preset describing no reachable camera
+    (path keyframes tracking a body, vis_state on the free camera)."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera(az=42.0, el=-33.0, dist=0.77)
+    sess.set_camera_path(["a", "b"])
+    sess.set_camera_object(sess.camera_list_for(20)[10])
+
+    sess.save_camera_preset("snap")
+
+    saved = sess.viz.vis_state["camera_presets"]["snap"]
+    assert saved["azimuth"] == pytest.approx(42.0)
+    assert saved["distance"] == pytest.approx(0.77)
+
+
+# -- weight VALUES, not just their count ------------------------------------------------------
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("inf"), float("nan")])
+def test_a_non_positive_or_non_finite_weight_is_refused_naming_its_index(sess, bad):
+    """`weights=[0.0]` used to reach `make_pan_cameras` and raise ZeroDivisionError, which is NOT
+    a ValueError -- so `SimLoop._publish`'s `except ValueError` missed it and `_publish_guarded`
+    paused the loop with a `kind:"render"` error (the one treatment spec section 9 says a camera
+    failure must never get), repeating every tick because the path stayed armed. Unreachable from
+    the wire, since `parse_command` rejects these, but reachable from any Python caller -- and
+    this is the layer that owns path validation."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    with pytest.raises(ValueError, match=r"segment_weights\[0\]"):
+        sess.set_camera_path(["a", "b"], weights=[bad])
+    assert sess.camera_path is None
+
+
+def test_the_offending_weight_index_is_named_not_just_the_first(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    _save(sess, "c", az=180.0)
+    with pytest.raises(ValueError, match=r"segment_weights\[1\]"):
+        sess.set_camera_path(["a", "b", "c"], weights=[1.0, 0.0])
+
+
+def test_a_valid_weight_list_is_still_accepted(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    _save(sess, "c", az=180.0)
+    sess.set_camera_path(["a", "b", "c"], weights=[0.5, 2.5])
+    assert sess.camera_path["weights"] == [0.5, 2.5]
+
+
+# -- the camera list caches ids resolved against the CURRENT model ---------------------------
+
+
+def test_swap_model_invalidates_the_camera_list_cache():
+    """`_build_pan_camera` BAKES `trackbodyid` by resolving the preset's body NAME against
+    whichever model was current when the camera was built, and `camera_list_for`'s cache key
+    fingerprints preset content and frame count but nothing about the model. A cached list
+    surviving a swap therefore points the camera at whatever body happens to occupy that index
+    in the new model. Latent today only because `thorax` is body 1 in both the plain and the
+    ghost model -- an accident of those two XMLs -- so the fixture here deliberately gives the
+    two models DIFFERENT body orders, which is what makes the assertion meaningful."""
+    _TRACKED = (
+        '<body name="tracked" pos="0 0 0.3">'
+        '<joint name="s2" type="slide" axis="0 0 1"/>'
+        '<geom name="g2" type="box" size="0.02 0.02 0.02"/></body>'
+    )
+    # `tracked` is the LAST body in the primary model and the FIRST in the alt, so a stale
+    # cached trackbodyid resolves to the wrong body rather than harmlessly to the same one.
+    primary_xml = _XML.replace("</worldbody>", _TRACKED + "</worldbody>")
+    alt_xml = _XML.replace(
+        '<body name="box" pos="0 0 0.6">', _TRACKED + '<body name="box" pos="0 0 0.6">'
+    )
+    primary = mujoco.MjModel.from_xml_string(primary_xml)
+    alt = mujoco.MjModel.from_xml_string(alt_xml)
+    s = Session(model=primary, alt_model=alt, width=64, height=48)
+    try:
+        primary_id = mujoco.mj_name2id(primary, mujoco.mjtObj.mjOBJ_BODY, "tracked")
+        alt_id = mujoco.mj_name2id(alt, mujoco.mjtObj.mjOBJ_BODY, "tracked")
+        assert primary_id != alt_id, "fixture no longer reorders the bodies"
+
+        _save(s, "a", az=0.0, free_type="track", trackbody="tracked")
+        _save(s, "b", az=90.0, free_type="track", trackbody="tracked")
+        s.set_camera_path(["a", "b"])
+        assert s.camera_list_for(10)[0].trackbodyid == primary_id
+        assert s._camera_list_cache is not None
+
+        s.swap_model("alt")
+
+        assert s._camera_list_cache is None, "the swap left a camera list built for the old model"
+        assert s.camera_list_for(10)[0].trackbodyid == alt_id, (
+            "the rebuilt camera still tracks the old model's body id"
+        )
+    finally:
+        s.close()

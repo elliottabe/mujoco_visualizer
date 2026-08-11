@@ -40,6 +40,7 @@ from mujoco_visualizer.visualizer import (
     _build_pan_camera,
     _cosine_ease,
     _resolve_preset,
+    allocate_segment_frames,
     dual_lighting,
     scale_lights,
 )
@@ -538,7 +539,9 @@ def make_pan_cameras(
         loop: If True, append a segment back to the first preset.
 
     Returns:
-        List of ``mujoco.MjvCamera`` of length ``total_frames``.
+        List of ``mujoco.MjvCamera`` of length EXACTLY ``total_frames`` -- see
+        :func:`~mujoco_visualizer.visualizer.allocate_segment_frames`, shared with
+        ``Visualizer.make_pan_cameras``, which owns that guarantee.
     """
     presets = settings.get('camera_presets', {})
     if len(preset_names) < 2:
@@ -566,9 +569,11 @@ def make_pan_cameras(
             )
         weights = [float(w) for w in segment_weights]
 
-    total_w = sum(weights)
-    seg_frames = [max(1, round(w / total_w * total_frames)) for w in weights]
-    seg_frames[-1] = max(1, total_frames - sum(seg_frames[:-1]))
+    # Shared with Visualizer.make_pan_cameras rather than reimplemented: this function is that
+    # method's standalone twin, and both copies of the old inline `max(1, round(...))` rule
+    # returned MORE than total_frames cameras for small frame counts (see
+    # allocate_segment_frames' docstring). One of the two being fixed is how the bug survives.
+    seg_frames = allocate_segment_frames(weights, total_frames)
 
     cameras: List[mujoco.MjvCamera] = []
     for seg in range(n_segs):

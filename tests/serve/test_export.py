@@ -927,15 +927,23 @@ def test_export_hides_the_tendons_of_actuators_no_ctrl_column_drives(tmp_path):
 
 def test_export_renders_a_camera_per_frame(tmp_path):
     """The point of a camera sequence: two frames of the SAME pose, rendered from deliberately
-    different cameras, must differ in pixels. A single-camera export cannot produce that.
+    different cameras, must show each frame's OWN camera -- in the right ORDER.
 
-    NOTE: azimuth 180.0 (the brief's literal second camera) was tried first and rejected --
-    _MODEL_XML's geom is a perfect cube (size .1 .1 .1) under a light directly overhead on
-    the same vertical axis as the lookat point, and empirically (verified with a standalone
-    render_with call, not just this test) azimuth 0 vs 180 renders BIT-IDENTICAL images
-    regardless of whether per-frame camera indexing is implemented correctly -- a delta that
-    cannot distinguish a bug from a fix is not a usable regression test. Azimuth 90.0 was
-    verified (same standalone check) to actually differ from azimuth 0.0 for this fixture.
+    Two things were wrong with the first version of this test and both are fixed here.
+
+    **The camera pair had almost no signal.** _MODEL_XML's geom is a perfect cube (size
+    .1 .1 .1) under a light directly overhead on the lookat axis, so it is nearly invariant to
+    azimuth in 90-degree steps. Measured through this exact export path at 128x96: azimuth 0 vs
+    180 is BIT-IDENTICAL (0 differing pixels), and azimuth 0 vs 90 -- the pair this test
+    shipped with -- differs by 6 pixels at a maximum of 1 grey level, which is indistinguishable
+    from renderer noise and could not tell a bug from a fix. Azimuth 45 shows the cube's corner
+    and two faces instead of one: 406 differing pixels at a maximum of 188 grey levels.
+
+    **`assert not array_equal(first, second)` did not pin the ORDER.** Two frames rendered from
+    a REVERSED index are also unequal, so the assertion passed for exactly the defect a
+    per-frame camera list exists to prevent. Each frame is now matched against an
+    independently-rendered reference for its own camera, so frame 0 must be nearest to a render
+    at camera 0 and frame 1 nearest to a render at camera 1.
     """
     import mujoco
 
@@ -949,21 +957,41 @@ def test_export_renders_a_camera_per_frame(tmp_path):
         c.distance = 1.5
         return c
 
-    out = tmp_path / "per_frame"
-    job = ExportJob(
-        model, None, {}, qpos,
-        path=out, fmt="png", width=128, height=96, fps=10,
-        camera=[_cam(0.0), _cam(90.0)],
-    )
-    job.start()
-    job.join(timeout=120)
-    assert job.progress()["state"] == "done", job.progress()
-
     import imageio.v2 as imageio
 
-    first = imageio.imread(out / "frame_00000.png")
-    second = imageio.imread(out / "frame_00001.png")
-    assert not np.array_equal(first, second)
+    def _render(cameras, tag):
+        out = tmp_path / tag
+        job = ExportJob(
+            model, None, {}, qpos[: len(cameras)],
+            path=out, fmt="png", width=128, height=96, fps=10, camera=cameras,
+        )
+        job.start()
+        job.join(timeout=120)
+        assert job.progress()["state"] == "done", job.progress()
+        return [
+            imageio.imread(out / f"frame_{i:05d}.png").astype(np.int32)
+            for i in range(len(cameras))
+        ]
+
+    first, second = _render([_cam(0.0), _cam(45.0)], "per_frame")
+    # Independent single-camera renders of the same pose: the reference each frame must match.
+    (ref_0,) = _render([_cam(0.0)], "ref_0")
+    (ref_45,) = _render([_cam(45.0)], "ref_45")
+
+    assert not np.array_equal(first, second), (
+        "both exported frames are identical, so the sequence was not indexed per frame"
+    )
+    # The order, which the old inequality-only assertion left free: nearest reference wins, and
+    # a reversed index fails this even though it passes the inequality above.
+    d_first = (abs(first - ref_0).mean(), abs(first - ref_45).mean())
+    d_second = (abs(second - ref_0).mean(), abs(second - ref_45).mean())
+    assert d_first[0] < d_first[1], (
+        f"frame 0 is closer to a render at azimuth 45 than at its own azimuth 0 {d_first}; "
+        "the camera list is being indexed in the wrong order"
+    )
+    assert d_second[1] < d_second[0], (
+        f"frame 1 is closer to a render at azimuth 0 than at its own azimuth 45 {d_second}"
+    )
 
 
 def test_export_rejects_a_camera_sequence_of_the_wrong_length(tmp_path):

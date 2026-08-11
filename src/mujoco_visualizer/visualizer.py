@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from pathlib import Path
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Set, Tuple, Union
 
@@ -555,6 +556,77 @@ def _lerp_angle(a: float, b: float, t: float) -> float:
 
 def _cosine_ease(t: float) -> float:
     return 0.5 * (1.0 - np.cos(np.pi * t))
+
+
+def allocate_segment_frames(weights: Sequence[float], total_frames: int) -> List[int]:
+    """Split *total_frames* across segments in proportion to *weights*, summing to EXACTLY
+    *total_frames* for any weights and any ``total_frames >= 1``.
+
+    This is the whole reason ``make_pan_cameras`` can promise a list of length
+    ``total_frames``. The rule it replaces was
+    ``[max(1, round(w / total_w * n)) for w in weights]`` with the last segment set to the
+    remainder, and the ``max(1, ...)`` floor broke the promise: once the non-last segments
+    rounded UP to n or more frames between them, the last segment's remainder went <= 0, was
+    floored back to 1, and the list came out LONGER than n. Measured: weights [3, 6, 6, 1] over
+    n = 20 produced [4, 8, 8, 1] = 21 cameras, which a preview happily clamped its index into
+    while ``ExportJob.__init__`` refused the same path outright -- a shot the user could preview
+    and then not export. Reachable for weights in 1-6 over 2-4 segments whenever n is small
+    (a short trim, or a large stride over a long clip).
+
+    Largest-remainder (Hamilton) apportionment, which is exact by construction: floor each
+    segment's ideal share, then hand the frames that floor discarded to the segments with the
+    largest fractional parts. Ties break toward the LOWER index, stated explicitly rather than
+    left to sort stability, because `RVSettings.pathSegmentCounts` in the fly viewer's
+    ``rollout_settings.js`` mirrors this function to print the split in the path editor and the
+    two must agree digit for digit. Floor-plus-fraction is also what makes that mirroring sound
+    across runtimes: the old rule used ``round``, and Python (banker's, to even) and JS
+    (``Math.round``, half away from zero) disagree on exact ``.5`` shares, whereas ``floor`` and
+    an IEEE double comparison agree everywhere.
+
+    **A segment may receive 0 frames, and that is deliberate** -- but only when there are fewer
+    frames than segments. With ``total_frames < len(weights)`` some keyframes simply cannot be
+    visited: one frame renders one camera, so a 3-segment path over 1 frame shows one shot and
+    skips the rest. Skipping a keyframe is strictly better than the alternative the old floor
+    chose, which was to return MORE cameras than there are frames -- a list that cannot be
+    rendered at all. When ``total_frames >= len(weights)`` every segment is guaranteed at least
+    one frame (the repair loop below), so each keyframe is still visited and
+    ``test_each_segments_first_frame_is_its_start_keyframe`` holds; a pathological weight ratio
+    like [1, 100] over 3 frames yields [1, 2], not [0, 3].
+    """
+    n_segs = len(weights)
+    total_frames = int(total_frames)
+    if n_segs == 0:
+        return []
+    total_w = float(sum(weights))
+    if not math.isfinite(total_w) or total_w <= 0.0:
+        # Otherwise this is a bare ZeroDivisionError from `w / total_w`, which is not a
+        # ValueError -- so `SimLoop._publish`'s `except ValueError` misses it and the loop PAUSES
+        # with a kind:"render" error. `Session.set_camera_path` rejects each offending weight by
+        # index before a path can be armed; this is the same failure made survivable for a direct
+        # `make_pan_cameras` caller, which has no such gate in front of it.
+        raise ValueError(
+            f"segment weights must sum to a finite positive number; got {list(weights)!r}"
+        )
+    ideal = [w / total_w * total_frames for w in weights]
+    counts = [int(math.floor(x)) for x in ideal]
+    short = total_frames - sum(counts)
+    # `short` is in [0, n_segs): each floor discards less than one frame.
+    order = sorted(range(n_segs), key=lambda i: (-(ideal[i] - counts[i]), i))
+    for i in order[:short]:
+        counts[i] += 1
+
+    # Restore the old rule's "every segment gets at least one frame" intent wherever it is
+    # actually affordable, by moving a frame from the longest segment to each starved one.
+    # Safe: with total_frames >= n_segs and at least one zero, the non-zero segments share
+    # total_frames > (number of non-zero segments) frames, so the longest holds >= 2 and cannot
+    # be emptied by giving one away.
+    if total_frames >= n_segs:
+        for i in range(n_segs):
+            if counts[i] == 0:
+                donor = max(range(n_segs), key=lambda j: (counts[j], -j))
+                counts[donor] -= 1
+                counts[i] += 1
+    return counts
 
 
 def _resolve_preset(cam_cfg: dict) -> dict:
@@ -1698,7 +1770,10 @@ class Visualizer:
                               presets from (instead of self.vis_state).
 
         Returns:
-            List of ``mujoco.MjvCamera`` of length *total_frames*.
+            List of ``mujoco.MjvCamera`` of length EXACTLY *total_frames*, for any weights and
+            any ``total_frames >= 1`` -- see :func:`allocate_segment_frames`, which owns that
+            guarantee and explains why a segment is allowed 0 frames when there are fewer
+            frames than segments.
         """
         if settings is not None:
             if isinstance(settings, str):
@@ -1733,9 +1808,7 @@ class Visualizer:
                 )
             weights = [float(w) for w in segment_weights]
 
-        total_w = sum(weights)
-        seg_frames = [max(1, round(w / total_w * total_frames)) for w in weights]
-        seg_frames[-1] = max(1, total_frames - sum(seg_frames[:-1]))
+        seg_frames = allocate_segment_frames(weights, total_frames)
 
         cameras = []
         for seg in range(n_segs):

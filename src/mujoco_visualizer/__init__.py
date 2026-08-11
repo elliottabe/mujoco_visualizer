@@ -9,7 +9,7 @@ Public API:
                               build_camera, apply_scene_flags, get_scene_modifiers,
                               setup_render, list_available_settings
 """
-from mujoco_visualizer.visualizer import Visualizer
+from mujoco_visualizer.visualizer import Visualizer, allocate_segment_frames
 from mujoco_visualizer.config import AnatomyConfig, CategoryRule, PoseGroup, load_config
 from mujoco_visualizer.categories import build_geom_categories
 from mujoco_visualizer.model_utils import filter_model_to_config_joints
@@ -40,6 +40,7 @@ __all__ = [
     "get_scene_modifiers",
     "build_camera",
     "make_pan_cameras",
+    "allocate_segment_frames",
     "setup_render",
     "list_available_settings",
 ]

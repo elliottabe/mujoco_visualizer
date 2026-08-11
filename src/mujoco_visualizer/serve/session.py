@@ -928,7 +928,30 @@ class Session:
         ``TypeError: '<' not supported between 'str' and 'int'``, surfacing as the ghost
         toggle failing. Coerced here, at the one place wire keys enter, rather than papered
         over in each consumer.
+
+        **This is the THIRD writer into camera state**, and the one nobody expected to be one.
+        The Camera tab's azimuth/elevation/distance/lookat/free_type/trackbody/fixedcamid are
+        GENERATED controls, so they arrive here as ``{"camera.azimuth": ...}`` on a
+        ``render.set`` -- never through :meth:`set_camera`, which is where the path disarm used
+        to live exclusively. The result was measured: with a path armed, ``camera.azimuth=271``
+        left the path armed, ``camera_state`` echoed 271 back so the field LOOKED accepted, and
+        the rendered camera stayed on the path at 0.0 -- then a later drag that touched only
+        elevation applied the stashed 271 retroactively and the view jumped. A control the user
+        can change with visibly no effect is the exact defect :meth:`active_camera` was written
+        to end, and spec section 12 requires that typing in a field moves the view.
+
+        :meth:`active_camera` states the precedence for READERS -- which camera renders. This
+        states it for WRITERS: any write into the ``camera`` group is the user driving the
+        camera, so it takes the camera back from an armed path. Deliberately keyed on the
+        dotted key's ROOT rather than a list of individual ``camera.*`` keys, so a new generated
+        camera field cannot become a fourth silent special case; the same ruling the spec
+        already applies to ``camera.mode`` and ``camera.named``.
         """
+        # Disarmed ONCE for the whole batch, before anything is merged: a drag arrives as a
+        # multi-key batch, and disarming per key would drop the path list and its cache several
+        # times for one user action.
+        if any(dotted.split(".")[0] == "camera" for dotted in settings):
+            self._disarm_camera_path()
         for dotted, value in settings.items():
             node = self.viz.vis_state
             parts = dotted.split(".")
@@ -1023,6 +1046,27 @@ class Session:
         """
         return self._camera
 
+    def _free_camera_pose(self) -> Dict:
+        """``vis_state['camera']``'s own position, ignoring anything injected or overriding.
+
+        Split out of :meth:`camera_state` when that method started reporting the camera that
+        actually RENDERS: :meth:`save_camera_preset` wants this one instead. A preset is a
+        stored shot whose azimuth/elevation/distance must be coherent with the
+        ``free_type``/``trackbody``/``fixedcamid`` stored alongside them, and those three only
+        ever come from ``vis_state`` -- an injected ``MjvCamera`` carries resolved ids, not
+        names. Snapshotting an injected path camera's angles next to ``vis_state``'s tracking
+        fields could therefore mint a preset that describes no reachable camera (path keyframes
+        tracking a body, ``vis_state`` on the free camera), so preset-saving deliberately keeps
+        reading the free camera and is unchanged by the ``frame_meta`` fix.
+        """
+        cam = self.viz.vis_state.get("camera", {})
+        return {
+            "azimuth": float(cam.get("azimuth", 180.0)),
+            "elevation": float(cam.get("elevation", -30.0)),
+            "distance": float(cam.get("distance", 0.3)),
+            "lookat": [float(v) for v in cam.get("lookat", [0.0, 0.0, 0.0])],
+        }
+
     def camera_state(self) -> Dict:
         """The camera as the client needs to see it, for ``frame_meta``.
 
@@ -1035,15 +1079,46 @@ class Session:
         :attr:`camera` -- the named override that actually wins at render time. A settings file
         can pin ``named`` to a model camera while the free camera is what is on screen, so a
         client that showed only ``named`` would misreport which camera it is looking through.
+
+        **The position reported is the position that RENDERS, not ``vis_state``'s.** When
+        :meth:`active_camera` resolves to an injected ``MjvCamera`` -- which is what one frame
+        of an armed camera path is -- its azimuth/elevation/distance/lookat are reported in
+        place of ``vis_state``'s. Reading ``vis_state`` unconditionally was measured to lie by
+        the width of a whole path: mid-scrub on a 20 deg -> 300 deg path the screen showed
+        ``az=-20.0, dist=0.900`` while this block said ``az=20.0, dist=0.400``. That is not a
+        cosmetic error in the numeric fields -- ``static/rollout.js`` seeds its orbit from
+        ``serverCamera.azimuth`` and its wheel from ``serverCamera.distance``, so the first drag
+        on an armed path jumped ~40 deg and the first wheel tick snapped the zoom: the camera
+        teleport this branch exists to fix, reintroduced through a different door.
+
+        This composes with :meth:`apply_render`'s disarm-on-``camera.*`` rule, and the two are
+        one story rather than two fixes: while a path is armed the fields show where the camera
+        actually is, and the moment the user types in one of them the write takes the camera back
+        from the path. Reporting live path values would be incoherent if typing did nothing.
+
+        Azimuth is normalised into ``[0, 360)`` on the way out because an interpolated path
+        azimuth is free to be negative or exceed 360 (``_lerp_angle`` follows the shortest
+        signed arc and does not wrap -- a 350 -> 10 segment genuinely climbs to 370), while the
+        generated ``camera.azimuth`` control's range is 0-360 and would clamp anything outside
+        it. The normalised value is the same physical angle.
         """
         cam = self.viz.vis_state.get("camera", {})
+        pose = self._free_camera_pose()
+        active = self.active_camera()
+        if isinstance(active, mujoco.MjvCamera):
+            pose = {
+                "azimuth": float(active.azimuth),
+                "elevation": float(active.elevation),
+                "distance": float(active.distance),
+                "lookat": [float(v) for v in active.lookat],
+            }
         return {
             "mode": cam.get("mode", "free"),
             "free_type": cam.get("free_type", "free"),
-            "azimuth": float(cam.get("azimuth", 180.0)),
-            "elevation": float(cam.get("elevation", -30.0)),
-            "distance": float(cam.get("distance", 0.3)),
-            "lookat": [float(v) for v in cam.get("lookat", [0.0, 0.0, 0.0])],
+            "azimuth": pose["azimuth"] % 360.0,
+            "elevation": pose["elevation"],
+            "distance": pose["distance"],
+            "lookat": pose["lookat"],
             "trackbody": cam.get("trackbody", ""),
             "fixedcamid": cam.get("fixedcamid", ""),
             "named": cam.get("named", ""),
@@ -1066,8 +1141,8 @@ class Session:
     def save_camera_preset(self, name: str) -> None:
         """Snapshot the current free camera into ``vis_state['camera_presets'][name]``.
 
-        Isolation from later camera movement comes today from :meth:`camera_state` itself: it
-        builds a fresh dict and a fresh ``lookat`` list on every call, and :meth:`set_camera`
+        Isolation from later camera movement comes today from :meth:`_free_camera_pose` itself:
+        it builds a fresh dict and a fresh ``lookat`` list on every call, and :meth:`set_camera`
         always reassigns ``cam["lookat"]`` rather than mutating it in place, so nothing here
         aliases anything ``set_camera`` will touch next. The ``copy.deepcopy`` below is
         defence in depth on top of that, not the thing currently doing the work -- cheap
@@ -1082,7 +1157,14 @@ class Session:
             raise ValueError(
                 f"camera preset name must match {PRESET_NAME_RE.pattern!r}, got {name!r}"
             )
-        state = self.camera_state()
+        # The FREE camera's pose, not camera_state()'s -- see _free_camera_pose for why an
+        # injected path camera's angles must not be snapshotted next to vis_state's tracking
+        # fields. The three non-positional preset fields still come from vis_state.
+        cam = self.viz.vis_state.get("camera", {})
+        state = dict(self._free_camera_pose())
+        state["free_type"] = cam.get("free_type", "free")
+        state["trackbody"] = cam.get("trackbody", "")
+        state["fixedcamid"] = cam.get("fixedcamid", "")
         presets = self.viz.vis_state.setdefault("camera_presets", {})
         presets[name] = copy.deepcopy(
             {field: state[field] for field in self._PRESET_CAMERA_FIELDS}
@@ -1184,6 +1266,22 @@ class Session:
                     f"segment_weights has {len(weights)} entries but this path has "
                     f"{expected} segments"
                 )
+            # VALUES, not just the count. A weight of 0 (or a whole list of them) makes
+            # make_pan_cameras' `w / total_w` a ZeroDivisionError, which is NOT a ValueError --
+            # so SimLoop._publish's `except ValueError` misses it and _publish_guarded pauses the
+            # loop with a kind:"render" error, the one treatment spec section 9 says a camera
+            # failure must never get, repeating every tick because the path stays armed. A
+            # negative weight is worse than an error: it silently steals frames from its
+            # neighbours. Unreachable from the wire (parse_command rejects non-positive and
+            # non-finite weights before this), but reachable from any Python caller, and this is
+            # the layer that owns path validation.
+            for i, w in enumerate(weights):
+                if not math.isfinite(w) or w <= 0.0:
+                    raise ValueError(
+                        f"segment_weights[{i}] is {w!r}; every segment weight must be a finite "
+                        f"number greater than zero (a segment cannot be given no time, and a "
+                        f"zero total has no proportional split)"
+                    )
 
         self._camera_path = {
             "cameras": cameras,
@@ -1255,6 +1353,21 @@ class Session:
             raise ValueError(
                 f"camera path references a preset that no longer exists: {exc}"
             ) from None
+        if len(cameras) != int(n_frames):
+            # The "exactly n_frames" promise in this docstring is what the preview and the
+            # export both rest on, and it is INHERITED from make_pan_cameras' per-segment
+            # allocation rather than enforced here. It has been broken once already (the old
+            # `max(1, round(...))` floor returned n+1 cameras for weights [3, 6, 6, 1] over
+            # n = 20), and the failure surfaced three layers downstream as
+            # `ExportJob.__init__` refusing a "camera sequence has 21 entries but this export
+            # renders 20 frames" -- an error naming internals the user cannot act on, for a
+            # path whose PREVIEW worked, because the preview clamps its index. A promise a
+            # caller relies on has to fail at its own boundary, so it fails here now.
+            raise ValueError(
+                f"camera_list_for({int(n_frames)}) built {len(cameras)} cameras; the camera "
+                f"list must be exactly as long as the frame count it was asked for "
+                f"(see allocate_segment_frames)"
+            )
         self._camera_list_cache = (key, cameras)
         return cameras
 
@@ -1362,6 +1475,16 @@ class Session:
         # `loop.py` guards against for its joint map on this same swap.
         self._ctrl_map = self._build_ctrl_map()
         self._rebuild_tendon_state()
+        # Same trap as `_ctrl_map` above, one layer further out: `_build_pan_camera` BAKES
+        # `trackbodyid` (and `fixedcamid`) by resolving the preset's body NAME against whichever
+        # model was current when the camera was built, and `camera_list_for`'s cache key
+        # fingerprints the preset CONTENT and the frame count but nothing about the model. A
+        # cached list therefore survives a swap holding ids from the old model, pointing the
+        # camera at whatever body happens to occupy that index in the new one. Latent today only
+        # because `thorax` is body 1 in both the plain and the ghost model -- an accident of
+        # those two XMLs, not a property of the code -- so it is invalidated here rather than
+        # left to be discovered by a model whose body order differs.
+        self._camera_list_cache = None
 
     def load_settings(self, name: str) -> None:
         """Load a bundled OR user settings preset by name.
