@@ -1551,12 +1551,17 @@ class Visualizer:
         show_skybox = self.vis_state.get('skybox', {}).get('show', True)
 
         renderer.update_scene(self.data, camera=cam, scene_option=opt)
-        if not show_shadows:
-            renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = False
-        if show_wireframe:
-            renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = True
-        if not show_skybox:
-            renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = False
+        # Assigned unconditionally, never `if not show_x: ... = False`. `update_scene()` does not
+        # reset `scene.flags`, and these flags live on the renderer's scene object, which the live
+        # viewer reuses for every frame -- so a one-directional write moved a flag once and never
+        # back. Ticking wireframe in the Settings tab could not be unticked, unticking shadows
+        # could not be undone, and `reset_render_settings` restored `vis_state` while the canvas
+        # went on rendering the old flags. Found by the reset round-trip figure, which reported
+        # 13/13 roots restored and a max per-pixel difference of 137: no test in this repo could
+        # see it, because `vis_state` was correct the whole time.
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = show_shadows
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_WIREFRAME] = show_wireframe
+        renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = show_skybox
         for fn, kw in scene_mods:
             fn(renderer.scene, geom_xpos=self.data.geom_xpos, **kw)
         if modify_scene_fns:
