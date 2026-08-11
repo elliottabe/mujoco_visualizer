@@ -923,3 +923,77 @@ def test_export_hides_the_tendons_of_actuators_no_ctrl_column_drives(tmp_path):
         "the exported frames' tendon alphas disagree with what the live Session shows for the "
         "same model -- the two paths have drifted again"
     )
+
+
+def test_export_renders_a_camera_per_frame(tmp_path):
+    """The point of a camera sequence: two frames of the SAME pose, rendered from deliberately
+    different cameras, must differ in pixels. A single-camera export cannot produce that.
+
+    NOTE: azimuth 180.0 (the brief's literal second camera) was tried first and rejected --
+    _MODEL_XML's geom is a perfect cube (size .1 .1 .1) under a light directly overhead on
+    the same vertical axis as the lookat point, and empirically (verified with a standalone
+    render_with call, not just this test) azimuth 0 vs 180 renders BIT-IDENTICAL images
+    regardless of whether per-frame camera indexing is implemented correctly -- a delta that
+    cannot distinguish a bug from a fix is not a usable regression test. Azimuth 90.0 was
+    verified (same standalone check) to actually differ from azimuth 0.0 for this fixture.
+    """
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(_MODEL_XML)
+    qpos = np.repeat(model.qpos0.copy().reshape(1, -1), 2, axis=0)
+
+    def _cam(azimuth):
+        c = mujoco.MjvCamera()
+        c.azimuth = azimuth
+        c.elevation = -20.0
+        c.distance = 1.5
+        return c
+
+    out = tmp_path / "per_frame"
+    job = ExportJob(
+        model, None, {}, qpos,
+        path=out, fmt="png", width=128, height=96, fps=10,
+        camera=[_cam(0.0), _cam(90.0)],
+    )
+    job.start()
+    job.join(timeout=120)
+    assert job.progress()["state"] == "done", job.progress()
+
+    import imageio.v2 as imageio
+
+    first = imageio.imread(out / "frame_00000.png")
+    second = imageio.imread(out / "frame_00001.png")
+    assert not np.array_equal(first, second)
+
+
+def test_export_rejects_a_camera_sequence_of_the_wrong_length(tmp_path):
+    """Raised in __init__, before the thread starts. A short sequence would otherwise either
+    IndexError twenty minutes into a render or silently repeat a frame's camera."""
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(_MODEL_XML)
+    qpos = np.repeat(model.qpos0.copy().reshape(1, -1), 3, axis=0)
+    with pytest.raises(ValueError, match="3"):
+        ExportJob(
+            model, None, {}, qpos,
+            path=tmp_path / "bad.mp4", width=64, height=48, fps=10,
+            camera=[mujoco.MjvCamera(), mujoco.MjvCamera()],
+        )
+
+
+def test_a_single_camera_and_none_still_work(tmp_path):
+    """Every pre-existing caller passes a name or None; the sequence support must not change
+    them."""
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(_MODEL_XML)
+    qpos = model.qpos0.copy().reshape(1, -1)
+    for camera in (None, mujoco.MjvCamera()):
+        job = ExportJob(
+            model, None, {}, qpos,
+            path=tmp_path / f"single_{type(camera).__name__}", fmt="png",
+            width=64, height=48, fps=10, camera=camera,
+        )
+        job.start()
+        job.join(timeout=120)
+        assert job.progress()["state"] == "done", job.progress()

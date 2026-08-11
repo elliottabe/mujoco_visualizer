@@ -91,6 +91,9 @@ class ExportJob(threading.Thread):
       automatically, and a missing one fails the job with ``state="failed"`` rather than
       guessing where to make directories. PNG-sequence export is the opposite: ``path`` is
       the sequence's own directory and IS created.
+    - ``camera`` accepts a name (``str``), a single ``mujoco.MjvCamera``, ``None``, or a
+      ``list``/``tuple`` of ``mujoco.MjvCamera`` with exactly one entry per frame (a camera
+      path) -- a length mismatch raises in ``__init__``, before the render thread starts.
     """
 
     def __init__(
@@ -127,10 +130,23 @@ class ExportJob(threading.Thread):
         self._anatomy = anatomy
         self._vis_state = vis_state
         self._frames = np.asarray(qpos_frames, dtype=np.float64)
+        # `camera` may be a name, a single MjvCamera, or ONE CAMERA PER FRAME (a camera path).
+        # A str is a Sequence, so the isinstance order here matters: check str first or a
+        # camera named "track1" is mistaken for a 6-element sequence of characters. Placed
+        # here (immediately after self._frames is assigned) rather than where camera=
+        # is later read, because the length check below reads len(self._frames).
+        self._camera_is_sequence = isinstance(camera, (list, tuple))
+        if self._camera_is_sequence and len(camera) != len(self._frames):
+            raise ValueError(
+                f"camera sequence has {len(camera)} entries but this export renders "
+                f"{len(self._frames)} frames; they must match exactly. A shorter sequence "
+                "would either IndexError part-way through a long render or silently repeat a "
+                "frame's camera."
+            )
+        self._camera = list(camera) if self._camera_is_sequence else camera
         self._path = Path(path)
         self._width, self._height, self._note = even_dims(width, height)
         self._fps = float(fps)
-        self._camera = camera
         self._fmt = fmt
         self._crf = int(crf)
         # Accepted but not yet consumed by any renderer here -- kept for forward
@@ -381,7 +397,7 @@ class ExportJob(threading.Thread):
                 self._apply_tendon_activation_frame(viz, i)
             yield viz.render_with(
                 renderer,
-                camera=self._camera,
+                camera=self._camera[i] if self._camera_is_sequence else self._camera,
                 frame_idx=i,
                 modify_scene_fns=self._modify_scene_fns,
             )
