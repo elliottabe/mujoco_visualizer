@@ -861,6 +861,123 @@ def test_every_camera_group_key_disarms_not_just_the_positional_ones(sess, dotte
     assert sess.camera_path is None, f"{dotted} left the path armed"
 
 
+# -- ...and disarming is still not enough when a settings bundle pinned mode: "named" ---------
+#
+# Measured with `vis_state['camera']['mode'] == "named"`, `named == "cam_side"` (a resolvable XML
+# camera) and a path armed: `camera.azimuth = 271` DID disarm, but `Visualizer.get_camera`
+# short-circuits on mode == 'named', so the resolved render camera was the STRING 'cam_side' --
+# the typed 271 discarded, and the only visible effect a teleport to the XML camera. Reachable in
+# normal use: Earthy_V1, Earthy_V1_forces and Earthy_amp2 all ship `camera.mode: "named"`, and
+# launch.py forces mode="free" only when NO --settings was named.
+#
+# The gate is the same one `Session.set_camera` already uses (its `touched` flag): force the mode
+# only when a value the free camera actually READS arrived. An arriving POSITION is the user
+# driving the camera; an arriving SELECTION is not -- which is what keeps the generated
+# mode/named/free_type/trackbody/fixedcamid controls settable.
+
+
+def _pin_named(sess, name="cam_side"):
+    cam = sess.viz.vis_state.setdefault("camera", {})
+    cam["mode"] = "named"
+    cam["named"] = name
+    assert (
+        mujoco.mj_name2id(sess.model, mujoco.mjtObj.mjOBJ_CAMERA, name) != -1
+    ), f"fixture no longer has a resolvable XML camera {name!r}"
+
+
+def test_a_positional_camera_key_wins_over_a_bundle_pinned_named_mode(sess):
+    """The residual behind this test: the path disarmed and the field echoed 271 back, yet the
+    renderer was handed the XML camera's NAME and the typed value changed nothing about the shot
+    -- spec section 12's "typing in one moves the view", failing through a third door."""
+    _pin_named(sess)
+    xml_cam_frame = sess.render().copy()
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    # `_save` goes through set_camera, which forces mode='free'; re-pin, as a bundle load would.
+    _pin_named(sess)
+    sess.set_camera_path(["a", "b"])
+    sess.set_camera_object(sess.camera_list_for(20)[0])
+
+    sess.apply_render({"camera.azimuth": 271.0})
+
+    assert sess.camera_path is None, "a camera.* render.set must still disarm the path"
+    assert sess.viz.vis_state["camera"]["mode"] == "free", (
+        "mode stayed 'named', so get_camera short-circuits to the XML camera and the typed "
+        "azimuth is discarded"
+    )
+    resolved = sess.viz.get_camera(override=sess.active_camera())
+    assert isinstance(resolved, mujoco.MjvCamera), (
+        f"the renderer was handed {resolved!r} -- the XML camera's name, not a camera carrying "
+        "the typed azimuth"
+    )
+    assert resolved.azimuth == pytest.approx(271.0)
+    assert not np.array_equal(xml_cam_frame, sess.render()), (
+        "the frame is byte-identical to a render at the XML camera: the pixels moved by "
+        "teleporting to cam_side, not by honouring the typed 271"
+    )
+
+
+@pytest.mark.parametrize(
+    "dotted, value",
+    [
+        ("camera.azimuth", 271.0),
+        ("camera.elevation", -12.0),
+        ("camera.distance", 1.25),
+        ("camera.lookat.0", 0.05),
+        ("camera.lookat.2", 0.05),
+    ],
+)
+def test_every_positional_camera_key_forces_free_mode(sess, dotted, value):
+    """All four of az/el/dist/lookat are values `_cfg_to_mjvcamera` reads off the FREE camera, so
+    every one of them is discarded whole while mode == 'named'. lookat is checked per component
+    because it arrives as `camera.lookat.N`, matched on the key's second segment."""
+    _pin_named(sess)
+    sess.apply_render({dotted: value})
+    assert sess.viz.vis_state["camera"]["mode"] == "free", f"{dotted} left mode 'named'"
+
+
+@pytest.mark.parametrize(
+    "dotted, value",
+    [
+        ("camera.named", "cam_side"),
+        ("camera.free_type", "track"),
+        ("camera.mode", "named"),
+        ("camera.trackbody", "box"),
+        ("camera.fixedcamid", "cam_side"),
+    ],
+)
+def test_a_camera_selection_key_alone_does_not_force_free_mode(sess, dotted, value):
+    """The other half of the rule, and the reason a previous pass declined to force the mode at
+    all: if a SELECTION forced mode='free', the generated control that made the selection would
+    undo itself on the same message and be unsettable."""
+    _pin_named(sess)
+    before = sess.viz.vis_state["camera"]["mode"]
+    sess.apply_render({dotted: value})
+    assert sess.viz.vis_state["camera"]["mode"] == before, (
+        f"{dotted} forced mode to {sess.viz.vis_state['camera']['mode']!r}; a selection is not a "
+        "position, and a control that undoes its own write is unsettable"
+    )
+    # ...and the selection itself landed, so this is not "nothing happened".
+    assert sess.viz.vis_state["camera"][dotted.split(".")[1]] == value
+
+
+def test_the_mode_is_forced_once_per_batch_and_an_explicit_mode_in_it_still_wins(sess):
+    """A batch is one gesture. The force is written BEFORE the merge, so a batch carrying an
+    explicit `camera.mode` next to a position keeps the mode the user stated -- otherwise the
+    generated mode control becomes unsettable again whenever a drag coalesces with it."""
+    _pin_named(sess)
+    sess.apply_render({"camera.azimuth": 30.0, "camera.mode": "named"})
+    assert sess.viz.vis_state["camera"]["mode"] == "named"
+    assert sess.viz.vis_state["camera"]["azimuth"] == 30.0
+
+
+def test_a_render_set_to_a_non_camera_key_leaves_the_pinned_mode_alone(sess):
+    """A look change is not a camera move, for the mode exactly as for the disarm."""
+    _pin_named(sess)
+    sess.apply_render({"floor.alpha": 0.5, "shadows": False})
+    assert sess.viz.vis_state["camera"]["mode"] == "named"
+
+
 def test_a_render_set_to_a_non_camera_key_leaves_an_armed_path_alone(sess):
     """The other side of the rule: a look change is not a camera move. Without this, arming a
     path and then touching any render setting at all would silently drop the path."""
@@ -888,6 +1005,65 @@ def test_the_disarm_happens_once_per_batch_not_once_per_key(sess):
         {"camera.azimuth": 30.0, "camera.elevation": -5.0, "camera.distance": 0.7}
     )
     assert len(calls) == 1, f"disarmed {len(calls)} times for one batch"
+
+
+# -- D8, fourth writer: a settings load replaces the WHOLE camera dict, mode included ---------
+#
+# `Session.load_settings` merges a whole `camera` group -- `mode: "named"` and all -- and did so
+# without disarming. That is the runtime route into the state above: load Earthy_V1 from the
+# Settings tab with a path armed and the path survives a camera it no longer describes,
+# re-injecting itself on the next publish tick. A settings load replaces the camera outright, so
+# an armed path over the old one is meaningless; same rule as apply_render, coarsest write.
+
+
+def test_loading_a_settings_preset_disarms_an_armed_path(tmp_path):
+    user_dir = tmp_path / "user_settings"
+    sess = Session(
+        model=mujoco.MjModel.from_xml_string(_XML),
+        width=64,
+        height=48,
+        user_settings_dir=user_dir,
+    )
+    try:
+        sess.viz.vis_state.setdefault("camera", {})["mode"] = "named"
+        sess.viz.vis_state["camera"]["named"] = "cam_side"
+        sess.save_settings_as("pinned_named")
+
+        _save(sess, "a", az=0.0)
+        _save(sess, "b", az=90.0)
+        sess.set_camera_path(["a", "b"])
+        sess.set_camera_object(sess.camera_list_for(20)[0])
+        assert sess.camera_path is not None
+
+        sess.load_settings("pinned_named")
+
+        assert sess.camera_path is None, (
+            "a settings load replaced the whole camera dict and left the path armed -- it will "
+            "re-inject itself on the next publish tick"
+        )
+        assert sess._camera_object is None
+        assert sess._camera_list_cache is None
+    finally:
+        sess.close()
+
+
+def test_a_failed_settings_load_leaves_an_armed_path_alone(tmp_path):
+    """Disarmed AFTER the load, so a load that raises changes nothing at all."""
+    sess = Session(
+        model=mujoco.MjModel.from_xml_string(_XML),
+        width=64,
+        height=48,
+        user_settings_dir=tmp_path / "user_settings",
+    )
+    try:
+        _save(sess, "a", az=0.0)
+        _save(sess, "b", az=90.0)
+        sess.set_camera_path(["a", "b"])
+        with pytest.raises(ValueError):
+            sess.load_settings("no_such_preset_anywhere")
+        assert sess.camera_path is not None
+    finally:
+        sess.close()
 
 
 # -- frame_meta must report the camera that is actually RENDERING ----------------------------

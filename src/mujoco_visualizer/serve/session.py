@@ -100,6 +100,14 @@ _CAMERA_WIRE_KEYS = {
 _PATH_TRACKING_ALIASES = {"track": "trackcom"}
 _PATH_FORBIDDEN_FREE_TYPES = {"fixed"}
 
+# The `camera.*` render keys that carry a POSITION rather than a SELECTION -- read by
+# `Session.apply_render` to decide whether an arriving batch is the user driving the free camera.
+# `camera.lookat.N` is matched on its first two segments, so all three components count.
+# Deliberately NOT here: `mode`, `named`, `free_type`, `trackbody`, `fixedcamid` -- those pick
+# WHICH camera renders, and forcing mode='free' on them would make the generated controls that
+# set them unsettable (ticking `named` would immediately undo itself).
+_CAMERA_POSITIONAL_KEYS = {"azimuth", "elevation", "distance", "lookat"}
+
 
 def _normalised_tracking(preset: Dict) -> tuple:
     """The tuple two path keyframes must agree on, with `track`/`trackcom` folded together."""
@@ -946,12 +954,42 @@ class Session:
         dotted key's ROOT rather than a list of individual ``camera.*`` keys, so a new generated
         camera field cannot become a fourth silent special case; the same ruling the spec
         already applies to ``camera.mode`` and ``camera.named``.
+
+        Disarming alone was measured to be NOT ENOUGH once a settings bundle pins
+        ``camera.mode: "named"`` -- which ``Earthy_V1``, ``Earthy_V1_forces`` and ``Earthy_amp2``
+        all do, and which ``launch.py`` only overrides to ``"free"`` when no ``--settings`` was
+        named. With ``mode == 'named'`` and ``named == 'cam_side'``, a ``render.set`` of
+        ``camera.azimuth = 271`` disarmed the path and then rendered the *string* ``'cam_side'``:
+        ``Visualizer.get_camera`` short-circuits to the XML camera, so the typed 271 was
+        discarded and the only visible effect was a teleport to the XML camera. Spec section 12
+        requires that typing in a field moves the view, so the mode is forced to ``'free'`` --
+        with the SAME gate :meth:`set_camera` uses for the same problem, its ``touched`` flag:
+        force it only when a value actually arrived that the free camera reads. The rule, plainly:
+        **an arriving POSITION is the user driving the camera; an arriving SELECTION is not.**
+        A batch of only ``camera.mode``/``named``/``free_type``/``trackbody``/``fixedcamid``
+        therefore leaves the mode alone, which is what keeps those generated controls settable.
         """
-        # Disarmed ONCE for the whole batch, before anything is merged: a drag arrives as a
-        # multi-key batch, and disarming per key would drop the path list and its cache several
-        # times for one user action.
-        if any(dotted.split(".")[0] == "camera" for dotted in settings):
+        # Both decisions are made ONCE for the whole batch, before anything is merged: a drag
+        # arrives as a multi-key batch, and disarming per key would drop the path list and its
+        # cache several times for one user action.
+        key_parts = [dotted.split(".") for dotted in settings]
+        if any(parts[0] == "camera" for parts in key_parts):
             self._disarm_camera_path()
+        if any(
+            parts[0] == "camera"
+            and len(parts) > 1
+            and parts[1] in _CAMERA_POSITIONAL_KEYS
+            for parts in key_parts
+        ):
+            # See the docstring: position, not selection. `set_camera` gates the identical
+            # `mode = "free"` on its `touched` flag for the identical reason -- a settings bundle
+            # that pinned mode='named' otherwise swallows the value the user just typed.
+            #
+            # Written BEFORE the merge, so a batch that carries an explicit `camera.mode`
+            # alongside a position keeps the mode the user asked for: an explicit selection in
+            # the same gesture is a stated intent, and overriding it here is how the generated
+            # `camera.mode` control would become unsettable.
+            self.viz.vis_state.setdefault("camera", {})["mode"] = "free"
         for dotted, value in settings.items():
             node = self.viz.vis_state
             parts = dotted.split(".")
@@ -1500,6 +1538,15 @@ class Session:
         silently keep loading the bundled default underneath it. ``list_available_settings``
         itself takes no side on this -- it lists both, distinguished by origin -- so the
         choice is made here, once, rather than left to whichever caller resolves the name.
+
+        **This is the FOURTH writer into camera state**, and the loudest of them: a settings
+        bundle merges a WHOLE ``camera`` dict, ``mode`` included, so loading ``Earthy_V1`` from
+        the Settings tab replaces the camera outright. An armed path over the camera that was
+        just replaced describes a shot the user did not ask for, so it is disarmed -- the same
+        rule :meth:`apply_render` states for writers, applied to the coarsest write there is.
+        Without this, loading a bundle that pins ``mode: "named"`` left the path armed and
+        re-injecting itself on the next publish tick, which is the runtime route into exactly
+        the defect :meth:`apply_render`'s mode forcing exists to close.
         """
         available = list_available_settings(self.user_settings_dir)
         matches = [d for d in available if d["name"] == name]
@@ -1513,6 +1560,9 @@ class Session:
             self.viz.load_settings(str(self.user_settings_dir / f"{name}.json"))
         else:
             self.viz.load_settings(name)
+        # Disarmed AFTER the load, not before: a load that raises (unwritable/corrupt file)
+        # must leave the session exactly as it was, path included.
+        self._disarm_camera_path()
 
     def save_settings_as(self, name: str) -> Path:
         """Save the current render settings as a NAMED preset in this session's

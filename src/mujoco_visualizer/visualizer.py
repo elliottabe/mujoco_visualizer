@@ -578,10 +578,26 @@ def allocate_segment_frames(weights: Sequence[float], total_frames: int) -> List
     largest fractional parts. Ties break toward the LOWER index, stated explicitly rather than
     left to sort stability, because `RVSettings.pathSegmentCounts` in the fly viewer's
     ``rollout_settings.js`` mirrors this function to print the split in the path editor and the
-    two must agree digit for digit. Floor-plus-fraction is also what makes that mirroring sound
-    across runtimes: the old rule used ``round``, and Python (banker's, to even) and JS
+    two must agree. Floor-plus-fraction is part of what makes that mirroring sound across
+    runtimes: the old rule used ``round``, and Python (banker's, to even) and JS
     (``Math.round``, half away from zero) disagree on exact ``.5`` shares, whereas ``floor`` and
-    an IEEE double comparison agree everywhere.
+    an IEEE double comparison agree.
+
+    **The weight total is summed by an explicit left-fold, and JAVASCRIPT'S ARITHMETIC IS
+    NORMATIVE here.** Floor-plus-fraction is not sufficient on its own: CPython >= 3.12's
+    built-in ``sum()`` applies Neumaier compensated summation to floats, while JS ``reduce``
+    is a naive left-fold, so the two runtimes disagree on the TOTAL before either divides by
+    it. ``[0.1, 1.3, 0.1]`` totals ``1.5`` under ``sum()`` and ``1.5000000000000002`` under
+    ``reduce``; the ideal shares then differ in the last bits and the largest-remainder ordering
+    of two near-tied fractions flips. Measured on the tenths grid the editor's
+    ``min="0.1" step="0.1"`` weight input actually produces: weights ``[0.1, 1.1, 0.3]`` over
+    351 frames printed ``24 / 257 / 70`` in the readout while the server rendered
+    ``23 / 258 / 70`` -- always a one-frame move between two segments, and never caught by any
+    total check because both sides still sum to ``n``. The loop below reproduces JS's naive fold
+    exactly rather than the reverse, because a naive accumulator is one line that can be stated
+    and kept true in both languages, whereas hand-writing Neumaier in JavaScript would be a
+    second delicate implementation free to drift. ``math.fsum`` would be a THIRD answer and is
+    deliberately not used.
 
     **A segment may receive 0 frames, and that is deliberate** -- but only when there are fewer
     frames than segments. With ``total_frames < len(weights)`` some keyframes simply cannot be
@@ -597,7 +613,11 @@ def allocate_segment_frames(weights: Sequence[float], total_frames: int) -> List
     total_frames = int(total_frames)
     if n_segs == 0:
         return []
-    total_w = float(sum(weights))
+    # Naive left-fold, matching `pathSegmentCounts`' `weights.reduce((a, b) => a + b, 0)` bit for
+    # bit. NOT `sum(weights)`: see the docstring -- CPython >= 3.12 compensates, JS does not.
+    total_w = 0.0
+    for w in weights:
+        total_w += float(w)
     if not math.isfinite(total_w) or total_w <= 0.0:
         # Otherwise this is a bare ZeroDivisionError from `w / total_w`, which is not a
         # ValueError -- so `SimLoop._publish`'s `except ValueError` misses it and the loop PAUSES
