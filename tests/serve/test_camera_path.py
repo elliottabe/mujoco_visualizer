@@ -100,3 +100,195 @@ def test_render_uses_the_injected_object(sess):
     sess.set_camera_object(_cam(azimuth=11.0))
     near = sess.render()
     assert not np.array_equal(far, near)
+
+
+# -- the path spec and its exclusions --------------------------------------------------------
+#
+# A path is an ordered list of >=2 free/tracking presets sharing ONE tracking configuration.
+# Every exclusion below has the same cause: nothing interpolates. An XML camera resolves to a
+# NAME, so there are no az/el/dist to blend; a `fixed` preset has the same problem one level
+# down (MuJoCo reads fixedcamid and ignores az/el/dist/lookat); and keyframes that disagree on
+# the tracking config make _build_pan_camera snap free_type at the segment midpoint while still
+# lerping lookat -- a visible discontinuity halfway through, with no error.
+
+
+def _save(sess, name, **kw):
+    sess.set_camera(**{k: v for k, v in kw.items() if k in ("az", "el", "dist", "lookat")})
+    cam = sess.viz.vis_state["camera"]
+    for key in ("free_type", "trackbody", "fixedcamid"):
+        if key in kw:
+            cam[key] = kw[key]
+    sess.save_camera_preset(name)
+
+
+def test_arming_a_path_records_the_spec(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"], weights=[1.0], loop=False)
+    assert sess.camera_path == {"cameras": ["a", "b"], "weights": [1.0], "loop": False}
+
+
+def test_an_empty_camera_list_disarms(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    sess.set_camera_path([])
+    assert sess.camera_path is None
+
+
+def test_camera_list_for_returns_exactly_n_cameras(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    _save(sess, "c", az=180.0)
+    sess.set_camera_path(["a", "b", "c"], weights=[1.0, 2.0])
+    for n in (2, 7, 120, 1588):
+        cams = sess.camera_list_for(n)
+        assert len(cams) == n
+        assert all(isinstance(c, mujoco.MjvCamera) for c in cams)
+
+
+def test_each_segments_first_frame_is_its_start_keyframe(sess):
+    """make_pan_cameras emits t=0 at each segment's start, so those frames land exactly on the
+    keyframe. The path's FINAL keyframe is approached but never reached -- t = fi/n over
+    range(n) never evaluates 1 -- which is a real property of the last frame, not a rounding
+    artefact, and is asserted separately below."""
+    _save(sess, "a", az=10.0)
+    _save(sess, "b", az=200.0)
+    sess.set_camera_path(["a", "b"])
+    cams = sess.camera_list_for(50)
+    assert cams[0].azimuth == pytest.approx(10.0)
+
+
+def test_the_final_keyframe_is_approached_but_not_reached(sess):
+    _save(sess, "a", az=10.0)
+    _save(sess, "b", az=200.0)
+    sess.set_camera_path(["a", "b"])
+    cams = sess.camera_list_for(50)
+    assert cams[-1].azimuth != pytest.approx(200.0)
+    # 10 -> 200 spans 190 degrees, which is > 180, so _lerp_angle's shortest-arc rule takes
+    # the OTHER, 170-degree route (through 0, into negative values) rather than the direct
+    # one -- the same mechanism test_azimuth_takes_the_short_way_round_zero exercises. The
+    # raw field therefore lands near -160, not near +200, even though -160 % 360 == 200 is
+    # the same physical angle; compare mod 360 rather than on the raw (unwrapped) value.
+    assert abs((cams[-1].azimuth % 360.0) - 200.0) < 1.0
+
+
+def test_azimuth_takes_the_short_way_round_zero(sess):
+    """_lerp_angle uses the shortest signed difference, so 350 -> 10 must pass through 0, not
+    through 180. This is the single likeliest silent defect in an interpolated pan."""
+    _save(sess, "late", az=350.0)
+    _save(sess, "early", az=10.0)
+    sess.set_camera_path(["late", "early"])
+    for cam in sess.camera_list_for(60):
+        assert cam.azimuth >= 349.9 or cam.azimuth <= 10.1
+
+
+def test_segment_weights_split_the_frames_proportionally(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    _save(sess, "c", az=180.0)
+    sess.set_camera_path(["a", "b", "c"], weights=[1.0, 3.0])
+    cams = sess.camera_list_for(100)
+    # Segment 2 starts where azimuth passes its own start keyframe (90). With weights 1:3 the
+    # first segment gets about a quarter of the frames.
+    first_segment = [i for i, c in enumerate(cams) if c.azimuth < 89.9]
+    assert 20 <= len(first_segment) <= 30
+
+
+def test_loop_appends_a_return_to_the_first_camera(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"], loop=True)
+    cams = sess.camera_list_for(80)
+    assert len(cams) == 80
+    # The looped path passes back down through low azimuth on the way home.
+    assert cams[-1].azimuth < cams[len(cams) // 2].azimuth
+
+
+def test_camera_list_for_caches_and_invalidates_on_the_spec(sess):
+    """scene_message-adjacent code paths call this per frame; recomputing 1588 cameras each
+    time would be real work for a byte-identical answer."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    first = sess.camera_list_for(40)
+    assert sess.camera_list_for(40) is first          # same object, cached
+    assert sess.camera_list_for(41) is not first      # different n
+    sess.set_camera_path(["b", "a"])
+    assert sess.camera_list_for(40) is not first      # different spec
+
+
+def test_camera_list_for_without_a_path_raises(sess):
+    with pytest.raises(ValueError, match="no camera path"):
+        sess.camera_list_for(10)
+
+
+def test_a_deleted_preset_is_reported_by_name(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    sess.delete_camera_preset("b")
+    with pytest.raises(ValueError, match="b"):
+        sess.camera_list_for(10)
+
+
+def test_fewer_than_two_cameras_is_refused(sess):
+    _save(sess, "a", az=0.0)
+    with pytest.raises(ValueError, match="at least two"):
+        sess.set_camera_path(["a"])
+
+
+def test_an_unknown_preset_name_is_refused_and_lists_what_exists(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "real", az=90.0)
+    with pytest.raises(ValueError, match="real"):
+        sess.set_camera_path(["a", "never_saved"])
+
+
+def test_an_xml_camera_name_is_refused_with_the_reason(sess):
+    _save(sess, "a", az=0.0)
+    with pytest.raises(ValueError, match="cannot be interpolated"):
+        sess.set_camera_path(["a", "cam_side"])
+
+
+def test_a_fixed_preset_is_refused_naming_it_and_its_type(sess):
+    _save(sess, "a", az=0.0, free_type="free")
+    _save(sess, "pinned", az=90.0, free_type="fixed")
+    with pytest.raises(ValueError, match="pinned"):
+        sess.set_camera_path(["a", "pinned"])
+
+
+def test_mixed_tracking_configurations_are_refused_naming_both_and_the_difference(sess):
+    _save(sess, "loose", az=0.0, free_type="free")
+    _save(sess, "tracked", az=90.0, free_type="trackcom", trackbody="box")
+    with pytest.raises(ValueError) as excinfo:
+        sess.set_camera_path(["loose", "tracked"])
+    message = str(excinfo.value)
+    assert "loose" in message and "tracked" in message and "free_type" in message
+
+
+def test_track_and_trackcom_are_not_a_mixed_path(sess):
+    """_FREE_TYPE_MAP maps both to mjCAMERA_TRACKING with needs_body=True -- they are aliases,
+    so a path using both is not mixed and must be accepted."""
+    _save(sess, "old_name", az=0.0, free_type="track", trackbody="box")
+    _save(sess, "new_name", az=90.0, free_type="trackcom", trackbody="box")
+    sess.set_camera_path(["old_name", "new_name"])
+    assert len(sess.camera_list_for(20)) == 20
+
+
+def test_tracking_presets_on_different_bodies_are_refused(sess):
+    """Panning between two bodies would jump trackbodyid at the segment midpoint."""
+    _save(sess, "on_box", az=0.0, free_type="trackcom", trackbody="box")
+    _save(sess, "on_world", az=90.0, free_type="trackcom", trackbody="world")
+    with pytest.raises(ValueError, match="trackbody"):
+        sess.set_camera_path(["on_box", "on_world"])
+
+
+@pytest.mark.parametrize("weights", [[1.0], [1.0, 2.0, 3.0]])
+def test_a_wrong_weight_count_is_refused_with_both_numbers(sess, weights):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    _save(sess, "c", az=180.0)
+    with pytest.raises(ValueError) as excinfo:
+        sess.set_camera_path(["a", "b", "c"], weights=weights)
+    assert "2" in str(excinfo.value)

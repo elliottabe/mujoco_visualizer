@@ -92,6 +92,21 @@ _CAMERA_WIRE_KEYS = {
     "lookat": "lookat",
 }
 
+# free_type values a camera path may contain, and the normalisation that decides whether two
+# keyframes agree. `track` and `trackcom` both map to mjCAMERA_TRACKING with needs_body=True in
+# Visualizer._FREE_TYPE_MAP -- they are aliases, so a path using both is NOT mixed. `fixed` is
+# excluded outright: MuJoCo reads fixedcamid and ignores az/el/dist/lookat, so there is nothing
+# to interpolate.
+_PATH_TRACKING_ALIASES = {"track": "trackcom"}
+_PATH_FORBIDDEN_FREE_TYPES = {"fixed"}
+
+
+def _normalised_tracking(preset: Dict) -> tuple:
+    """The tuple two path keyframes must agree on, with `track`/`trackcom` folded together."""
+    free_type = preset.get("free_type", "free")
+    free_type = _PATH_TRACKING_ALIASES.get(free_type, free_type)
+    return (free_type, preset.get("trackbody", ""), preset.get("fixedcamid", ""))
+
 # Metres of lookat travel per pixel of drag, per unit of camera distance. Multiplied by
 # `distance` at use so a drag moves the same APPARENT amount at any zoom -- a fixed metres-per
 # -pixel gain that feels right at distance 0.3 is imperceptible at 3.0. The value itself is a
@@ -335,6 +350,12 @@ class Session:
         # the `camera` property), where a non-serialisable object would blow up an export
         # sidecar's json.dumps after the render had already succeeded.
         self._camera_object: Optional[mujoco.MjvCamera] = None
+
+        # The armed camera path, and the memoised camera list derived from it. See
+        # set_camera_path / camera_list_for. Deliberately NOT persisted: a path is a
+        # per-session composition, like the replay trim.
+        self._camera_path: Optional[Dict] = None
+        self._camera_list_cache = None
 
         self._controller = None
         self._controller_out: Optional[np.ndarray] = None
@@ -1049,6 +1070,140 @@ class Session:
                 f"no camera preset {name!r}; available: {sorted(presets)}"
             )
         del presets[name]
+
+    @property
+    def camera_path(self) -> Optional[Dict]:
+        """The armed path, or ``None``. A copy: a caller mutating it must not silently
+        re-point the live path without going through validation."""
+        if self._camera_path is None:
+            return None
+        return {
+            "cameras": list(self._camera_path["cameras"]),
+            "weights": (
+                None if self._camera_path["weights"] is None
+                else list(self._camera_path["weights"])
+            ),
+            "loop": self._camera_path["loop"],
+        }
+
+    def set_camera_path(
+        self,
+        cameras: Sequence[str],
+        weights: Optional[Sequence[float]] = None,
+        loop: bool = False,
+    ) -> None:
+        """Arm a camera path over saved presets, or disarm with an empty *cameras*.
+
+        Validated HERE rather than at the wire boundary because every check but the shape ones
+        needs ``vis_state['camera_presets']``, which ``protocol.parse_command`` has no access
+        to. Failures raise ``ValueError`` and surface as non-pausing ``kind:"command"`` errors,
+        the same convention as :meth:`save_camera_preset`.
+        """
+        cameras = list(cameras)
+        if not cameras:
+            self._camera_path = None
+            self._camera_list_cache = None
+            self.set_camera_object(None)
+            return
+        if len(cameras) < 2:
+            raise ValueError("a camera path needs at least two cameras to interpolate between")
+
+        presets = self.viz.vis_state.get("camera_presets", {})
+        resolved = []
+        for name in cameras:
+            if name not in presets:
+                if mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, name) != -1:
+                    raise ValueError(
+                        f"{name!r} is a model camera, and model cameras cannot be "
+                        "interpolated: get_camera returns their NAME, so there are no "
+                        "azimuth/elevation/distance to blend. Save a camera preset instead."
+                    )
+                raise ValueError(
+                    f"no camera preset {name!r}; available: {sorted(presets)}"
+                )
+            preset = presets[name]
+            free_type = preset.get("free_type", "free")
+            if free_type in _PATH_FORBIDDEN_FREE_TYPES:
+                raise ValueError(
+                    f"preset {name!r} has free_type {free_type!r}, which cannot be "
+                    "interpolated: MuJoCo reads fixedcamid and ignores "
+                    "azimuth/elevation/distance/lookat for it."
+                )
+            resolved.append((name, preset))
+
+        first_name, first = resolved[0]
+        first_key = _normalised_tracking(first)
+        for name, preset in resolved[1:]:
+            key = _normalised_tracking(preset)
+            if key != first_key:
+                differing = [
+                    field
+                    for field, a, b in zip(
+                        ("free_type", "trackbody", "fixedcamid"), first_key, key
+                    )
+                    if a != b
+                ]
+                raise ValueError(
+                    f"presets {first_name!r} and {name!r} disagree on "
+                    f"{', '.join(differing)} ({first_key} vs {key}). A path's keyframes must "
+                    "share one tracking configuration -- _build_pan_camera snaps free_type at "
+                    "the segment midpoint while still interpolating lookat, so a mixed path "
+                    "renders a visible discontinuity halfway through with no error."
+                )
+
+        if weights is not None:
+            weights = [float(w) for w in weights]
+            expected = len(cameras) - 1 + (1 if loop else 0)
+            if len(weights) != expected:
+                raise ValueError(
+                    f"segment_weights has {len(weights)} entries but this path has "
+                    f"{expected} segments"
+                )
+
+        self._camera_path = {
+            "cameras": cameras,
+            "weights": None if weights is None else list(weights),
+            "loop": bool(loop),
+        }
+        self._camera_list_cache = None
+
+    def camera_list_for(self, n_frames: int) -> List[mujoco.MjvCamera]:
+        """Exactly *n_frames* cameras along the armed path.
+
+        **The single derived-value rule.** The live preview and an export both call this with
+        the same frame count and index the same returned list, which is what makes "what you
+        previewed is what you rendered" structural rather than something that happens to hold.
+        Two independent derivations that currently agree is the failure this exists to prevent.
+
+        Cached on ``(spec, n_frames)``: a scrub calls this every published frame and would
+        otherwise rebuild 1588 cameras for a byte-identical answer.
+        """
+        if self._camera_path is None:
+            raise ValueError("no camera path is armed")
+        key = (
+            tuple(self._camera_path["cameras"]),
+            tuple(self._camera_path["weights"] or ()),
+            self._camera_path["loop"],
+            int(n_frames),
+        )
+        if self._camera_list_cache is not None and self._camera_list_cache[0] == key:
+            return self._camera_list_cache[1]
+        try:
+            cameras = self.viz.make_pan_cameras(
+                self._camera_path["cameras"],
+                total_frames=int(n_frames),
+                segment_weights=self._camera_path["weights"],
+                loop=self._camera_path["loop"],
+            )
+        except KeyError as exc:
+            # make_pan_cameras raises a bare KeyError for a preset deleted since the path was
+            # armed. Re-raised as a ValueError naming it, so the loop reports it the same way
+            # as every other camera-command failure instead of escaping as an unhandled type.
+            raise ValueError(
+                f"camera path references a preset that no longer exists: {exc}"
+            ) from None
+        self._camera_list_cache = (key, cameras)
+        return cameras
 
     @property
     def active_model_name(self) -> str:
