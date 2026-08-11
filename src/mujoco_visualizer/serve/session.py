@@ -404,6 +404,12 @@ class Session:
         # exist yet as of this commit -- this comment states the intent, not a verified fact.
         self._reset_baseline = copy.deepcopy(self.viz.vis_state)
 
+        # Bumped on every WHOLESALE vis_state write (load_settings, reset_render_settings) and
+        # published in scene_message. Per-key `apply_render` edits deliberately do NOT bump it:
+        # the client already knows about the control it just moved, and counting drags would
+        # make this change continuously and stop being usable as a change signal.
+        self._settings_epoch = 0
+
     # -- controller -----------------------------------------------------------
 
     def attach_controller(self, controller) -> None:
@@ -1585,6 +1591,16 @@ class Session:
         # Disarmed AFTER the load, not before: a load that raises (unwritable/corrupt file)
         # must leave the session exactly as it was, path included.
         self._disarm_camera_path()
+        self._settings_epoch += 1
+
+    @property
+    def settings_epoch(self) -> int:
+        """How many wholesale ``vis_state`` writes have happened. See ``_settings_epoch``.
+
+        Read-only on purpose: a client that could set it could claim a change that never
+        happened, which is exactly the confusion the counter exists to remove.
+        """
+        return self._settings_epoch
 
     def reset_render_settings(self) -> bool:
         """Restore the :data:`RESET_KEYS` roots of ``vis_state`` to their launch values.
@@ -1635,6 +1651,7 @@ class Session:
         _carry_vis_state_across_swap(restored, self.model)
         changed = any(self.viz.vis_state.get(k) != v for k, v in restored.items())
         self.viz.vis_state.update(restored)
+        self._settings_epoch += 1
         return changed
 
     def save_settings_as(self, name: str) -> Path:
@@ -1785,6 +1802,11 @@ class Session:
             "tendon_unclassified": unclassified,
             "presets": self.viz.list_presets(),
             "settings": copy.deepcopy(self.viz.vis_state),
+            # Lets a client detect that a settings command was applied even when it changed
+            # nothing -- a reset when already at the launch state, or re-loading the selected
+            # preset. Comparing the `settings` blob alone cannot distinguish those from a
+            # command that never arrived. Additive: older clients ignore it.
+            "settings_epoch": self._settings_epoch,
             # Flat names, not the {"name", "origin"} dicts list_available_settings()
             # actually returns: this list goes straight to viewer.js as a dropdown's option
             # set (see static/viewer.js), which has always expected plain strings, and a
