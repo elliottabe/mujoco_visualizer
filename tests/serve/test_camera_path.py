@@ -232,6 +232,38 @@ def test_a_deleted_preset_is_reported_by_name(sess):
         sess.camera_list_for(10)
 
 
+def test_a_deleted_preset_is_reported_even_through_a_warm_cache(sess):
+    """The bug a review round found: the cache above is keyed on the path spec + n_frames
+    only, so a call that warmed it BEFORE the deletion (exactly what a live preview does --
+    it calls camera_list_for with the same n every published frame) kept serving the stale
+    list afterwards, with no exception at all. test_a_deleted_preset_is_reported_by_name
+    above never warms the cache first, so it could not have caught this."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    sess.camera_list_for(40)              # warm the cache
+    sess.delete_camera_preset("b")
+    with pytest.raises(ValueError, match="b"):
+        sess.camera_list_for(40)          # SAME n -- must still detect the deletion
+
+
+def test_a_resaved_preset_is_reflected_even_through_a_warm_cache(sess):
+    """The second mutation path a fingerprint-free cache key cannot see: re-saving a preset a
+    path already references (e.g. re-shooting the opening framing) moves it to a new
+    position without touching `set_camera_path` or `delete_camera_preset` -- the only two
+    places that used to invalidate the cache."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    first = sess.camera_list_for(40)
+    assert first[0].azimuth == pytest.approx(0.0)   # frame 0 lands exactly on "a"'s keyframe
+
+    _save(sess, "a", az=222.0)            # move the camera and re-save over "a"
+    second = sess.camera_list_for(40)     # SAME n -- must not serve the old shot
+    assert second is not first
+    assert second[0].azimuth == pytest.approx(222.0)
+
+
 def test_fewer_than_two_cameras_is_refused(sess):
     _save(sess, "a", az=0.0)
     with pytest.raises(ValueError, match="at least two"):
@@ -467,3 +499,44 @@ def test_path_frame_count_matches_an_export_range():
 
 def test_camera_state_reports_path_frame(sess):
     assert sess.camera_state()["path_frame"] is None
+
+
+def test_a_deleted_preset_disarms_through_the_live_loop_despite_a_warm_cache(sess):
+    """End-to-end reproduction of the review finding: a path that has already been previewed
+    at least once (i.e. the realistic case -- SimLoop._publish calls camera_list_for with the
+    SAME n_frames every tick) has a warm cache by the time a referenced preset is deleted, so
+    the disarm-on-ValueError branch in _publish must still fire through that warm cache, not
+    only on a cold one (delete-before-first-preview).
+
+    Drives real Session + SimLoop._publish directly, the same way
+    test_frame_meta_carries_the_camera_block (tests/serve/test_camera.py) does, rather than
+    reasoning about it from camera_list_for alone.
+    """
+    from mujoco_visualizer.serve.loop import SimLoop
+    from mujoco_visualizer.serve.replay import ArrayTrajectorySource
+
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+
+    qpos = np.zeros((1, 5, sess.model.nq))
+    loop = SimLoop(sess, source=ArrayTrajectorySource(qpos))
+    loop._playing = True
+    try:
+        loop._publish()  # warms camera_list_for's cache at n = path_frame_count(0, 4, 1) = 5
+        assert loop.error is None
+        assert sess.camera_path is not None
+
+        sess.delete_camera_preset("b")
+        loop._publish()  # same n_frames as the warming call above
+
+        assert loop.error is not None
+        assert loop.error == {
+            "t": "error", "kind": "command", "msg": loop.error["msg"], "paused": False,
+        }
+        assert "b" in loop.error["msg"]
+        assert sess.camera_path is None       # disarmed
+        assert sess._camera_object is None    # no stale injected camera left rendering
+        assert loop.playing is True           # non-pausing: playback was not stopped
+    finally:
+        loop.stop()

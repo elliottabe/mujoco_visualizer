@@ -1180,16 +1180,44 @@ class Session:
         previewed is what you rendered" structural rather than something that happens to hold.
         Two independent derivations that currently agree is the failure this exists to prevent.
 
-        Cached on ``(spec, n_frames)``: a scrub calls this every published frame and would
-        otherwise rebuild 1588 cameras for a byte-identical answer.
+        Cached on ``(spec, n_frames, preset_fingerprint)``: a scrub calls this every published
+        frame and would otherwise rebuild 1588 cameras for a byte-identical answer.
+
+        The key includes a **fingerprint of each referenced preset's content**, not just the
+        path spec and frame count. A cache derived from presets must be invalidated by any
+        change to them, and there are three ways they can change out from under an armed
+        path -- :meth:`save_camera_preset` overwriting one at a new position,
+        :meth:`delete_camera_preset` removing one, and ``Visualizer.load_settings`` merging in
+        a whole new ``camera_presets`` dict from outside ``Session`` entirely, which
+        ``Session`` has no hook into. Remembering to invalidate at each of those call sites
+        would need all three to be found and kept in sync forever; deriving the key from
+        preset content instead makes a stale cache structurally impossible; a name absent
+        from ``camera_presets`` contributes ``None`` rather than raising while the key is
+        built, so a deletion is a cache MISS (falling through to ``make_pan_cameras``, whose
+        ``KeyError`` is re-raised below as the ``ValueError`` the disarm handler expects)
+        rather than a cache hit that silently keeps serving the deleted preset's last shot.
+        The cost of fingerprinting a handful of seven-field presets once per published frame
+        is trivial next to the ``make_pan_cameras`` call it exists to avoid.
         """
         if self._camera_path is None:
             raise ValueError("no camera path is armed")
+        presets = self.viz.vis_state.get("camera_presets", {})
+
+        def _fingerprint(name: str) -> Optional[tuple]:
+            preset = presets.get(name)
+            if preset is None:
+                return None
+            return tuple(
+                tuple(preset.get(field, ())) if field == "lookat" else preset.get(field)
+                for field in self._PRESET_CAMERA_FIELDS
+            )
+
         key = (
             tuple(self._camera_path["cameras"]),
             tuple(self._camera_path["weights"] or ()),
             self._camera_path["loop"],
             int(n_frames),
+            tuple(_fingerprint(name) for name in self._camera_path["cameras"]),
         )
         if self._camera_list_cache is not None and self._camera_list_cache[0] == key:
             return self._camera_list_cache[1]
