@@ -16,7 +16,7 @@ touching this file.
 import copy
 import math
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mujoco
 import numpy as np
@@ -329,6 +329,12 @@ class Session:
         self._gain: Dict[str, float] = {}
         self._mode = "absolute"
         self._camera = None
+        # A camera OBJECT injected by a caller that has computed one itself -- today the
+        # camera-path preview, which produces one MjvCamera per frame. Kept in its own slot
+        # rather than overloading `_camera` because `_camera` is also read as PROVENANCE (see
+        # the `camera` property), where a non-serialisable object would blow up an export
+        # sidecar's json.dumps after the render had already succeeded.
+        self._camera_object: Optional[mujoco.MjvCamera] = None
 
         self._controller = None
         self._controller_out: Optional[np.ndarray] = None
@@ -790,7 +796,7 @@ class Session:
         """
         self._apply_tendon_activation_vis()
         return self.viz.render_with(
-            self._renderer, camera=self._camera, modify_scene_fns=self.scene_modifiers
+            self._renderer, camera=self.active_camera(), modify_scene_fns=self.scene_modifiers
         )
 
     def encode(self, frame: np.ndarray) -> bytes:
@@ -826,8 +832,13 @@ class Session:
         """
         if named is not None:
             self._camera = named
+            # A named selection or an arriving free-camera parameter both mean "stop rendering
+            # the thing that was injected". Spec D8's "a canvas drag disarms the path" is
+            # exactly this.
+            self._camera_object = None
             return
         self._camera = None
+        self._camera_object = None
         cam = self.viz.vis_state.setdefault("camera", {})
         if pan is not None:
             # Screen-space -> world, in the camera's OWN basis. Done here, not in the browser,
@@ -919,6 +930,40 @@ class Session:
             return node[cls._list_index(node, part, dotted)]
         return node.setdefault(part, {})
 
+    def set_camera_object(self, cam: Optional[mujoco.MjvCamera]) -> None:
+        """Render from *cam* until cleared, overriding both the named override and vis_state.
+
+        The supported way to hand in a camera a caller computed itself.
+        ``Visualizer.get_camera`` already returns an ``MjvCamera`` override untouched, so this
+        needs no rendering change -- only a public way in, since the only other setter
+        (:meth:`set_camera`) takes names and free-camera parameters.
+
+        Pass ``None`` to clear, which falls back to whatever :meth:`active_camera` finds next.
+        """
+        self._camera_object = cam
+
+    def active_camera(self) -> Optional[Union[str, mujoco.MjvCamera]]:
+        """**The single precedence rule for which camera renders.** Read by :meth:`render`.
+
+        In order:
+
+        1. an injected ``MjvCamera`` (:meth:`set_camera_object`) -- a caller that computed a
+           camera itself, e.g. one frame of a camera path;
+        2. a named override (``set_camera(named=...)``) -- an XML camera or a saved preset,
+           which is the ONLY way a preset ever renders, because
+           ``Visualizer.get_camera``'s no-override branch resolves XML cameras only;
+        3. ``None``, meaning the renderer reads ``vis_state['camera']`` -- which is itself
+           either a named XML camera (``mode == 'named'``) or the free camera.
+
+        This exists because before it there were already two writers into camera state with the
+        order stated nowhere, and a generated control that wrote the wrong one appeared to work
+        while changing nothing. Anything that adds a fourth way to choose a camera belongs in
+        this function, not beside it.
+        """
+        if self._camera_object is not None:
+            return self._camera_object
+        return self._camera
+
     @property
     def camera(self) -> Optional[str]:
         """The named camera/preset currently selected, or ``None`` for the free camera.
@@ -928,6 +973,10 @@ class Session:
         factories read ``session._camera`` before this property existed, which made a private
         attribute part of an out-of-package contract. Setting still goes through
         :meth:`set_camera`, which is where the wire-name translation lives.
+
+        Deliberately reports only the *name* -- never an injected ``MjvCamera`` -- because this
+        value is read as PROVENANCE and lands in an export sidecar as JSON, where an object
+        would raise at ``json.dumps`` time. See :meth:`active_camera` for what actually renders.
         """
         return self._camera
 
