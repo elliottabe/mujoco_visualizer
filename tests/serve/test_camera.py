@@ -214,6 +214,62 @@ def test_a_saved_preset_is_offered_to_clients_and_resolves_to_a_camera(sess):
     assert cam.azimuth == pytest.approx(12.0)
 
 
+def test_selecting_a_saved_preset_changes_what_get_camera_returns(sess):
+    """The end-to-end fact a "select a camera" control has to deliver, asserted on the object
+    the renderer is actually handed.
+
+    Camera presets resolve ONLY through ``get_camera``'s ``override=`` path, which is reachable
+    only from ``set_camera(named=...)`` -> ``Session.camera``. The no-override branch resolves
+    XML cameras via ``mj_name2id`` and never looks at ``camera_presets`` at all -- so writing
+    ``vis_state['camera']['named']`` (which is what a generated ``render.set`` control does:
+    ``apply_render`` writes the key verbatim and touches neither ``Session._camera`` nor
+    ``mode``) selects a preset in name only and the rendered frame stays byte-identical. That
+    was the shape of the browser's Camera-tab dropdown, and this asserts the working route
+    instead: move the camera AWAY from the preset first, so returning to the preset's numbers
+    cannot be a coincidence of the live camera happening to already be there.
+    """
+    sess.set_camera(az=37.0, el=-12.0, dist=1.25)
+    sess.save_camera_preset("my_shot")
+
+    sess.set_camera(az=180.0, el=-60.0, dist=0.2)
+    live = sess.viz.get_camera(sess.camera)
+    assert live.azimuth == pytest.approx(180.0), "precondition: the camera moved off the preset"
+
+    sess.set_camera(named="my_shot")
+    assert sess.camera == "my_shot"
+    cam = sess.viz.get_camera(sess.camera)
+    assert isinstance(cam, mujoco.MjvCamera), (
+        f"a preset must resolve to an MjvCamera, got {cam!r} -- a bare string here means the "
+        "renderer would look up a nonexistent XML camera"
+    )
+    assert cam.azimuth == pytest.approx(37.0)
+    assert cam.elevation == pytest.approx(-12.0)
+    assert cam.distance == pytest.approx(1.25)
+
+
+def test_writing_camera_named_through_render_does_not_select_a_preset(sess):
+    """The negative half, pinned so the broken route cannot be mistaken for the working one.
+
+    Kept as a test rather than a comment because it is the whole reason the Camera tab's
+    dropdown is a bespoke ``{t:"camera", named:...}`` sender instead of a generated
+    ``render.set`` control: this call looks like it works (the key lands in ``vis_state`` and
+    comes straight back out in the scene message) and renders nothing new.
+    """
+    sess.set_camera(az=37.0, el=-12.0, dist=1.25)
+    sess.save_camera_preset("my_shot")
+    sess.set_camera(az=180.0, el=-60.0, dist=0.2)
+
+    sess.apply_render({"camera.named": "my_shot"})
+
+    assert sess.viz.vis_state["camera"]["named"] == "my_shot"
+    assert sess.camera is None, "apply_render must not (and does not) set the named override"
+    cam = sess.viz.get_camera(sess.camera)
+    assert cam.azimuth == pytest.approx(180.0), (
+        "if this ever starts returning the preset's azimuth, apply_render has grown a special "
+        "case for camera.named and the Camera tab's bespoke dropdown can be reconsidered"
+    )
+
+
 def test_saving_twice_overwrites_rather_than_duplicating(sess):
     sess.set_camera(az=10.0)
     sess.save_camera_preset("my_shot")

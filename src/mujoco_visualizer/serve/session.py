@@ -109,6 +109,16 @@ def camera_basis(azimuth_deg: float, elevation_deg: float):
 
     Public and module-level rather than a method, so a test can assert orthonormality without
     constructing a Session, and so nothing has to reach into a private helper to pan.
+
+    DO NOT DEDUPLICATE THIS WITH ``visualizer._az_el_to_dir``. The two look like the same
+    function and are not: this one is ``[cos(el)cos(az), cos(el)sin(az), sin(el)]`` -- MuJoCo's
+    CAMERA convention, azimuth measured from world +x, the one ``_cfg_to_mjvcamera`` hands to
+    ``MjvCamera.azimuth`` -- while ``_az_el_to_dir`` is ``[cos(el)sin(az), cos(el)cos(az),
+    sin(el)]``, azimuth measured from world +y and with the opposite handedness (90 degrees
+    rotated, sin/cos swapped). That one serves LIGHT directions only (``vis_state['lighting']``
+    round-tripped through ``_dir_to_az_el``), where the convention is internal to this package
+    and only has to be self-consistent. Collapsing them into one helper would rotate either
+    every pan basis or every light by 90 degrees, with nothing failing loudly.
     """
     az = math.radians(float(azimuth_deg))
     el = math.radians(float(elevation_deg))

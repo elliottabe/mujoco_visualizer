@@ -52,6 +52,20 @@ def _dir_to_az_el(d: Sequence[float]) -> Tuple[float, float]:
 
 
 def _az_el_to_dir(az_deg: float, el_deg: float) -> np.ndarray:
+    """Unit direction for a LIGHT at *az_deg*/*el_deg*. The inverse of :func:`_dir_to_az_el`.
+
+    DO NOT DEDUPLICATE THIS WITH ``serve.session.camera_basis``. The two look like the same
+    function and are not: this one is ``[cos(el)sin(az), cos(el)cos(az), sin(el)]``, azimuth
+    measured from world +y, which pairs with ``_dir_to_az_el``'s ``arctan2(d[0], d[1])`` and is
+    the convention ``vis_state['lighting']``'s stored az/el round-trip through. It is
+    LIGHT-ONLY: nothing camera-shaped reads it.
+
+    ``camera_basis`` is ``[cos(el)cos(az), cos(el)sin(az), sin(el)]`` -- MuJoCo's CAMERA
+    convention, azimuth from world +x, which is what ``MjvCamera.azimuth`` means and therefore
+    what a screen-space pan must resolve in. It is 90 degrees rotated from this with the
+    opposite handedness (sin/cos swapped). Collapsing them into one helper would silently rotate
+    either every light or every pan basis by 90 degrees, and nothing would fail loudly.
+    """
     az = np.radians(az_deg)
     el = np.radians(el_deg)
     return np.array([np.cos(el) * np.sin(az), np.cos(el) * np.cos(az), np.sin(el)])

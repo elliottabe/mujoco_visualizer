@@ -173,29 +173,79 @@
   }
 
   // -- camera drag ----------------------------------------------------------
+  //
+  // This is the GENERIC navigation: absolute az/el seeded from a literal (90, -20) because
+  // nothing here knows where the camera actually is. A consumer that wants better (seeded from
+  // frame_meta.camera, with zoom and pan) must REPLACE it -- see `disableCameraNav` below --
+  // never simply bind a second listener set on top.
 
   let dragging = false, lastX = 0, lastY = 0, az = 90, el = -20, queued = false;
+  // Set by disableCameraNav(). Checked in the queued flush too, so a pointermove that already
+  // armed a requestAnimationFrame cannot send one last stale camera command after the opt-out.
+  let cameraNavDisabled = false;
 
   function flushCamera() {
     queued = false;
+    if (cameraNavDisabled) return;
     send({ t: "camera", az: az, el: el });
   }
 
-  cv.addEventListener("pointerdown", (e) => {
+  // Named, not inline arrow literals: `removeEventListener` matches on function IDENTITY, so
+  // an anonymous handler passed straight to addEventListener can never be unbound again.
+  function onCameraPointerDown(e) {
     dragging = true; lastX = e.clientX; lastY = e.clientY;
     cv.setPointerCapture(e.pointerId);
-  });
-  cv.addEventListener("pointerup", (e) => {
+  }
+  function onCameraPointerUp(e) {
     dragging = false;
     cv.releasePointerCapture(e.pointerId);
-  });
-  cv.addEventListener("pointermove", (e) => {
+  }
+  function onCameraPointerMove(e) {
     if (!dragging) return;
     az += (e.clientX - lastX) * 0.4;
     el = Math.max(-89.9, Math.min(89.9, el - (e.clientY - lastY) * 0.4));
     lastX = e.clientX; lastY = e.clientY;
     if (!queued) { queued = true; requestAnimationFrame(flushCamera); }
-  });
+  }
+
+  function bindCameraNav() {
+    cv.addEventListener("pointerdown", onCameraPointerDown);
+    cv.addEventListener("pointerup", onCameraPointerUp);
+    cv.addEventListener("pointermove", onCameraPointerMove);
+  }
+  bindCameraNav();
+
+  /** Unbind this file's canvas navigation. A consumer replacing canvas navigation MUST call
+   *  this FIRST, before wiring its own listeners.
+   *
+   * Leaving both bound is not merely redundant, it is three separate bugs:
+   *
+   *  - The FIRST drag is handled by this file alone. A replacement seeded from
+   *    `frame_meta.camera` correctly ignores a drag before the first frame arrives; this
+   *    handler does not, and sends the literal (90, -20) -- the teleport this file's own seed
+   *    causes, at exactly the moment the replacement exists to prevent it.
+   *  - Every later drag emits TWO `camera` commands per animation frame. `camera` is in the
+   *    server's `_LAST_WINS` set (protocol.py): two commands drained in one tick means the
+   *    earlier is discarded WHOLESALE, not key-merged, so one of the two gestures is silently
+   *    lost every frame.
+   *  - Both handler sets call `releasePointerCapture` for the same pointerId, and the second
+   *    call throws a `DOMException` on every mouse release.
+   *
+   * There is no re-enable: `cameraNavDisabled` latches, so nothing (including a socket
+   * reconnect, which does not re-run this file) can rebind behind the consumer's back. A page
+   * that wants this file's navigation back should reload.
+   *
+   * There is deliberately no wheel/zoom handler in this file to remove -- `distance` has never
+   * been reachable from the generic viewer. If one is ever added here it must be unbound below
+   * too, or an opted-out consumer inherits a second zoom.
+   */
+  function disableCameraNav() {
+    cameraNavDisabled = true;
+    dragging = false;
+    cv.removeEventListener("pointerdown", onCameraPointerDown);
+    cv.removeEventListener("pointerup", onCameraPointerUp);
+    cv.removeEventListener("pointermove", onCameraPointerMove);
+  }
 
   // -- header controls ------------------------------------------------------
 
@@ -268,6 +318,9 @@
     };
   }
 
+  // The public extension API. This object literal IS the contract -- a consumer may touch
+  // nothing else, and fly_neuromech's `test_rollout_js_only_touches_the_public_extension_api`
+  // derives the permitted member set by parsing exactly this literal.
   window.MJViewer = {
     connect,
     send,
@@ -275,6 +328,9 @@
     onFrame: (fn) => frameHandlers.push(fn),
     onError: (fn) => errorHandlers.push(fn),
     extRoot: () => document.getElementById("ext"),
+    // Public because replacing canvas navigation is a supported thing to do and doing it
+    // WITHOUT this is broken in three ways -- see disableCameraNav's own docstring.
+    disableCameraNav,
   };
 
   connect();
