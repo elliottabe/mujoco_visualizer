@@ -98,10 +98,25 @@ def _ws_loop(sock_conn, loop, session=None) -> None:
     Session, and ``scene_message()`` reads ``viz.vis_state`` (which that thread rewrites via
     apply_render/load_settings/set_camera). Serialising it from here could raise "dictionary
     changed size during iteration" inside ``json.dumps`` -- and this function's bare ``except``
-    would silently turn that into a dropped connection. *session* is accepted but unused, for
-    call-compatibility.
+    would silently turn that into a dropped connection.
+
+    *session* is read for exactly one thing: ``user_settings_dir``, which ``parse_command`` needs
+    to whitelist a ``settings.load`` name. Without it that whitelist holds only the presets
+    bundled in the package, so a preset the user had just saved through ``settings.save`` was
+    rejected on load -- "'V2_3_muscles' is not (available: Default, Earthy_V1, ...)" -- with the
+    save itself having succeeded. A one-directional round trip, and the parameter that closes it
+    existed on ``parse_command`` from the start while this, its only production caller, never
+    passed it. Read ONCE per connection rather than per command: it is fixed for the Session's
+    lifetime, and ``list_available_settings`` globs the directory on every ``settings`` command
+    as it is.
+
+    Read as an attribute, not via ``getattr(session, ..., None)``: a defaulted lookup here is how
+    this seam broke silently in the first place, and ``Session.__init__`` always assigns the
+    attribute (``None`` when no directory was given). Only *session* being None is a real case --
+    the parameter is optional for the fake-socket unit tests.
     """
     loop.client_joined()
+    user_settings_dir = None if session is None else session.user_settings_dir
     sock_conn.send(json.dumps(loop.scene()))
     last_seq = -1
     # Compared by VALUE (kind, msg), not identity: SimLoop._publish() builds a brand-new
@@ -118,7 +133,7 @@ def _ws_loop(sock_conn, loop, session=None) -> None:
                 if raw is None:
                     break
                 try:
-                    loop.submit(parse_command(raw))
+                    loop.submit(parse_command(raw, user_settings_dir=user_settings_dir))
                 except CommandError as exc:
                     sock_conn.send(
                         json.dumps({"t": "error", "kind": "command", "msg": str(exc)})

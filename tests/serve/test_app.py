@@ -42,7 +42,18 @@ class StubLoop:
 
 class StubSession:
     """A Session the app must never call into: every route and the ws handler run on Flask
-    request threads, and Session belongs to the simulation thread."""
+    request threads, and Session belongs to the simulation thread.
+
+    ``user_settings_dir`` is the ONE exception, and it is a plain attribute here because it is a
+    plain attribute on the real Session (always assigned by ``__init__``, ``None`` when no
+    directory was given). ``_ws_loop`` reads it to whitelist ``settings.load`` names. Given as a
+    real attribute rather than reached for with ``getattr(..., None)`` in the production code:
+    a defaulted lookup would let a future rename go unnoticed here and silently narrow the
+    whitelist back to bundled presets only, which is exactly the bug this stands guard over.
+    """
+
+    def __init__(self, user_settings_dir=None):
+        self.user_settings_dir = user_settings_dir
 
     def scene_message(self):
         raise AssertionError(
@@ -311,3 +322,53 @@ def test_clip_routes_404_without_a_provider():
     app = create_app(FakeLoop(), None)
     assert app.test_client().get("/api/clips").status_code == 404
     assert app.test_client().get("/api/series?clip=0&key=reward").status_code == 404
+
+
+def test_ws_lets_a_user_saved_preset_be_loaded_back(tmp_path):
+    """A preset saved through ``settings.save`` must be loadable through ``settings.load`` on the
+    same connection.
+
+    ``parse_command`` whitelists a ``settings.load`` name against the bundled presets PLUS
+    ``user_settings_dir``, but its only production caller -- ``_ws_loop`` -- did not pass the
+    directory, so the whitelist held bundled presets only. Saving worked and reported success;
+    loading the very same name came back "'V2_3_muscles' is not (available: Default, Earthy_V1,
+    ...)". A one-directional round trip, with the closing parameter present on ``parse_command``
+    the whole time.
+
+    Asserted on the SUBMITTED command rather than on rendered output: what broke was validation
+    at the wire boundary, so the property is that the command survives parsing and reaches the
+    loop, not what the loop later does with it.
+    """
+    (tmp_path / "V2_3_muscles.json").write_text("{}")
+    loop = FrameLoop()
+    conn = FakeSockConn(
+        incoming=[json.dumps({"t": "settings", "load": "V2_3_muscles"})],
+        disconnect_after=2,  # scene, then the first frame_meta
+    )
+    _ws_loop(conn, loop, StubSession(user_settings_dir=tmp_path))
+
+    errors = [m for m in _texts(conn.sent) if m.get("t") == "error"]
+    assert not errors, f"a user-saved preset was refused on load: {errors}"
+    assert loop.submitted == [{"t": "settings", "load": "V2_3_muscles"}]
+
+
+def test_ws_still_refuses_a_preset_name_that_exists_nowhere(tmp_path):
+    """The widened whitelist must not become no whitelist.
+
+    The fix above threads a directory into the name check; it must not turn into "accept any
+    name". A name absent from both the bundled presets and *user_settings_dir* still has to be
+    refused at the boundary -- the value becomes a path the server opens (see
+    ``parse_command``'s own note on why ``settings.load`` is whitelisted rather than treated as
+    a path), and the connection must survive the refusal.
+    """
+    loop = FrameLoop()
+    conn = FakeSockConn(
+        incoming=[json.dumps({"t": "settings", "load": "no_such_preset"})],
+        disconnect_after=2,
+    )
+    _ws_loop(conn, loop, StubSession(user_settings_dir=tmp_path))
+
+    errors = [m for m in _texts(conn.sent) if m.get("t") == "error"]
+    assert errors, "an unknown preset name was accepted; the load whitelist is gone"
+    assert "no_such_preset" in errors[0]["msg"]
+    assert loop.submitted == [], "a refused command must not reach the loop"
