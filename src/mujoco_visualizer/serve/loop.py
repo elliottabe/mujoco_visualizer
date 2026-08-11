@@ -27,6 +27,29 @@ from mujoco_visualizer.serve.protocol import coalesce
 from mujoco_visualizer.serve.session import CtrlWidthMismatch, Diverged
 
 
+def path_frame_count(trim_in: int, trim_out: int, stride: int) -> int:
+    """How many frames an export of ``[trim_in, trim_out]`` at *stride* will render.
+
+    Deliberately the same arithmetic as ``launch.py``'s ``range(lo, hi + 1, stride)``: this
+    count is what a camera path is stretched across, so if the two ever disagreed the preview
+    would index a list of a different length than the export rendered.
+    """
+    return len(range(int(trim_in), int(trim_out) + 1, int(stride)))
+
+
+def path_frame_index(frame: int, trim_in: int, trim_out: int, stride: int) -> int:
+    """Which camera of a path applies to recorded *frame*.
+
+    Clamped into the list rather than allowed to go negative or past the end: a scrub can sit
+    outside the export's trim, and a negative index would silently wrap onto the path's LAST
+    camera -- a plausible-looking wrong answer, which is the failure mode worth spending a
+    clamp on.
+    """
+    count = path_frame_count(trim_in, trim_out, stride)
+    k = (int(frame) - int(trim_in)) // int(stride)
+    return max(0, min(count - 1, k))
+
+
 class SimLoop(threading.Thread):
     """Drive a Session at a target frame rate, applying queued commands each tick."""
 
@@ -762,6 +785,25 @@ class SimLoop(threading.Thread):
             }
 
     def _publish(self) -> None:
+        # Preview along the armed camera path. Indexed from the SAME list an export will
+        # render, so preview frame f shows the very object export frame k shows -- see
+        # Session.camera_list_for. Wrapped because a path can reference a preset deleted since
+        # it was armed; that surfaces as a non-pausing command error and disarms, rather than
+        # killing the publish loop.
+        path_frame = None
+        if self.replay_mode and self._session.camera_path is not None:
+            try:
+                count = path_frame_count(self._in, self._out, self._stride)
+                cameras = self._session.camera_list_for(count)
+                path_frame = path_frame_index(
+                    self._published_frame, self._in, self._out, self._stride
+                )
+                self._session.set_camera_object(cameras[path_frame])
+            except ValueError as exc:
+                self._session.set_camera_path([])
+                path_frame = None
+                self._error = {"t": "error", "kind": "command", "msg": str(exc), "paused": False}
+
         frame = self._session.render()
         jpeg = self._session.encode(frame)
         if self.replay_mode:
@@ -794,6 +836,8 @@ class SimLoop(threading.Thread):
             # on the first drag).
             "camera": self._session.camera_state(),
         }
+        camera_block = meta["camera"]
+        camera_block["path_frame"] = path_frame
         if replay is not None:
             # rtf stays 0 in replay mode: nothing advances data.time, and reporting a
             # real-time factor for a file scrub would be a made-up number.

@@ -1026,6 +1026,11 @@ class Session:
             "fixedcamid": cam.get("fixedcamid", ""),
             "named": cam.get("named", ""),
             "selected": self.camera,
+            # Index into the armed path's camera list, or None when no path is active. Always
+            # None here: it depends on the loop's trim/stride, which are loop state, so
+            # SimLoop._publish overwrites this default rather than Session computing it --
+            # see path_frame_index/path_frame_count in serve/loop.py.
+            "path_frame": None,
         }
 
     # The seven fields Visualizer._resolve_preset actually reads. Deliberately NOT the whole

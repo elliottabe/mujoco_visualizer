@@ -434,3 +434,36 @@ def test_camera_path_is_last_wins_but_camera_preset_is_not():
 
     assert "camera_path" in protocol._LAST_WINS
     assert "camera_preset" not in protocol._LAST_WINS
+
+
+# -- the live preview ------------------------------------------------------------------------
+#
+# Preview and export must index ONE list from ONE camera_list_for(n) call. n comes from the
+# trim and stride: n = floor((out - in) / stride) + 1, the same count launch.py's
+# range(lo, hi + 1, stride) produces for an export. The preview then indexes it with
+# k = clamp(floor((frame - in) / stride), 0, n - 1), so preview frame f shows the very object
+# export frame k will render.
+
+
+def test_path_frame_index_maths():
+    from mujoco_visualizer.serve.loop import path_frame_index
+
+    # 701 frames, stride 2 -> 351 exported frames.
+    assert path_frame_index(frame=200, trim_in=200, trim_out=900, stride=2) == 0
+    assert path_frame_index(frame=202, trim_in=200, trim_out=900, stride=2) == 1
+    assert path_frame_index(frame=900, trim_in=200, trim_out=900, stride=2) == 350
+    # Outside the trim, clamped rather than negative or past the end -- a scrub can sit outside
+    # the export range, and a negative index would silently wrap onto the last camera.
+    assert path_frame_index(frame=100, trim_in=200, trim_out=900, stride=2) == 0
+    assert path_frame_index(frame=5000, trim_in=200, trim_out=900, stride=2) == 350
+
+
+def test_path_frame_count_matches_an_export_range():
+    from mujoco_visualizer.serve.loop import path_frame_count
+
+    for lo, hi, stride in [(0, 1587, 1), (200, 900, 2), (0, 100, 10), (7, 7, 1)]:
+        assert path_frame_count(lo, hi, stride) == len(range(lo, hi + 1, stride))
+
+
+def test_camera_state_reports_path_frame(sess):
+    assert sess.camera_state()["path_frame"] is None

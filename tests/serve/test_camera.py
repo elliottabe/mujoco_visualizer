@@ -41,7 +41,7 @@ def test_camera_state_reports_every_field_the_client_binds_to(sess):
     state = sess.camera_state()
     assert set(state) == {
         "mode", "free_type", "azimuth", "elevation", "distance",
-        "lookat", "trackbody", "fixedcamid", "named", "selected",
+        "lookat", "trackbody", "fixedcamid", "named", "selected", "path_frame",
     }
     assert isinstance(state["lookat"], list) and len(state["lookat"]) == 3
     for key in ("azimuth", "elevation", "distance"):

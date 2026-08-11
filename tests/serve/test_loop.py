@@ -165,6 +165,13 @@ class FakeSession:
     def set_camera(self, **kw):
         self.camera_calls.append(kw)
 
+    @property
+    def camera_path(self):
+        # _publish() now checks this every tick to decide whether to preview a camera path
+        # (see Session.camera_path). No test in this file arms one, so None -- the disarmed
+        # state -- is always correct and keeps _publish's path-preview branch a no-op here.
+        return None
+
     def camera_state(self):
         # _publish() now reads this every tick (see Session.camera_state), so the fake needs
         # a stand-in with the same shape -- any dict-with-these-keys is fine since nothing in
