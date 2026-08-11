@@ -1070,6 +1070,13 @@ class Visualizer:
         # Fingerprint of the skybox settings the current tex_data was generated from.
         # None means "never generated", so the first apply always runs.
         self._sky_fingerprint = None
+        # Whether the regenerated skybox texture still needs pushing to a live render context.
+        # SEPARATE from `_sky_fingerprint` on purpose: the fingerprint answers "is `model.tex_data`
+        # already correct", this answers "has a context seen it". Collapsing the two meant the
+        # single True `_apply_sky_props` returns was consumed by whichever caller applied first --
+        # `load_settings` does its own `_apply_all()` -- leaving `render_with`'s call to return
+        # False and the upload to never happen, so the canvas kept the previous sky.
+        self._sky_needs_upload = False
 
         # Detect floor geom and material
         self._floor_geom_id: Optional[int] = next(
@@ -1336,6 +1343,7 @@ class Visualizer:
             return False
         tex_buf[adr:adr + len(flat)] = flat
         self._sky_fingerprint = fingerprint
+        self._sky_needs_upload = True
         return True
 
     def _apply_forces(self) -> None:
@@ -1517,16 +1525,22 @@ class Visualizer:
 
         Returns (renderer.height, renderer.width, 3) uint8.
         """
-        if apply_settings and self._apply_all():
+        if apply_settings:
+            self._apply_all()
+        if self._sky_needs_upload:
             # MuJoCo uploads textures when the render context is built, so a regenerated
             # skybox never reaches a context that already exists. Without this, reusing a
             # renderer silently pins the sky at whatever it was when the context was made
             # (verified: max pixel diff 0 across a red->green change, vs 255 with a fresh
             # context). ``_mjr_context`` is private to mujoco.Renderer; there is no public
             # accessor for the MjrContext.
+            #
+            # Gated on the sticky flag rather than on this call's `_apply_all()` return, so an
+            # upload is not lost when some other caller applied the settings first.
             mujoco.mjr_uploadTexture(
                 self.model, renderer._mjr_context, self._skybox_tex_id
             )
+            self._sky_needs_upload = False
 
         cam = self.get_camera(camera)
         opt = self._build_scene_option()
