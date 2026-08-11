@@ -251,14 +251,26 @@ def test_a_resaved_preset_is_reflected_even_through_a_warm_cache(sess):
     """The second mutation path a fingerprint-free cache key cannot see: re-saving a preset a
     path already references (e.g. re-shooting the opening framing) moves it to a new
     position without touching `set_camera_path` or `delete_camera_preset` -- the only two
-    places that used to invalidate the cache."""
+    places that used to invalidate the cache.
+
+    The re-save below writes `vis_state['camera']` directly and calls `save_camera_preset`
+    WITHOUT going through `Session.set_camera` -- unlike `_save`'s usual route -- because
+    `set_camera` now disarms an armed path (D8; see the "D8" test section below), and this test
+    is deliberately isolating the FINGERPRINT invalidation path specifically. Going through
+    `set_camera` here would disarm the path as a side effect and `camera_list_for` would raise
+    `ValueError: no camera path is armed` for an unrelated reason, rather than testing what this
+    test exists to test. A real re-shoot in the browser would go through a drag first (which,
+    correctly, disarms), then Save; this test's narrower job is the cache alone.
+    """
     _save(sess, "a", az=0.0)
     _save(sess, "b", az=90.0)
     sess.set_camera_path(["a", "b"])
     first = sess.camera_list_for(40)
     assert first[0].azimuth == pytest.approx(0.0)   # frame 0 lands exactly on "a"'s keyframe
 
-    _save(sess, "a", az=222.0)            # move the camera and re-save over "a"
+    sess.viz.vis_state["camera"]["azimuth"] = 222.0
+    sess.save_camera_preset("a")          # move the camera and re-save over "a", path still armed
+    assert sess.camera_path is not None   # confirms this route -- unlike _save -- does not disarm
     second = sess.camera_list_for(40)     # SAME n -- must not serve the old shot
     assert second is not first
     assert second[0].azimuth == pytest.approx(222.0)
@@ -540,3 +552,101 @@ def test_a_deleted_preset_disarms_through_the_live_loop_despite_a_warm_cache(ses
         assert loop.playing is True           # non-pausing: playback was not stopped
     finally:
         loop.stop()
+
+
+# -- D8: a camera command disarms an armed path, and it must SURVIVE a republish -------------
+#
+# Task 8's acceptance script found this broken against the real fly model: an earlier version
+# of Session.set_camera cleared only `_camera_object` for the tick the drag command landed on.
+# That looked sufficient (`active_camera()` really did return None right afterwards) but was
+# not: `_camera_path` stayed armed, so the very next `SimLoop._publish()` tick re-derived
+# `cameras[path_frame_index(...)]` and called `set_camera_object` again, silently overwriting
+# the drag one frame later. The fix is `Session._disarm_camera_path`, called from every place a
+# drag/named-selection/explicit-disarm can arrive, so there is one disarm, not two out-of-sync
+# ones. The tests below assert the ACTUAL RESOLVED CAMERA after a second publish, not just that
+# a flag went None -- a flag-only assertion is exactly what the original, insufficient fix would
+# still have passed.
+
+
+def test_a_free_camera_command_disarms_an_armed_path_even_through_a_republish(sess):
+    """The regression test for the D8 finding. Arms a path, publishes once (so a path camera
+    is genuinely injected and cached), applies a `camera` drag through the same dispatch
+    production uses (`SimLoop._apply`), publishes AGAIN, and checks that the second publish did
+    not resurrect the path's camera."""
+    from mujoco_visualizer.serve.loop import SimLoop
+    from mujoco_visualizer.serve.replay import ArrayTrajectorySource
+
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+
+    qpos = np.zeros((1, 5, sess.model.nq))
+    loop = SimLoop(sess, source=ArrayTrajectorySource(qpos))
+    loop._playing = True
+    try:
+        loop._publish()  # warms the path: injects cameras[path_frame] for this tick
+        assert sess.camera_path is not None
+        injected_before_drag = sess.active_camera()
+        assert isinstance(injected_before_drag, mujoco.MjvCamera)
+
+        # The drag, through the real command dispatch (not calling set_camera directly), so
+        # this exercises exactly the seam a browser's canvas drag reaches.
+        loop._apply({"t": "camera", "az": 271.0, "el": -10.0})
+        loop._publish()  # the tick that used to silently re-inject the path's camera
+
+        # -- the flags (necessary, but this alone is what the original insufficient fix passed)
+        assert sess.camera_path is None
+        assert loop._meta["camera"]["path_frame"] is None
+
+        # -- the rendered camera itself (this is the assertion the flags-only version lacked).
+        # active_camera() must fall through to None -- no injected object survives -- and the
+        # camera actually resolved for rendering must carry the DRAGGED azimuth, not either
+        # preset's (0.0 or 90.0).
+        assert sess.active_camera() is None
+        resolved = sess.viz.get_camera(override=sess.active_camera())  # what render_with() uses
+        assert isinstance(resolved, mujoco.MjvCamera)
+        assert resolved.azimuth == pytest.approx(271.0)
+
+        # -- and the actual rendered PIXELS differ from what the still-armed path would have
+        # produced, proving this is not merely a metadata field: re-inject the path's own
+        # camera (the exact object the bug would have re-derived) and confirm the frame the fix
+        # produces is visually different from the frame the bug would have produced.
+        dragged_frame = sess.render().copy()
+        sess.set_camera_object(injected_before_drag)
+        path_frame_render = sess.render().copy()
+        assert not np.array_equal(dragged_frame, path_frame_render)
+    finally:
+        loop.stop()
+
+
+def test_a_named_selection_disarms_an_armed_path(sess):
+    """The other reachable disarm site: picking a saved camera/XML camera by name is just as
+    much a request to look elsewhere as a drag is, and D8 covers both."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    assert sess.camera_path is not None
+
+    sess.set_camera(named="cam_side")
+
+    assert sess.camera_path is None
+    assert sess.active_camera() == "cam_side"
+
+
+def test_set_camera_path_empty_list_still_disarms():
+    """Pins that routing the explicit disarm through the shared `_disarm_camera_path` helper
+    did not lose the original, simpler disarm behaviour."""
+    sess = Session(model=mujoco.MjModel.from_xml_string(_XML), width=64, height=48)
+    try:
+        _save(sess, "a", az=0.0)
+        _save(sess, "b", az=90.0)
+        sess.set_camera_path(["a", "b"])
+        assert sess.camera_path is not None
+
+        sess.set_camera_path([])
+
+        assert sess.camera_path is None
+        assert sess._camera_object is None
+        assert sess._camera_list_cache is None
+    finally:
+        sess.close()

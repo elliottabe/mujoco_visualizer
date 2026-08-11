@@ -838,6 +838,25 @@ class Session:
         self._renderer = self.viz.make_renderer(height=self.height, width=self.width)
         old.close()
 
+    def _disarm_camera_path(self) -> None:
+        """Drop the armed path, its memoised camera list, and any camera it injected.
+
+        One place, called both by an explicit disarm (``set_camera_path([])``) and by
+        :meth:`set_camera` -- because a drag or a named selection IS a request to look
+        elsewhere, and spec D8 requires the ARMED PATH to disarm, not merely the injected
+        object to be cleared for the instant. Clearing only ``_camera_object`` (an earlier,
+        insufficient version of this fix) is not enough: as long as ``_camera_path`` stays
+        set, ``SimLoop._publish`` re-derives ``cameras[path_frame_index(...)]`` and calls
+        ``set_camera_object`` again on the very next published tick, silently overwriting the
+        drag one frame later. This was caught by Task 8's acceptance script against the real
+        model, not by any test at the time -- see
+        ``test_a_free_camera_command_disarms_an_armed_path_even_through_a_republish`` below for
+        the regression test that would have caught it.
+        """
+        self._camera_path = None
+        self._camera_list_cache = None
+        self._camera_object = None
+
     def set_camera(
         self, named: Optional[str] = None, pan: Optional[Sequence[float]] = None, **kw
     ) -> None:
@@ -854,12 +873,15 @@ class Session:
         if named is not None:
             self._camera = named
             # A named selection or an arriving free-camera parameter both mean "stop rendering
-            # the thing that was injected". Spec D8's "a canvas drag disarms the path" is
-            # exactly this.
-            self._camera_object = None
+            # the thing that was injected" AND "disarm whatever path was driving it" -- spec
+            # D8's "a canvas drag disarms the path". Clearing only the injected object here is
+            # NOT sufficient on its own: see _disarm_camera_path's own docstring for why an
+            # armed _camera_path re-injects itself on the very next publish tick if it survives
+            # this call.
+            self._disarm_camera_path()
             return
         self._camera = None
-        self._camera_object = None
+        self._disarm_camera_path()
         cam = self.viz.vis_state.setdefault("camera", {})
         if pan is not None:
             # Screen-space -> world, in the camera's OWN basis. Done here, not in the browser,
@@ -1106,9 +1128,7 @@ class Session:
         """
         cameras = list(cameras)
         if not cameras:
-            self._camera_path = None
-            self._camera_list_cache = None
-            self.set_camera_object(None)
+            self._disarm_camera_path()
             return
         if len(cameras) < 2:
             raise ValueError("a camera path needs at least two cameras to interpolate between")
