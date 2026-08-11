@@ -379,3 +379,58 @@ def test_the_cache_key_includes_the_recorded_spec_not_just_frame_count(sess):
     sess._camera_path["cameras"][1] = "c"
     second = sess.camera_list_for(30)
     assert second is not first
+
+
+# -- the wire message ------------------------------------------------------------------------
+
+
+def test_protocol_accepts_a_path():
+    from mujoco_visualizer.serve.protocol import parse_command
+
+    assert parse_command(
+        {"t": "camera_path", "cameras": ["a", "b"], "weights": [1.0, 2.0], "loop": True}
+    ) == {"t": "camera_path", "cameras": ["a", "b"], "weights": [1.0, 2.0], "loop": True}
+
+
+def test_protocol_defaults_weights_and_loop():
+    from mujoco_visualizer.serve.protocol import parse_command
+
+    assert parse_command({"t": "camera_path", "cameras": ["a", "b"]}) == {
+        "t": "camera_path", "cameras": ["a", "b"], "weights": None, "loop": False,
+    }
+
+
+def test_protocol_accepts_an_empty_list_as_disarm():
+    from mujoco_visualizer.serve.protocol import parse_command
+
+    assert parse_command({"t": "camera_path", "cameras": []})["cameras"] == []
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        {"t": "camera_path"},                                        # no cameras
+        {"t": "camera_path", "cameras": "a,b"},                      # not a list
+        {"t": "camera_path", "cameras": ["a", 7]},                   # non-string name
+        {"t": "camera_path", "cameras": ["a"]},                      # one name
+        {"t": "camera_path", "cameras": ["a", "b"], "weights": "1"},  # weights not a list
+        {"t": "camera_path", "cameras": ["a", "b"], "weights": [0.0]},   # non-positive
+        {"t": "camera_path", "cameras": ["a", "b"], "weights": [-1.0]},  # negative
+        {"t": "camera_path", "cameras": ["a", "b"], "weights": [True]},  # bool is not a number
+        {"t": "camera_path", "cameras": ["a", "b"], "loop": "yes"},   # loop not a bool
+    ],
+)
+def test_protocol_rejects_malformed_paths(cmd):
+    from mujoco_visualizer.serve.protocol import CommandError, parse_command
+
+    with pytest.raises(CommandError):
+        parse_command(cmd)
+
+
+def test_camera_path_is_last_wins_but_camera_preset_is_not():
+    """A path spec is a whole state, so the newest send is the truth -- unlike camera_preset,
+    where coalescing would let a save swallow a delete."""
+    from mujoco_visualizer.serve import protocol
+
+    assert "camera_path" in protocol._LAST_WINS
+    assert "camera_preset" not in protocol._LAST_WINS

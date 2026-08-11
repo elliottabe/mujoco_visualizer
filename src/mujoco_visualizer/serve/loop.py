@@ -272,6 +272,10 @@ class SimLoop(threading.Thread):
                 self._session.save_camera_preset(cmd["name"])
             else:
                 self._session.delete_camera_preset(cmd["name"])
+        elif kind == "camera_path":
+            self._session.set_camera_path(
+                cmd["cameras"], weights=cmd["weights"], loop=cmd["loop"]
+            )
         elif kind == "render":
             self._session.apply_render(cmd["set"])
         elif kind == "settings":

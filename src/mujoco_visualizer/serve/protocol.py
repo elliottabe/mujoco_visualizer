@@ -27,6 +27,7 @@ COMMANDS = frozenset(
         "speed",
         "camera",
         "camera_preset",
+        "camera_path",
         "render",
         "settings",
         "stream",
@@ -57,7 +58,7 @@ _MODES = frozenset({"absolute", "additive"})
 # ``{"set": {<dotted.key>: value}}``, a key-value delta, not a whole state. A settings panel
 # with dozens of controls emitting two independent edits in one tick -- ``{colors.thorax:...}``
 # then ``{alpha:...}`` -- must keep both, not have the second silently erase the first.
-_LAST_WINS = frozenset({"mode", "speed", "camera", "settings", "stream"})
+_LAST_WINS = frozenset({"mode", "speed", "camera", "camera_path", "settings", "stream"})
 
 # Roots that exist in Visualizer.vis_state. A `render.set` key outside these was previously
 # merged verbatim, creating a dead entry: the control appeared to do nothing and nothing said
@@ -217,6 +218,49 @@ def parse_command(raw, user_settings_dir: Optional[str] = None) -> Dict:
                 f"'camera_preset.name' must match {PRESET_NAME_RE.pattern}, got {name!r}"
             )
         return {"t": "camera_preset", "op": op, "name": name}
+
+    if kind == "camera_path":
+        cameras = cmd.get("cameras")
+        if not isinstance(cameras, (list, tuple)):
+            raise CommandError("'camera_path.cameras' must be a list of preset names")
+        names = []
+        for i, name in enumerate(cameras):
+            if not isinstance(name, str):
+                raise CommandError(
+                    f"'camera_path.cameras' element {i} must be a string, got "
+                    f"{type(name).__name__}"
+                )
+            names.append(name)
+        # An empty list is the disarm, so it skips the >=2 rule. Anything non-empty and shorter
+        # than two has nothing to interpolate between.
+        if names and len(names) < 2:
+            raise CommandError(
+                "'camera_path.cameras' needs at least two names (or [] to disarm)"
+            )
+        weights = cmd.get("weights")
+        if weights is not None:
+            if not isinstance(weights, (list, tuple)):
+                raise CommandError("'camera_path.weights' must be a list of numbers or null")
+            parsed_weights = []
+            for i, value in enumerate(weights):
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise CommandError(
+                        f"'camera_path.weights' element {i} must be a number, got "
+                        f"{type(value).__name__}"
+                    )
+                if not math.isfinite(value) or value <= 0:
+                    raise CommandError(
+                        f"'camera_path.weights' element {i} must be finite and > 0, got {value}"
+                    )
+                parsed_weights.append(float(value))
+            weights = parsed_weights
+        loop = cmd.get("loop", False)
+        if not isinstance(loop, bool):
+            raise CommandError("'camera_path.loop' must be a boolean")
+        # The COUNT of weights is not checked here: it depends on `loop` and on the path length
+        # after the session has resolved the names, so Session.set_camera_path owns it (see its
+        # docstring for why the content checks cannot live at this boundary at all).
+        return {"t": "camera_path", "cameras": names, "weights": weights, "loop": loop}
 
     if kind == "render":
         values = cmd.get("set")
