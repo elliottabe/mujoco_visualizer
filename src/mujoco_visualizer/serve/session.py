@@ -394,14 +394,17 @@ class Session:
         mujoco.mj_forward(self.model, self.data)
         self._snapshot()
 
-        # The render settings as they stand right now, for `reset_render_settings`. Captured
-        # HERE and nowhere else: steps 1-3 of initialisation (model-derived defaults, the
-        # anatomy config, the `settings` bundle) have all run by this point, and step 4 --
-        # scripts/rollout_viewer/launch.py's `apply_fly_camera_default` -- writes only `camera`
-        # keys, which RESET_KEYS excludes. So this is already the state a reset must return to,
-        # with no second capture point for a caller to forget. That last claim is load-bearing;
-        # a test in the parent repo's rollout-viewer suite is intended to pin it, but does not
-        # exist yet as of this commit -- this comment states the intent, not a verified fact.
+        # The render settings as they stand right now, for `reset_render_settings`. This is
+        # correct for a bare Session (nothing has written to vis_state past this point), but is
+        # NOT the last word for a caller that keeps initialising vis_state after the
+        # constructor returns -- scripts/rollout_viewer/launch.py both applies a camera default
+        # AND measures tendons['ctrl_full_scale'] from real ctrl data post-init. That second
+        # write is a RESET_KEYS root; a Session was once built on the belief that no post-init
+        # write ever touched one, which was false and let a reset silently reinstate the
+        # model-only ctrl_full_scale ceiling (~7x the measured value on the fly model). Such a
+        # caller MUST call :meth:`capture_reset_baseline` again after its own last vis_state
+        # write -- see that method's docstring -- rather than relying on this one. The invariant
+        # is pinned by tests/rollout_viewer/test_render_reset_baseline.py in the parent repo.
         self._reset_baseline = copy.deepcopy(self.viz.vis_state)
 
         # Bumped on every WHOLESALE vis_state write (load_settings, reset_render_settings) and
@@ -1653,6 +1656,25 @@ class Session:
         self.viz.vis_state.update(restored)
         self._settings_epoch += 1
         return changed
+
+    def capture_reset_baseline(self) -> None:
+        """Re-take the snapshot :meth:`reset_render_settings` restores to.
+
+        ``__init__`` takes one already, so a bare ``Session`` needs no call here. This exists
+        for callers that finish initialising ``vis_state`` AFTER the constructor returns:
+        ``scripts/rollout_viewer/launch.py`` measures ``tendons['ctrl_full_scale']`` from the
+        rollout's real ``ctrl`` data and writes it post-init, and a baseline taken before that
+        write made a reset silently reinstate the model-only ceiling -- roughly 7x the measured
+        value on the fly model, which is the washed-out-muscles failure that measurement exists
+        to prevent.
+
+        Call it once, after EVERY post-init write to ``vis_state``. The design originally
+        avoided a second capture point on the grounds that nothing wrote a ``RESET_KEYS`` root
+        after ``__init__``; that was simply false, and the invariant is now pinned by a test
+        rather than by that assumption -- see
+        ``tests/rollout_viewer/test_render_reset_baseline.py`` in the parent repo.
+        """
+        self._reset_baseline = copy.deepcopy(self.viz.vis_state)
 
     def save_settings_as(self, name: str) -> Path:
         """Save the current render settings as a NAMED preset in this session's

@@ -306,7 +306,17 @@ class SimLoop(threading.Thread):
             # settings command carried one of those two keys, so a reset -- which carries
             # neither -- raised KeyError: 'load' here, on the sim thread, where it surfaces as a
             # paused command error rather than as anything about settings.
-            if "reset" in cmd:
+            #
+            # `cmd["reset"] is True`, not `"reset" in cmd`: protocol.parse_command's own guard
+            # (see its `'settings.reset' must be true if present` check) only ever LETS a
+            # `reset` key onto the wire when its value is `True`, so over the websocket the two
+            # tests agree by construction. They must keep agreeing here too, because
+            # `SimLoop.submit`/`_apply` is a public method a caller can reach WITHOUT going
+            # through `parse_command` -- an in-process embedder, a future test double -- and
+            # such a caller sending `{"t":"settings","reset":False}` (meaning "do not reset")
+            # must not have that silently reinterpreted as a reset just because the key merely
+            # showed up in the dict.
+            if cmd.get("reset") is True:
                 self._session.reset_render_settings()
             elif "save" in cmd:
                 self._session.save_settings_as(cmd["save"])

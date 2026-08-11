@@ -1076,6 +1076,15 @@ class Visualizer:
         # single True `_apply_sky_props` returns was consumed by whichever caller applied first --
         # `load_settings` does its own `_apply_all()` -- leaving `render_with`'s call to return
         # False and the upload to never happen, so the canvas kept the previous sky.
+        #
+        # CAVEAT (pre-existing, not fixed here): neither `_sky_fingerprint` nor
+        # `_skybox_tex_id` is invalidated by `rebind_model`/`swap_model`. After a clip swap, a
+        # restored `skybox` setting that happens to match the fingerprint LATCHED FROM THE OLD
+        # MODEL makes `_apply_sky_props` return early and never write the new model's
+        # `tex_data` -- same class of bug as the render-flags write-once defect this task's
+        # sibling fix addressed, and it also affects `load_settings`/`apply_render` after a
+        # swap, not just Reset. Left unfixed here: it needs its own testing and is a separate
+        # change from this task's scope.
         self._sky_needs_upload = False
 
         # Detect floor geom and material
