@@ -107,6 +107,7 @@ class FakeSession:
         self.render_calls = []
         self.settings_loaded = []
         self.settings_saved = []
+        self.settings_reset = 0
         self.resizes = []
         self.resets = 0
         self.mode = None
@@ -191,6 +192,10 @@ class FakeSession:
     def save_settings_as(self, name):
         self.settings_saved.append(name)
         return f"/fake/user/settings/{name}.json"
+
+    def reset_render_settings(self):
+        self.settings_reset += 1
+        return True
 
     # -- added for replay mode --
     def set_qpos(self, qpos, ctrl=None):
@@ -355,6 +360,17 @@ def test_a_failed_settings_save_is_reported_not_fatal():
         # The thread survived -- it can still take and apply further commands.
         loop.submit({"t": "sim", "cmd": "step", "n": 1})
         assert wait_until(lambda: sess.steps >= 1)
+
+
+def test_settings_reset_reaches_the_session_without_a_keyerror():
+    """R9. The settings branch used to be `if "save" in cmd: ... else: load_settings(cmd["load"])`
+    -- so a reset command, which carries neither key, raised KeyError: 'load' on the sim thread.
+    A three-way branch is required, and this asserts the dispatch rather than the parse."""
+    sess = FakeSession()
+    loop = SimLoop(sess, fps_cap=60, substeps_per_frame=5, idle_pause_s=None)
+    loop.submit({"t": "settings", "reset": True})
+    assert _run_briefly(loop, lambda: sess.settings_reset >= 1)
+    assert loop.error is None, f"the reset raised on the sim thread: {loop.error}"
 
 
 def test_commands_are_coalesced_before_applying():

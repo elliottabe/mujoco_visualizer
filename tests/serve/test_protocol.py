@@ -579,3 +579,34 @@ def test_lock_number_then_none_for_same_key():
     ])
     assert len(out) == 1
     assert out[0]["set"]["a"] is None, "None must survive as None, not be coerced to [0.0]"
+
+
+def test_settings_reset_is_accepted():
+    """T7. The reset op carries no name -- there is nothing to whitelist, which is why it is
+    parsed before the `load` branch that requires one."""
+    assert parse_command({"t": "settings", "reset": True}) == {
+        "t": "settings",
+        "reset": True,
+    }
+
+
+def test_settings_reset_must_be_true_not_merely_present():
+    """`{"reset": false}` is a client saying "do not reset"; silently treating it as a reset
+    because the key exists is the shape of bug that makes a UI checkbox act inverted."""
+    with pytest.raises(CommandError, match="reset"):
+        parse_command({"t": "settings", "reset": False})
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        {"t": "settings", "reset": True, "load": "Default"},
+        {"t": "settings", "reset": True, "save": "my_look"},
+    ],
+)
+def test_settings_reset_cannot_be_combined_with_load_or_save(cmd):
+    """T7. Refused rather than resolved by branch ordering. A client that sends both has a bug,
+    and picking one silently means the other half of its intent vanishes with no error --
+    exactly how the old `if "save" in cmd: ... else: load` shape would have handled it."""
+    with pytest.raises(CommandError, match="reset"):
+        parse_command(cmd)

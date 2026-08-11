@@ -282,6 +282,23 @@ def parse_command(raw, user_settings_dir: Optional[str] = None) -> Dict:
         return {"t": "render", "set": dict(values)}
 
     if kind == "settings":
+        # Parsed FIRST and checked for conflicts explicitly, rather than being slotted into the
+        # existing save/else-load shape. That shape resolves ambiguity by ordering: a command
+        # carrying both keys silently loses one with no error. A reset also carries no name, so
+        # it must be recognised before the `load` branch, which requires one.
+        if "reset" in cmd:
+            if cmd["reset"] is not True:
+                raise CommandError(
+                    "'settings.reset' must be true if present; got {0!r}".format(cmd["reset"])
+                )
+            conflicting = sorted({"save", "load"} & set(cmd))
+            if conflicting:
+                raise CommandError(
+                    "'settings.reset' cannot be combined with {0}; send them as separate "
+                    "commands".format("/".join(conflicting))
+                )
+            return {"t": "settings", "reset": True}
+
         save_name = cmd.get("save")
         if save_name is not None:
             # A save name is never checked against an existing-file whitelist (there is

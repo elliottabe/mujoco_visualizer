@@ -302,7 +302,13 @@ class SimLoop(threading.Thread):
         elif kind == "render":
             self._session.apply_render(cmd["set"])
         elif kind == "settings":
-            if "save" in cmd:
+            # Explicitly three-way. The previous `if save / else load` shape assumed every
+            # settings command carried one of those two keys, so a reset -- which carries
+            # neither -- raised KeyError: 'load' here, on the sim thread, where it surfaces as a
+            # paused command error rather than as anything about settings.
+            if "reset" in cmd:
+                self._session.reset_render_settings()
+            elif "save" in cmd:
                 self._session.save_settings_as(cmd["save"])
             else:
                 self._session.load_settings(cmd["load"])
