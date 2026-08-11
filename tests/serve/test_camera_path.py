@@ -291,4 +291,91 @@ def test_a_wrong_weight_count_is_refused_with_both_numbers(sess, weights):
     _save(sess, "c", az=180.0)
     with pytest.raises(ValueError) as excinfo:
         sess.set_camera_path(["a", "b", "c"], weights=weights)
-    assert "2" in str(excinfo.value)
+    message = str(excinfo.value)
+    # The name promises BOTH numbers: what was supplied and what this path actually needs.
+    assert str(len(weights)) in message
+    assert "2" in message
+
+
+def test_weights_with_loop_needs_len_cameras_weights_not_len_cameras_minus_one(sess):
+    """loop=True appends keyframes[0] back on, so a 3-camera looped path has 3 segments (not
+    2) and therefore needs 3 weights -- the exact len(cameras) vs len(cameras) - 1 distinction
+    the brief singled out."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    _save(sess, "c", az=180.0)
+    sess.set_camera_path(["a", "b", "c"], weights=[1.0, 2.0, 3.0], loop=True)
+    assert len(sess.camera_list_for(30)) == 30
+
+
+def test_weights_with_loop_and_wrong_count_names_three(sess):
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    _save(sess, "c", az=180.0)
+    with pytest.raises(ValueError) as excinfo:
+        sess.set_camera_path(["a", "b", "c"], weights=[1.0, 2.0], loop=True)
+    assert "3" in str(excinfo.value)
+
+
+def test_camera_path_property_returns_a_copy(sess):
+    """A caller mutating what the property handed back must not silently re-point the live
+    path without going through set_camera_path's validation."""
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"], weights=[1.0])
+    spec = sess.camera_path
+    spec["cameras"].append("mutated")
+    spec["weights"].append(99.0)
+    spec["loop"] = True
+    assert sess.camera_path == {"cameras": ["a", "b"], "weights": [1.0], "loop": False}
+
+
+def test_the_cache_key_distinguishes_frame_counts_without_a_rearm(sess):
+    """Pins the cache KEY, not set_camera_path's unconditional reset.
+
+    The sibling test above (test_camera_list_for_caches_and_invalidates_on_the_spec) cannot
+    tell those apart: set_camera_path clears the cache on every call, so it passes even if
+    the key dropped the spec entirely. This one never re-arms between the two lookups, so the
+    only thing that can produce two independent lists is the key including n_frames.
+
+    NOTE this does not round-trip back to n=30 after computing n=31: the cache is a single
+    most-recently-computed (key, list) SLOT (see camera_list_for's `self._camera_list_cache =
+    (key, cameras)`, exactly the brief's own code), not a dict keyed by every n ever asked
+    for. Computing n=31 evicts the n=30 entry, so a THIRD call with n=30 is a legitimate fresh
+    miss -- not a bug the key-degradation regression this test targets would cause, and not
+    something this test should assert away. What it does check is the repeat-call case (same
+    n twice in a row, still cached) and the differing-n case (fresh object), both without an
+    intervening set_camera_path.
+    """
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    sess.set_camera_path(["a", "b"])
+    thirty = sess.camera_list_for(30)
+    assert sess.camera_list_for(30) is thirty          # repeat call, same n: still cached
+    thirty_one = sess.camera_list_for(31)
+    assert thirty_one is not thirty
+    assert len(thirty) == 30
+    assert len(thirty_one) == 31
+
+
+def test_the_cache_key_includes_the_recorded_spec_not_just_frame_count(sess):
+    """Mutates the armed spec IN PLACE, bypassing set_camera_path entirely, so its
+    unconditional cache reset never fires. If the key still degraded to n_frames alone, this
+    would return the stale cached list; a fresh one proves the key reads `cameras` (not just
+    `n_frames`) at lookup time.
+
+    Reaches into the private `_camera_path` attribute rather than through the public API:
+    there is no public way to mutate an already-armed path in place -- `camera_path` hands
+    back a copy for exactly that reason -- so pinning this needs the private seam. Judged
+    worth the fragility here since it isolates the KEY's own behaviour from set_camera_path's
+    reset, which the sibling tests above cannot do; consistent with `_save`'s own direct
+    writes into `vis_state["camera"]`.
+    """
+    _save(sess, "a", az=0.0)
+    _save(sess, "b", az=90.0)
+    _save(sess, "c", az=180.0)
+    sess.set_camera_path(["a", "b"])
+    first = sess.camera_list_for(30)
+    sess._camera_path["cameras"][1] = "c"
+    second = sess.camera_list_for(30)
+    assert second is not first
