@@ -218,6 +218,7 @@ def _carry_vis_state_across_swap(vis_state: Dict, model: mujoco.MjModel) -> Dict
 RESET_KEYS = (
     "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
     "lighting", "floor", "skybox", "ghost", "forces", "tendons", "force_arrows",
+    "markers",
 )
 
 

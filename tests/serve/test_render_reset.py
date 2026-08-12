@@ -107,6 +107,7 @@ def _mutations(baseline):
         "forces": ("forces.scale_forcewidth", 0.055),
         "tendons": ("tendons.max_width", 0.0123),
         "force_arrows": ("force_arrows.scale", 3.5),
+        "markers": ("markers.radius", 0.999),
     }
 
 
@@ -114,6 +115,13 @@ def test_mutations_cover_every_reset_key(sess):
     """A guard on the test data, not on the code: if RESET_KEYS grows a root and `_mutations`
     does not, the round-trip test below would silently stop covering it and still pass."""
     assert set(_mutations(sess._reset_baseline)) == set(RESET_KEYS)
+
+
+def test_markers_is_a_reset_key():
+    """Pinned by name, independent of the generic round-trip below: a future refactor that
+    silently drops 'markers' from RESET_KEYS should fail here, not only via the less obvious
+    `test_mutations_cover_every_reset_key` set-equality check."""
+    assert "markers" in RESET_KEYS
 
 
 def test_reset_restores_every_root_to_its_launch_value(sess):

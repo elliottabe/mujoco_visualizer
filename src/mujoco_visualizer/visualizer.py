@@ -469,6 +469,29 @@ def default_force_arrow_scale(model: mujoco.MjModel) -> float:
     return 0.1 * float(model.stat.extent) / denom
 
 
+def default_marker_radius(model) -> float:
+    """The model-derived default for ``vis_state['markers']['radius']``:
+    ``0.25 * model.stat.meansize``.
+
+    NOT a hardcoded constant, for the same reason ``default_force_arrow_scale`` and
+    ``default_tendon_ctrl_full_scale`` are not: a fixed radius is either invisible or
+    occludes the whole model depending on what units the MJCF uses. ``stat.meansize`` is
+    MuJoCo's own mean-body-size statistic -- the quantity its default visual scaling already
+    keys off -- so a quarter of it is "a quarter of a typical body", which means the same
+    thing at any scale.
+
+    Verified on the v1 fly (CGS units, ``meansize = 0.02``): returns ``0.005`` cm, a 0.01 cm
+    sphere against a 0.25 cm body -- about 4% of body length, readable against a limb without
+    swallowing the joint it marks. That also coincides with
+    ``add_trajectory_points_to_scene``'s own ``0.005`` default on this model.
+
+    Falls back to ``0.005`` when ``meansize`` is zero (a degenerate or bare test model),
+    matching that helper's default -- a documented placeholder, not a claim it is right.
+    """
+    meansize = float(getattr(model.stat, "meansize", 0.0) or 0.0)
+    return 0.25 * meansize if meansize > 0.0 else 0.005
+
+
 def get_wing_fluid_idxs(model: mujoco.MjModel, suffix='') -> List[int]:
     """Return geom ids of the wing fluid geoms (left, right) in *model*."""
     out = []
@@ -985,6 +1008,18 @@ class Visualizer:
                 'scale':   self._default_force_arrow_scale,
                 'radius':  0.003,
             },
+            # Measured mocap markers, drawn by a caller-registered scene modifier (see
+            # scripts/rollout_viewer/launch.py in the fly_neuromech repo). This package
+            # ships no marker DATA -- like 'force_arrows', the group is the render-side half
+            # of a feature whose data half lives in the consumer.
+            #
+            # 'enabled' defaults TRUE, unlike force_arrows: markers exist to show how well a
+            # solved pose matches what was measured, which is the first thing a viewer of IK
+            # output wants to see. Deliberate asymmetry, not an oversight.
+            'markers': {
+                'enabled': True,
+                'radius':  default_marker_radius(self.model),
+            },
             'camera_presets': {},
         }
 
@@ -1190,7 +1225,8 @@ class Visualizer:
         # default __init__ set, never an error and never a synthesized value.
         for key in ('colors', 'geom_colors', 'alpha', 'vis_flags',
                     'geom_groups', 'site_groups', 'camera', 'lighting',
-                    'floor', 'skybox', 'ghost', 'forces', 'tendons', 'force_arrows'):
+                    'floor', 'skybox', 'ghost', 'forces', 'tendons', 'force_arrows',
+                    'markers'):
             if key in settings:
                 if isinstance(settings[key], dict) and isinstance(self.vis_state.get(key), dict):
                     self.vis_state[key] = {**self.vis_state[key], **settings[key]}
@@ -1245,6 +1281,9 @@ class Visualizer:
             'forces':            copy.deepcopy(self.vis_state['forces']),
             'tendons':           copy.deepcopy(self.vis_state['tendons']),
             'force_arrows':      copy.deepcopy(self.vis_state.get('force_arrows', {})),
+            # .get(..., {}) for the same reason 'ghost' uses it: this key postdates every
+            # bundled preset, so a Visualizer rebuilt from an old one has no entry to copy.
+            'markers':           copy.deepcopy(self.vis_state.get('markers', {})),
             'geom_render_state': geom_render_state,
             'camera_presets':    self.vis_state.get('camera_presets', {}),
             # .get(..., {}), not ['ghost'], because this key was added after every existing

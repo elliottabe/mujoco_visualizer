@@ -68,7 +68,7 @@ _LAST_WINS = frozenset({"mode", "speed", "camera", "camera_path", "settings", "s
 _VIS_STATE_ROOTS = frozenset({
     "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
     "camera", "camera_presets", "lighting", "floor", "skybox", "ghost",
-    "geom_render_state", "forces", "tendons", "force_arrows",
+    "geom_render_state", "forces", "tendons", "force_arrows", "markers",
 })
 
 # Roots that are fixed-length lists in vis_state (geom_groups/site_groups are boolean lists

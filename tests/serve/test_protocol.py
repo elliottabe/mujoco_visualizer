@@ -403,7 +403,7 @@ def test_vis_state_roots_contains_exactly_the_roots_vis_state_actually_has():
     expected = {
         "colors", "geom_colors", "alpha", "vis_flags", "geom_groups", "site_groups",
         "camera", "camera_presets", "lighting", "floor", "skybox", "ghost",
-        "geom_render_state", "forces", "tendons", "force_arrows",
+        "geom_render_state", "forces", "tendons", "force_arrows", "markers",
     }
     assert _VIS_STATE_ROOTS == expected
 
@@ -425,6 +425,25 @@ def test_force_arrows_is_accepted_and_rejected_once_the_root_is_removed(monkeypa
     )
     with pytest.raises(CommandError, match="force_arrows"):
         parse_command({"t": "render", "set": {"force_arrows.enabled": True}})
+
+
+def test_markers_is_accepted_and_rejected_once_the_root_is_removed(monkeypatch):
+    """Mirrors ``test_force_arrows_is_accepted_and_rejected_once_the_root_is_removed`` for the
+    'markers' root: accepted while registered in ``_VIS_STATE_ROOTS``, rejected the moment it
+    is not, so a silently dropped entry fails here rather than only via the less obvious
+    exact-membership literal above."""
+    import mujoco_visualizer.serve.protocol as protocol_mod
+
+    cmd = parse_command({"t": "render", "set": {"markers.enabled": True}})
+    assert cmd["set"] == {"markers.enabled": True}
+
+    monkeypatch.setattr(
+        protocol_mod,
+        "_VIS_STATE_ROOTS",
+        protocol_mod._VIS_STATE_ROOTS - {"markers"},
+    )
+    with pytest.raises(CommandError, match="markers"):
+        parse_command({"t": "render", "set": {"markers.enabled": True}})
 
 
 def test_render_accepts_a_bare_key_whose_name_is_itself_a_known_root():

@@ -20,7 +20,11 @@ import pytest
 from mujoco_visualizer import Visualizer
 from mujoco_visualizer.serve.session import Session
 from mujoco_visualizer.serve.protocol import parse_command
-from mujoco_visualizer.visualizer import add_arrow_to_scene, default_force_arrow_scale
+from mujoco_visualizer.visualizer import (
+    add_arrow_to_scene,
+    default_force_arrow_scale,
+    default_marker_radius,
+)
 
 _XML = """
 <mujoco>
@@ -326,6 +330,93 @@ def test_save_load_round_trips_force_arrows(tmp_path):
         assert loader.viz.vis_state["force_arrows"] == {
             "enabled": True, "scale": 0.42, "radius": 0.01,
         }
+    finally:
+        loader.close()
+
+
+# -- 3. vis_state['markers'] --------------------------------------------------------------------
+
+
+def test_default_marker_radius_matches_the_documented_formula():
+    """The exact formula stated in the task: 0.25 * model.stat.meansize."""
+    model = mujoco.MjModel.from_xml_string(_ONE_BOX)
+    expected = 0.25 * float(model.stat.meansize)
+    assert default_marker_radius(model) == pytest.approx(expected)
+
+
+def test_default_marker_radius_falls_back_to_a_documented_placeholder_on_zero_meansize():
+    class _Stat:
+        meansize = 0.0
+
+    class _M:
+        stat = _Stat()
+
+    assert default_marker_radius(_M()) == 0.005
+
+
+def test_fresh_vis_state_has_markers_enabled_with_a_real_positive_radius():
+    """Enabled by DEFAULT, unlike force_arrows: the overlay exists to show how well a solved
+    pose matches what was measured, which is the first thing a viewer of IK output wants to
+    see. Deliberate asymmetry with force_arrows's OFF default -- not an oversight to "fix"."""
+    viz = Visualizer(model=mujoco.MjModel.from_xml_string(_XML))
+    try:
+        markers = viz.vis_state["markers"]
+        assert markers["enabled"] is True
+        assert markers["radius"] == pytest.approx(default_marker_radius(viz.model))
+        assert markers["radius"] > 0.0, "an invisible (zero) default defeats the whole point"
+    finally:
+        viz.close()
+
+
+def test_markers_is_a_known_render_set_root():
+    cmd = parse_command({"t": "render", "set": {"markers.enabled": False}})
+    assert cmd["set"] == {"markers.enabled": False}
+
+
+def test_markers_dotted_render_set_reaches_vis_state(sess):
+    sess.apply_render({"markers.radius": 0.02})
+    assert sess.viz.vis_state["markers"]["radius"] == pytest.approx(0.02)
+    # Sibling field untouched by the dotted (merge-style) write.
+    assert sess.viz.vis_state["markers"]["enabled"] is True
+
+
+def test_a_wholesale_replaced_partial_markers_dict_does_not_raise(sess):
+    """Mirrors ``test_a_wholesale_replaced_partial_force_arrows_dict_does_not_raise``: a bare
+    (non-dotted) top-level key replaces the WHOLE group, so a caller sending
+    {"markers": {"enabled": False}} (one key, no "radius") must not break anything downstream
+    that reads this group with .get(...)."""
+    sess.apply_render({"markers": {"enabled": False}})
+    assert sess.viz.vis_state["markers"] == {"enabled": False}
+
+    # render() itself must not raise -- nothing in this package indexes markers directly yet
+    # (the scene modifier that reads it lands in a later task).
+    sess.render()
+
+    radius = sess.viz.vis_state["markers"].get("radius", default_marker_radius(sess.viz.model))
+    assert radius > 0.0
+
+
+def test_save_load_round_trips_markers(tmp_path):
+    """Focused counterpart to test_settings_save.py's whole-vis_state round trip: pins this
+    one group by name so a future refactor of that generic test can't quietly stop covering it."""
+    user_dir = tmp_path / "user_settings"
+    saver = Session(
+        model=mujoco.MjModel.from_xml_string(_XML), width=32, height=32,
+        user_settings_dir=user_dir,
+    )
+    try:
+        saver.viz.vis_state["markers"] = {"enabled": False, "radius": 0.042}
+        saver.save_settings_as("markers_probe")
+    finally:
+        saver.close()
+
+    loader = Session(
+        model=mujoco.MjModel.from_xml_string(_XML), width=32, height=32,
+        user_settings_dir=user_dir,
+    )
+    try:
+        loader.load_settings("markers_probe")
+        assert loader.viz.vis_state["markers"] == {"enabled": False, "radius": 0.042}
     finally:
         loader.close()
 
