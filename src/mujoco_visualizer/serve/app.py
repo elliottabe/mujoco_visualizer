@@ -161,7 +161,13 @@ def _ws_loop(sock_conn, loop, session=None) -> None:
         loop.client_left()
 
 
-def create_app(loop, session, extra_static: Optional[Path] = None, clip_info=None) -> Flask:
+def create_app(
+    loop,
+    session,
+    extra_static: Optional[Path] = None,
+    clip_info=None,
+    ctrl_info=None,
+) -> Flask:
     """Build the Flask app around a running (or runnable) *loop* and *session*.
 
     *extra_static* lets a host project (e.g. vnc_explorer) serve its own panel JS from
@@ -176,6 +182,12 @@ def create_app(loop, session, extra_static: Optional[Path] = None, clip_info=Non
     and immutable: these routes run on Flask request threads, so a provider that lazily
     read HDF5 or mutated a cache would be doing it concurrently with the simulation thread.
     The fly launcher satisfies this by loading every metric into numpy at startup.
+
+    *ctrl_info*, when given, adds ``/api/ctrl/legs`` and ``/api/ctrl/traces`` for the per-leg
+    actuator-activation panels. Same READ-ONLY, immutable requirement as *clip_info*, and for
+    the same reason -- these routes also run on Flask request threads. The fly launcher
+    satisfies it by serving traces out of the rollout source's already-frozen ``ctrl`` array
+    rather than re-reading HDF5 per request.
     """
     app = Flask(__name__, static_folder=str(STATIC), static_url_path="/static")
     sock = Sock(app)
@@ -210,6 +222,26 @@ def create_app(loop, session, extra_static: Optional[Path] = None, clip_info=Non
             except (KeyError, IndexError, ValueError) as exc:
                 # Named 400s rather than a 500 traceback: both are reachable from a URL a
                 # user can type or a stale client can send.
+                return jsonify({"error": str(exc)}), 400
+
+    if ctrl_info is not None:
+
+        @app.get("/api/ctrl/legs")
+        def ctrl_legs():
+            return jsonify(ctrl_info.legs())
+
+        @app.get("/api/ctrl/traces")
+        def ctrl_traces():
+            raw_clip = request.args.get("clip", "")
+            try:
+                clip = int(raw_clip)
+            except (TypeError, ValueError):
+                return jsonify({"error": f"clip must be an integer, got {raw_clip!r}"}), 400
+            try:
+                return jsonify(ctrl_info.traces(clip))
+            except (KeyError, IndexError, ValueError) as exc:
+                # Same reasoning as /api/series: reachable from a URL a user can type or a
+                # stale client can send, so a named 400 beats a 500 traceback.
                 return jsonify({"error": str(exc)}), 400
 
     if extra_static is not None:

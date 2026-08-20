@@ -372,3 +372,69 @@ def test_ws_still_refuses_a_preset_name_that_exists_nowhere(tmp_path):
     assert errors, "an unknown preset name was accepted; the load whitelist is gone"
     assert "no_such_preset" in errors[0]["msg"]
     assert loop.submitted == [], "a refused command must not reach the loop"
+
+
+class FakeCtrlInfo:
+    """The ctrl_info contract: static per-leg metadata plus per-clip traces."""
+
+    def legs(self):
+        return {
+            "legs": [{"key": "T1_right", "label": "T1R", "actuators": [
+                {"index": 3, "name": "mu_T1_33_right", "group": "coxa_adductor",
+                 "color": "#cc6644"}]}],
+            "legend": [{"group": "coxa_adductor", "label": "coxa adductor",
+                        "color": "#cc6644"}],
+            "n_actuators_total": 272,
+            "n_non_leg": 60,
+        }
+
+    def traces(self, clip):
+        if not 0 <= clip < 2:
+            raise IndexError(f"clip {clip} out of range")
+        return {"clip": clip, "n_frames": 4, "ctrl_range": [0.0, 1.0],
+                "legs": {"T1_right": [{"index": 3, "name": "mu_T1_33_right",
+                                       "color": "#cc6644", "group": "coxa_adductor",
+                                       "frames": [0, 3], "values": [0.1, 0.9]}]}}
+
+
+def test_api_ctrl_legs_returns_the_provider_payload():
+    app = create_app(FakeLoop(), None, ctrl_info=FakeCtrlInfo())
+    resp = app.test_client().get("/api/ctrl/legs")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["n_non_leg"] == 60
+    assert body["legs"][0]["label"] == "T1R"
+
+
+def test_api_ctrl_traces_returns_a_clips_traces():
+    app = create_app(FakeLoop(), None, ctrl_info=FakeCtrlInfo())
+    resp = app.test_client().get("/api/ctrl/traces?clip=1")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["clip"] == 1
+    assert body["legs"]["T1_right"][0]["values"] == [0.1, 0.9]
+
+
+def test_api_ctrl_traces_rejects_a_bad_clip_with_400():
+    app = create_app(FakeLoop(), None, ctrl_info=FakeCtrlInfo())
+    assert app.test_client().get("/api/ctrl/traces?clip=9").status_code == 400
+    assert app.test_client().get("/api/ctrl/traces?clip=x").status_code == 400
+
+
+def test_ctrl_routes_404_without_a_provider():
+    """A rollout with no ctrl gets ctrl_info=None, so these must not exist at all -- that 404
+    is what the Muscles tab reads as "no ctrl in this rollout"."""
+    app = create_app(FakeLoop(), None)
+    assert app.test_client().get("/api/ctrl/legs").status_code == 404
+    assert app.test_client().get("/api/ctrl/traces?clip=0").status_code == 404
+
+
+def test_ctrl_and_clip_providers_are_independent():
+    """One present and the other absent must work: an IK source has clip info (bouts) but no
+    policy ctrl at all."""
+    app = create_app(FakeLoop(), None, clip_info=FakeClipInfo())
+    assert app.test_client().get("/api/clips").status_code == 200
+    assert app.test_client().get("/api/ctrl/legs").status_code == 404
+    app2 = create_app(FakeLoop(), None, ctrl_info=FakeCtrlInfo())
+    assert app2.test_client().get("/api/ctrl/legs").status_code == 200
+    assert app2.test_client().get("/api/clips").status_code == 404
