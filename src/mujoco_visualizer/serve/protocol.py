@@ -425,6 +425,20 @@ def parse_command(raw, user_settings_dir: Optional[str] = None) -> Dict:
                 if not isinstance(cmd[flag], bool):
                     raise CommandError(f"'export.{flag}' must be a boolean")
                 out[flag] = cmd[flag]
+        if "label" in cmd:
+            # Appended to the auto-built stem (see the fly launcher's build_export_factory), so
+            # exporting the same clip at the same trim/stride/size twice can be told apart.
+            # Held to PRESET_NAME_RE -- the SAME class settings.save and camera_preset.name use
+            # -- because this string is concatenated into a path the server itself creates: a
+            # separator would relocate the export out of the figures directory, and a dot would
+            # collide with the extension appended after it. Validated here rather than
+            # sanitised downstream, so there is exactly one place that decides what is legal.
+            label = cmd["label"]
+            if not isinstance(label, str) or not PRESET_NAME_RE.match(label):
+                raise CommandError(
+                    f"'export.label' must match {PRESET_NAME_RE.pattern}, got {label!r}"
+                )
+            out["label"] = label
         if "path" in cmd:
             if not isinstance(cmd["path"], str) or not cmd["path"]:
                 raise CommandError("'export.path' must be a non-empty string")

@@ -301,6 +301,30 @@ def test_export_clamps_nothing_but_validates_range():
         parse_command({"t": "export", "width": 640, "height": 480, "fps": 0})
 
 
+def test_export_carries_an_optional_filename_label():
+    """The label is appended to the auto-built stem so several exports of the SAME clip at the
+    same trim/stride/size do not overwrite each other. Absent means the pre-existing name."""
+    base = {"t": "export", "width": 640, "height": 480, "fps": 30}
+    assert "label" not in parse_command(dict(base))
+    assert parse_command({**base, "label": "ghost_v2-b"})["label"] == "ghost_v2-b"
+
+
+@pytest.mark.parametrize("bad", [
+    "../escape",        # a path separator would relocate the export out of the figures dir
+    "with space",       # the client normalises these; a raw one reaching here is a bad client
+    "dot.suffix",       # would collide with the ".mp4" this stem gets appended
+    "",                 # an empty label must be absent, not an empty suffix
+    "x" * 65,           # 64 is the same cap preset names carry
+    7,                  # not a string
+])
+def test_export_label_is_whitelisted_because_it_becomes_a_filename(bad):
+    """Same rule, and the same character class, as settings.save's preset name: this string is
+    concatenated into a path the server itself creates, so it is validated at the wire boundary
+    rather than sanitised somewhere downstream."""
+    with pytest.raises(CommandError):
+        parse_command({"t": "export", "width": 640, "height": 480, "fps": 30, "label": bad})
+
+
 def test_export_cancel_parses():
     assert parse_command({"t": "export_cancel"}) == {"t": "export_cancel"}
 
