@@ -373,8 +373,12 @@ class Session:
         self._camera_object: Optional[mujoco.MjvCamera] = None
 
         # The armed camera path, and the memoised camera list derived from it. See
-        # set_camera_path / camera_list_for. Deliberately NOT persisted: a path is a
-        # per-session composition, like the replay trim.
+        # set_camera_path / camera_list_for. MIRRORED into vis_state['camera_path'] by every
+        # writer below, which is what lets a saved preset carry the shot: a path built out of
+        # six saved cameras used to be rebuildable only by hand, since the presets round-tripped
+        # but the path over them did not. This attribute stays the authority for what is ARMED
+        # (vis_state is a serialisation surface, and nothing stops a caller writing into it);
+        # the two are kept in step in exactly two places, here and _disarm_camera_path.
         self._camera_path: Optional[Dict] = None
         self._camera_list_cache = None
 
@@ -896,6 +900,9 @@ class Session:
         self._camera_path = None
         self._camera_list_cache = None
         self._camera_object = None
+        # Mirrored, so a preset saved with nothing armed records an explicit "no path" rather
+        # than keeping whatever was last armed. See __init__'s note on the two writers.
+        self.viz.vis_state["camera_path"] = None
 
     def set_camera(
         self, named: Optional[str] = None, pan: Optional[Sequence[float]] = None, **kw
@@ -1250,6 +1257,34 @@ class Session:
             )
         del presets[name]
 
+    # -- locks (owned by SimLoop, serialised here) ------------------------------
+
+    @property
+    def saved_locks(self) -> Dict[str, List[float]]:
+        """The lock set a preset saved right now would carry: ``{joint name: [value, ...]}``.
+
+        The locks themselves belong to ``SimLoop`` -- it resolves, validates and applies them
+        every frame. This is only the serialisation surface, kept in step by ``SimLoop``
+        through :meth:`set_saved_locks` on every change, exactly as ``vis_state['camera_path']``
+        is kept in step with the armed path. Living in ``vis_state`` is what lets a preset carry
+        locks at all: ``Visualizer.save_settings`` serialises ``vis_state`` and nothing else,
+        and there is no second file.
+
+        Because it is a true mirror rather than a snapshot taken at save time, a loaded preset
+        that says NOTHING about locks leaves this holding the live set -- which is what makes
+        "no locks key" mean "changed nothing" rather than "release everything".
+        """
+        return {
+            str(name): list(values)
+            for name, values in self.viz.vis_state.get("locks", {}).items()
+        }
+
+    def set_saved_locks(self, locks: Dict[str, Sequence[float]]) -> None:
+        """Mirror ``SimLoop``'s live lock set into ``vis_state``. See :attr:`saved_locks`."""
+        self.viz.vis_state["locks"] = {
+            str(name): [float(v) for v in values] for name, values in dict(locks).items()
+        }
+
     @property
     def camera_path(self) -> Optional[Dict]:
         """The armed path, or ``None``. A copy: a caller mutating it must not silently
@@ -1358,6 +1393,9 @@ class Session:
             "weights": None if weights is None else list(weights),
             "loop": bool(loop),
         }
+        # Mirrored only after every check above has passed, so vis_state never records a path
+        # that was rejected -- a saved preset must not carry a shot this session refused to arm.
+        self.viz.vis_state["camera_path"] = copy.deepcopy(self._camera_path)
         self._camera_list_cache = None
 
     def camera_list_for(self, n_frames: int) -> List[mujoco.MjvCamera]:
@@ -1579,6 +1617,19 @@ class Session:
         Without this, loading a bundle that pins ``mode: "named"`` left the path armed and
         re-injecting itself on the next publish tick, which is the runtime route into exactly
         the defect :meth:`apply_render`'s mode forcing exists to close.
+
+        A preset that CARRIES a path is the one exception, and it is not really one: the path
+        it arms is the path that file describes, over the presets that same file just loaded,
+        so it is not a stale shot over a replaced camera -- it is the shot the user saved. A
+        file with no ``camera_path`` key (every preset written before the key existed, bundled
+        ones included) still disarms, exactly as before.
+
+        Returns a list of human-readable NOTES about anything the file asked for that this
+        session could not honour -- today, a path naming a preset the file does not carry.
+        Notes rather than exceptions because by this point the colours have already been
+        applied: raising would leave a half-loaded preset, which is worse than a lost path.
+        The caller decides how loudly to report them (``SimLoop`` re-raises them as one
+        non-pausing command error).
         """
         available = list_available_settings(self.user_settings_dir)
         matches = [d for d in available if d["name"] == name]
@@ -1592,10 +1643,41 @@ class Session:
             self.viz.load_settings(str(self.user_settings_dir / f"{name}.json"))
         else:
             self.viz.load_settings(name)
-        # Disarmed AFTER the load, not before: a load that raises (unwritable/corrupt file)
-        # must leave the session exactly as it was, path included.
-        self._disarm_camera_path()
+        # AFTER the load, not before: a load that raises (unwritable/corrupt file) must leave
+        # the session exactly as it was, path included.
+        notes = self._rearm_loaded_camera_path()
         self._settings_epoch += 1
+        return notes
+
+    def _rearm_loaded_camera_path(self) -> List[str]:
+        """Arm the path the just-loaded ``vis_state`` describes, or disarm.
+
+        Everything the path claims is re-validated by :meth:`set_camera_path` against the
+        presets THIS file loaded -- the preset names, the two-camera minimum, the keyframe
+        agreement, the weight count and signs. A file is data, and a hand-edited or
+        older-model one can easily name a preset that is not there; that is a note, not a
+        crash, and it leaves the session with no path rather than a half-armed one.
+        """
+        spec = self.viz.vis_state.get("camera_path")
+        if not spec:
+            # Both the pre-feature case (no key at all) and an explicit null. Neither describes
+            # a shot, and an armed path over the camera this load just replaced is exactly what
+            # the docstring above disarms.
+            self._disarm_camera_path()
+            return []
+        try:
+            self.set_camera_path(
+                spec.get("cameras", []),
+                weights=spec.get("weights"),
+                loop=bool(spec.get("loop", False)),
+            )
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            # set_camera_path may have raised BEFORE writing _camera_path, leaving whatever was
+            # armed before the load still armed -- over a camera that has now been replaced.
+            # Disarm explicitly rather than relying on the failure having cleared it.
+            self._disarm_camera_path()
+            return [f"camera path not restored: {exc}"]
+        return []
 
     @property
     def settings_epoch(self) -> int:

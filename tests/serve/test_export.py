@@ -1025,3 +1025,87 @@ def test_a_single_camera_and_none_still_work(tmp_path):
         job.start()
         job.join(timeout=120)
         assert job.progress()["state"] == "done", job.progress()
+
+
+# -- global alpha parity ----------------------------------------------------------------
+
+_ALPHA_MODEL_XML = """
+<mujoco><worldbody>
+  <light pos="0 0 2"/>
+  <body name="b1"><joint name="j1" type="hinge" axis="0 0 1"/>
+    <geom name="opaque" type="box" size=".1 .1 .1" rgba=".8 .3 .2 1"/></body>
+  <body name="b2" pos="0.3 0 0"><joint name="j2" type="hinge" axis="0 0 1"/>
+    <geom name="translucent" type="box" size=".1 .1 .1" rgba=".2 .3 .8 0.6"/></body>
+</worldbody></mujoco>
+"""
+
+
+@pytest.mark.gl
+def test_export_renders_the_same_global_alpha_as_the_live_session(tmp_path):
+    """``_apply_geom_colors`` writes ``_orig_geom_rgba[i, 3] * alpha``, so
+    ``_orig_geom_rgba`` has to be the PRE-alpha baseline. A live ``Session`` hands the export
+    ``session.model``, which IS ``session.viz.model`` -- the model the preview has already
+    written alpha into -- and ``Visualizer.__init__`` then captures that as its "original".
+    The export multiplied by alpha a second time and rendered every geom at alpha**2: at 0.25
+    the video came out four times more transparent than the preview it was launched from.
+
+    Expectation if the fix is correct: every geom's rendered alpha equals the live Session's,
+    element for element. The translucent geom is here so a baseline that is merely reset to 1.0
+    rather than to the model's own per-geom alpha fails too (0.6*0.25 = 0.15, not 0.25), and
+    the ghost-excluded geom is deliberately absent -- ghost alpha REPLACES the global one, so
+    it matched even while this was broken and cannot discriminate.
+    """
+    from mujoco_visualizer.serve.session import Session
+
+    ALPHA = 0.25
+
+    live = Session(model=mujoco.MjModel.from_xml_string(_ALPHA_MODEL_XML), width=128, height=96)
+    try:
+        live.viz.vis_state["alpha"] = ALPHA
+        live.render()
+        live_alpha = live.model.geom_rgba[:, 3].copy()
+        # The export is handed the LIVE model, exactly as scripts/rollout_viewer/launch.py
+        # does (ExportJob(session.model, ...)) -- copying a pristine one here would test a
+        # caller that does not exist.
+        vis_state = copy.deepcopy(live.viz.vis_state)
+        export_model = live.model
+        qpos = np.repeat(export_model.qpos0.copy().reshape(1, -1), 2, axis=0)
+        job = ExportJob(
+            export_model, None, vis_state, qpos,
+            path=tmp_path / "alpha", fmt="png", width=128, height=96, fps=10,
+            color_baseline=live.viz.color_baseline,
+        )
+        job.start()
+        job.join(timeout=120)
+        assert job.progress()["state"] == "done", job.progress()
+    finally:
+        live.close()
+
+    opaque = mujoco.mj_name2id(job._model, mujoco.mjtObj.mjOBJ_GEOM, "opaque")
+    translucent = mujoco.mj_name2id(job._model, mujoco.mjtObj.mjOBJ_GEOM, "translucent")
+    assert job._model.geom_rgba[opaque, 3] == pytest.approx(ALPHA)
+    assert job._model.geom_rgba[translucent, 3] == pytest.approx(0.6 * ALPHA)
+    assert list(job._model.geom_rgba[:, 3]) == pytest.approx(list(live_alpha)), (
+        "the exported frames' geom alphas disagree with the live Session's for the same "
+        "model and the same vis_state -- the global alpha has been applied a second time"
+    )
+
+
+def test_color_baseline_survives_a_visualizer_that_has_already_applied_alpha():
+    """The property the export needs: a Visualizer's colour baseline is the model's pre-alpha
+    rgba, and it stays that way no matter how many times settings are applied. Without this,
+    there is nothing on the live side for the export to be handed."""
+    from mujoco_visualizer.visualizer import Visualizer
+
+    viz = Visualizer(model=mujoco.MjModel.from_xml_string(_ALPHA_MODEL_XML))
+    try:
+        pristine = viz.color_baseline.copy()
+        viz.vis_state["alpha"] = 0.5
+        viz._apply_all()
+        viz._apply_all()
+        assert list(viz.color_baseline[:, 3]) == pytest.approx(list(pristine[:, 3]))
+        # ... and it is a copy: mutating what the getter returned must not move the baseline.
+        viz.color_baseline[:, 3] = 0.0
+        assert list(viz.color_baseline[:, 3]) == pytest.approx(list(pristine[:, 3]))
+    finally:
+        viz.close()

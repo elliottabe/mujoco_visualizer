@@ -319,9 +319,24 @@ class SimLoop(threading.Thread):
             if cmd.get("reset") is True:
                 self._session.reset_render_settings()
             elif "save" in cmd:
+                self._mirror_locks()
                 self._session.save_settings_as(cmd["save"])
             else:
-                self._session.load_settings(cmd["load"])
+                self._mirror_locks()
+                # Both halves run before anything is reported. load_settings returns notes
+                # rather than raising precisely so a preset whose camera path no longer
+                # resolves still gets its locks installed -- and vice versa.
+                notes = list(self._session.load_settings(cmd["load"]))
+                notes += self._install_saved_locks()
+                if notes:
+                    # Raised only after both installs, and only as a REPORT: _apply's caller
+                    # turns this into a non-pausing kind='command' error, the same treatment a
+                    # bad lock name gets. The preset IS loaded; these are the parts of it this
+                    # model could not honour.
+                    raise ValueError(
+                        f"settings preset {cmd['load']!r} loaded, with "
+                        f"{len(notes)} item(s) dropped: " + "; ".join(notes)
+                    )
         elif kind == "stream":
             if "fps" in cmd:
                 self._fps_cap = cmd["fps"]
@@ -377,6 +392,53 @@ class SimLoop(threading.Thread):
         if self._joint_map is None:
             self._joint_map = build_joint_qpos_map(self._session.model)
         return self._joint_map
+
+    def _mirror_locks(self) -> None:
+        """Publish the live lock set to the Session, which serialises it into a preset.
+
+        Called at the top of BOTH settings branches -- before a save and before a load -- and
+        deliberately NOWHERE else. Before a save for the obvious reason. Before a LOAD because
+        that is what makes an absent ``locks`` key mean "changed nothing": ``load_settings``
+        leaves the key alone when the file does not carry one, so the install that follows reads
+        back the live set and re-installs it unchanged. Mirroring from ``_apply_lock`` instead
+        would work too, but it would put a ``Session`` call on the path of every lock command --
+        coupling the hot, thoroughly-stood-in lock path to a method only the settings path needs.
+        """
+        self._session.set_saved_locks(self._locks)
+
+    def _install_saved_locks(self) -> List[str]:
+        """Replace the live locks with the ones the just-loaded preset carries.
+
+        REPLACES rather than merges: a preset describes a complete state, and merging would
+        leave a joint frozen that the preset says nothing about.
+
+        Every entry is re-validated against the CURRENT model's joint map, because a preset
+        stores frozen VALUES and is therefore tied to the model it was saved on. Unlike
+        ``_apply_lock`` -- which commits nothing if one name in a batch is bad, since that is a
+        client mistake it can correct -- a preset is a file that may legitimately outlive a
+        model, so the entries that still resolve are kept and the rest are returned as notes.
+        Refusing the whole set would make a preset useless the moment one joint is renamed.
+        """
+        jmap = self._jmap()
+        kept: Dict[str, List[float]] = {}
+        notes: List[str] = []
+        for name, values in self._session.saved_locks.items():
+            if name not in jmap:
+                notes.append(f"lock on {name!r} dropped: no such joint in this model")
+                continue
+            _adr, width = jmap[name]
+            if len(values) != width:
+                notes.append(
+                    f"lock on {name!r} dropped: {len(values)} value(s) saved, but this "
+                    f"model's joint takes {width}"
+                )
+                continue
+            kept[name] = [float(v) for v in values]
+        self._locks = kept
+        # Back to the Session, so the mirror describes what is ACTUALLY locked -- otherwise a
+        # preset re-saved right after a lossy load would carry the dropped entries again.
+        self._mirror_locks()
+        return notes
 
     def _apply_lock(self, cmd: Dict) -> None:
         """Apply one (possibly coalesced) ``lock`` command.

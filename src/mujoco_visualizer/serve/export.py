@@ -116,6 +116,7 @@ class ExportJob(threading.Thread):
         primary_actuator_names: Optional[Sequence[str]] = None,
         modify_scene_fns: Optional[Sequence[Callable]] = None,
         actuator_color_fn: Optional[Callable] = None,
+        color_baseline: Optional[np.ndarray] = None,
     ):
         super().__init__(name="ExportJob", daemon=True)
         # Deep-copy rather than trust the caller: _make_visualizer mutates this model's
@@ -127,6 +128,17 @@ class ExportJob(threading.Thread):
         # model.tendon_rgba/tendon_width, and this same deep copy is what confines that
         # mutation to this job's own model rather than the caller's.
         self._model = copy.deepcopy(model)
+        # The PRE-alpha geom_rgba of the model this job was handed (see
+        # Visualizer.color_baseline). None means "the model handed in is pristine", which is
+        # true for a caller that compiles one for the export and FALSE for a caller that
+        # passes its live preview model: vis_state['alpha'] is already multiplied into that
+        # one's geom_rgba, and this job's own Visualizer would otherwise take the rendered
+        # rgba as its baseline and apply alpha a second time -- exporting every geom at
+        # alpha**2 (0.25 rendered as 0.0625). Copied, not aliased, for the same reason the
+        # model is.
+        self._color_baseline = (
+            None if color_baseline is None else np.array(color_baseline, dtype=np.float64)
+        )
         self._anatomy = anatomy
         self._vis_state = vis_state
         self._frames = np.asarray(qpos_frames, dtype=np.float64)
@@ -320,6 +332,11 @@ class ExportJob(threading.Thread):
             self._model.vis.global_.offheight = self._height
 
         viz = Visualizer(model=self._model, anatomy=self._anatomy)
+        # Before vis_state is applied to anything: this Visualizer captured self._model's
+        # CURRENT rgba as its baseline in __init__, which is the live preview's already-alpha'd
+        # output whenever the caller handed over its session model. See self._color_baseline.
+        if self._color_baseline is not None:
+            viz.color_baseline = self._color_baseline
         if self._vis_state:
             viz.vis_state = copy.deepcopy(self._vis_state)
 

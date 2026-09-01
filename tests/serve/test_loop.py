@@ -107,6 +107,8 @@ class FakeSession:
         self.render_calls = []
         self.settings_loaded = []
         self.settings_saved = []
+        self._saved_locks = {}
+        self.saved_lock_writes = []
         self.settings_reset = 0
         self.resizes = []
         self.resets = 0
@@ -188,6 +190,19 @@ class FakeSession:
 
     def load_settings(self, name):
         self.settings_loaded.append(name)
+        # Notes about what a preset asked for that could not be honoured; the real Session
+        # returns a list, and SimLoop iterates it.
+        return []
+
+    @property
+    def saved_locks(self):
+        return {name: list(values) for name, values in self._saved_locks.items()}
+
+    def set_saved_locks(self, locks):
+        """SimLoop mirrors its live locks here on every change, so a saved preset carries
+        them. Recorded rather than ignored so a test can see the mirror actually happen."""
+        self._saved_locks = {name: list(values) for name, values in dict(locks).items()}
+        self.saved_lock_writes.append(self.saved_locks)
 
     def save_settings_as(self, name):
         self.settings_saved.append(name)

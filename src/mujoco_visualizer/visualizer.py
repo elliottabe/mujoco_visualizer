@@ -880,6 +880,14 @@ class Visualizer:
                             for cat in self.anatomy.category_names},
             'geom_colors': {},   # {geom_id (int): hex str} per-geom overrides
             'alpha': 1.0,
+            # Two roots this class stores and serialises but never APPLIES -- exactly like
+            # 'camera_presets' below, and for the same reason: they are the saved state of a
+            # session, and vis_state is what save_settings/load_settings round-trip. A path
+            # over camera_presets belongs to Session (which validates and arms it); the frozen
+            # joint values belong to SimLoop (which owns the live locks). Kept here so a preset
+            # can carry them at all -- there is no second file.
+            'camera_path': None,   # {'cameras': [preset name], 'weights': [...]|None, 'loop': bool}
+            'locks': {},           # {joint name: [value per qpos element]}
             # Applied only to geoms matching `excluded_suffix`. alpha here REPLACES the global
             # alpha for those geoms rather than multiplying with it, so the number a UI shows is
             # the alpha that renders.
@@ -1239,6 +1247,29 @@ class Visualizer:
                 int(k): v for k, v in settings['geom_colors'].items()
             }
 
+        # 'camera_path' and 'locks' are REPLACED, never merged -- which is why they are here
+        # rather than in the merge loop above. Both describe a complete composition: merging a
+        # 2-camera path into a 6-camera one would mint a shot that was never saved, and merging
+        # locks would leave a joint frozen that the preset says nothing about. A file with no
+        # key at all is left alone entirely (`if key in settings`), so every preset written
+        # before these existed keeps its pre-feature behaviour.
+        # The two differ on what an ABSENT key means, and deliberately:
+        #
+        #   camera_path -- absent means NO path. A settings load replaces the whole 'camera'
+        #       dict, so any path armed beforehand is a shot over a camera that no longer
+        #       exists; Session.load_settings has always disarmed on load for that reason, and
+        #       every preset written before this key existed relies on it. Writing None here is
+        #       what keeps "absent" distinguishable from "armed" after the merge.
+        #   locks -- absent means NOTHING SAID. A preset that predates the key must not
+        #       silently release joints the user froze; locks are not part of the look and
+        #       nothing about loading a colour scheme implies unfreezing a leg.
+        self.vis_state['camera_path'] = copy.deepcopy(settings.get('camera_path'))
+        if 'locks' in settings:
+            self.vis_state['locks'] = {
+                str(k): [float(v) for v in vals]
+                for k, vals in (settings['locks'] or {}).items()
+            }
+
         # Camera presets
         if 'camera_presets' in settings:
             self.vis_state['camera_presets'].update(settings['camera_presets'])
@@ -1286,6 +1317,13 @@ class Visualizer:
             'markers':           copy.deepcopy(self.vis_state.get('markers', {})),
             'geom_render_state': geom_render_state,
             'camera_presets':    self.vis_state.get('camera_presets', {}),
+            # The path is written even when None ("no path armed"), so a preset saved with
+            # nothing armed reads as an explicit disarm rather than as a file too old to say --
+            # load_settings distinguishes the two, and only the older file keeps the pre-feature
+            # behaviour. .get for the same reason 'ghost' uses it: a Visualizer rebuilt from a
+            # preset written before these keys existed has no entry to copy.
+            'camera_path':       copy.deepcopy(self.vis_state.get('camera_path')),
+            'locks':             copy.deepcopy(self.vis_state.get('locks', {})),
             # .get(..., {}), not ['ghost'], because this key was added after every existing
             # vis_state literal and after all 17 bundled presets -- on a Visualizer built
             # before it exists (or rebuilt from an old preset that never sets it), there is
@@ -1296,6 +1334,38 @@ class Visualizer:
         }
         with open(json_path, 'w') as f:
             json.dump(data, f, indent=2)
+
+    # ── Colour baseline ───────────────────────────────────────────────────────
+
+    @property
+    def color_baseline(self) -> np.ndarray:
+        """The model's PRE-alpha ``geom_rgba``: the baseline ``_apply_geom_colors`` scales.
+
+        ``_apply_geom_colors`` writes ``baseline[i, 3] * vis_state['alpha']``, so the baseline
+        must be the rgba the model had before any alpha was applied -- captured in ``__init__``
+        (and refreshed by ``_rebuild_model_derived_state`` after material baking), never
+        re-read from a model that has already been rendered.
+
+        Public because a second Visualizer built on an ALREADY-RENDERED model cannot recover
+        it: its own ``__init__`` captures the rendered rgba, and applying the same alpha again
+        squares it. ``ExportJob`` is exactly that case -- it is handed ``session.model``, which
+        is the live ``session.viz.model`` -- so it takes this baseline from the live Visualizer
+        and installs it on its own. Returns a COPY; assign to it to install one.
+        """
+        return self._orig_geom_rgba.copy()
+
+    @color_baseline.setter
+    def color_baseline(self, rgba: np.ndarray) -> None:
+        rgba = np.asarray(rgba, dtype=np.float64)
+        if rgba.shape != self._orig_geom_rgba.shape:
+            # A baseline from a different model would silently recolour by geom id -- the same
+            # topology-dependent mistake `geom_render_state` is documented as, and refused for,
+            # in load_settings.
+            raise ValueError(
+                f"color_baseline has shape {rgba.shape}, but this model's geom_rgba is "
+                f"{self._orig_geom_rgba.shape}; it must come from the same model"
+            )
+        self._orig_geom_rgba = rgba.copy()
 
     # ── Apply helpers (mirror notebook apply_* functions) ─────────────────────
 
