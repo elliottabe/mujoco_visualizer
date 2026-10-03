@@ -1488,3 +1488,68 @@ def test_primary_actuator_names_is_public_and_a_defensive_copy():
         )
     finally:
         s.close()
+
+
+class _CommandBackend:
+    """Minimal backend exposing the optional ``command``/``readout`` hooks."""
+
+    label, warning = "fake", None
+
+    def __init__(self):
+        self.calls = []
+
+    def set_ctrl(self, c):
+        pass
+
+    def step(self, n):
+        pass
+
+    def sync_to(self, d):
+        pass
+
+    def set_state(self, q, v, t):
+        pass
+
+    def reset_to_keyframe(self, n):
+        pass
+
+    @property
+    def time(self):
+        return 0.0
+
+    def close(self):
+        pass
+
+    def command(self, name, args):
+        self.calls.append((name, args))
+        return None if name != "bad" else "unknown controller command 'bad'"
+
+    def readout(self):
+        return {"controls": [{"name": "perturb", "kind": "button", "label": "Push"}], "mn_rate": 1.0}
+
+
+def test_backend_command_and_readout_merge(sess):
+    from mujoco_visualizer.serve.protocol import CommandError
+
+    original, b = sess.backend, _CommandBackend()
+    sess.backend = b
+    try:
+        sess.backend_command("perturb", {"force": [1, 0, 0]})
+        assert b.calls == [("perturb", {"force": [1, 0, 0]})]
+        out = sess.readout()
+        assert out["controls"][0]["name"] == "perturb" and out["mn_rate"] == 1.0
+        sess.attach_controller(FakeController(sess.model.nu))
+        merged = sess.readout()
+        assert merged["mn_rate"] == 1.0 and merged["calls"] == 0   # backend and controller keys both survive
+        with pytest.raises(CommandError, match="bad"):
+            sess.backend_command("bad", {})
+    finally:
+        sess.backend = original
+
+
+def test_backend_without_command_raises(sess):
+    from mujoco_visualizer.serve.protocol import CommandError
+
+    with pytest.raises(CommandError, match="accepts no controller commands"):
+        sess.backend_command("perturb", {})      # CpuBackend has no command()
+    assert sess.readout() == {}                  # nor readout()

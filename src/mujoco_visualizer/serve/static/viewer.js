@@ -31,6 +31,7 @@
   const errbannerEl = document.getElementById("errbanner");
   const warnbannerEl = document.getElementById("warnbanner");
   const controlsEl = document.getElementById("controls");
+  const controllerEl = document.getElementById("controller");
   const cameraEl = document.getElementById("camera");
   const settingsEl = document.getElementById("settings");
 
@@ -172,6 +173,122 @@
     }
   }
 
+  // -- controller panel, built from meta.readout.controls descriptors --------
+  //
+  // Descriptor: {name, kind: "slider"|"toggle"|"button"|"vector", label, min, max, value, group}.
+  // Rebuilt only when the descriptor list changes shape; values refresh every frame.
+
+  let controllerSig = null;
+  const controllerUpdaters = new Map();
+
+  function sendController(name, args) {
+    send({ t: "controller", name: name, args: args });
+  }
+
+  function fmtValue(v) {
+    return typeof v === "number" ? v.toFixed(2) : String(v == null ? "" : v);
+  }
+
+  function controllerRow(d) {
+    const row = document.createElement("div");
+    row.className = "act";
+    const label = document.createElement("span");
+    label.textContent = d.label || d.name;
+    label.title = d.name;
+    row.append(label);
+
+    if (d.kind === "slider") {
+      const lo = Number(d.min ?? 0), hi = Number(d.max ?? 1);
+      const slider = document.createElement("input");
+      slider.type = "range";
+      slider.min = String(lo); slider.max = String(hi);
+      slider.step = String(d.step || (hi - lo) / 200 || 0.01);
+      const out = document.createElement("output");
+      slider.addEventListener("input", () => {
+        out.value = fmtValue(Number(slider.value));
+        sendController(d.name, { value: Number(slider.value) });
+      });
+      row.append(slider, out);
+      // Do not yank a slider the user is dragging back to the last published value.
+      return [row, (v) => {
+        if (document.activeElement !== slider && v != null) slider.value = String(v);
+        out.value = fmtValue(document.activeElement === slider ? Number(slider.value) : v);
+      }];
+    }
+    if (d.kind === "toggle") {
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.addEventListener("change", () => sendController(d.name, { value: box.checked }));
+      row.append(box, document.createElement("span"));
+      return [row, (v) => { box.checked = !!v; }];
+    }
+    if (d.kind === "button") {
+      const btn = document.createElement("button");
+      btn.textContent = d.label || d.name;
+      btn.addEventListener("click", () => sendController(d.name, {}));
+      const out = document.createElement("output");
+      row.append(btn, out);
+      return [row, (v) => { out.value = v == null ? "" : fmtValue(v); }];
+    }
+    if (d.kind === "vector") {
+      const n = Array.isArray(d.value) && d.value.length ? d.value.length : 3;
+      const box = document.createElement("span");
+      const inputs = [];
+      for (let i = 0; i < n; i++) {
+        const inp = document.createElement("input");
+        inp.type = "number"; inp.step = "any"; inp.style.width = "4.5rem";
+        if (d.min != null) inp.min = String(d.min);
+        if (d.max != null) inp.max = String(d.max);
+        inputs.push(inp);
+        box.append(inp);
+      }
+      const apply = document.createElement("button");
+      apply.textContent = "apply";
+      apply.addEventListener("click", () =>
+        sendController(d.name, { value: inputs.map((inp) => Number(inp.value)) }));
+      row.append(box, apply);
+      return [row, (v) => {
+        if (!Array.isArray(v) || inputs.includes(document.activeElement)) return;
+        inputs.forEach((inp, i) => { if (v[i] != null) inp.value = String(v[i]); });
+      }];
+    }
+    const out = document.createElement("output");
+    out.value = `unknown kind ${d.kind}`;
+    row.append(document.createElement("span"), out);
+    return [row, () => {}];
+  }
+
+  function renderController(descs) {
+    const sig = JSON.stringify(descs.map((d) =>
+      [d.name, d.kind, d.label, d.min, d.max, d.step, d.group,
+       Array.isArray(d.value) ? d.value.length : null]));
+    if (sig !== controllerSig) {
+      controllerSig = sig;
+      controllerUpdaters.clear();
+      controllerEl.textContent = "";
+      controllerEl.hidden = descs.length === 0;
+      let group;
+      for (const d of descs) {
+        if ((d.group || "") !== group) {
+          group = d.group || "";
+          if (group) {
+            const head = document.createElement("h4");
+            head.textContent = group;
+            head.style.margin = ".5rem 0 .2rem";
+            controllerEl.append(head);
+          }
+        }
+        const [row, update] = controllerRow(d);
+        controllerEl.append(row);
+        controllerUpdaters.set(d.name, update);
+      }
+    }
+    for (const d of descs) {
+      const update = controllerUpdaters.get(d.name);
+      if (update) update(d.value);
+    }
+  }
+
   // -- camera drag ----------------------------------------------------------
   //
   // This is the GENERIC navigation: absolute az/el seeded from a literal (90, -20) because
@@ -291,6 +408,9 @@
           // correct: the condition genuinely stopped. It can no longer wipe a server error,
           // which lives in its own element (#errbanner).
           showWarn(pendingMeta.warn);
+          const readout = pendingMeta.readout;
+          if (readout && Array.isArray(readout.controls)) renderController(readout.controls);
+          else if (controllerSig !== null) renderController([]);
           frameHandlers.forEach((fn) => fn(pendingMeta));
           pendingMeta = null;
         }

@@ -1669,3 +1669,65 @@ def test_the_export_slice_is_locked_too():
         time.sleep(0.2)
         assert len(made) == 1
         assert (made[0].frames[:, 1] == 5.0).all(), "export must inherit the locks"
+
+
+def test_controller_command_routes_to_the_session_and_errors_are_reported():
+    from mujoco_visualizer.serve.protocol import CommandError
+
+    sess = FakeSession()
+    sess.commands = []
+
+    def backend_command(name, args):
+        if name == "bad":
+            raise CommandError("unknown controller command 'bad'")
+        sess.commands.append((name, args))
+
+    sess.backend_command = backend_command
+    loop = SimLoop(sess, fps_cap=100.0)
+    loop._apply({"t": "controller", "name": "perturb", "args": {"force": [1, 0, 0]}})
+    assert sess.commands == [("perturb", {"force": [1, 0, 0]})]
+    loop._apply_safely({"t": "controller", "name": "bad", "args": {}})
+    assert loop._error == {
+        "t": "error", "kind": "command", "msg": "unknown controller command 'bad'", "paused": False,
+    }
+
+
+@pytest.mark.parametrize("backend_has_command", [True, False])
+def test_controller_error_never_stops_the_running_loop(backend_has_command):
+    """Unknown name, or a backend without ``command``: a command error, and the loop keeps ticking."""
+    from mujoco_visualizer.serve.session import Session
+
+    class Backend:
+        label = "fake"
+
+        def __init__(self):
+            self.calls = []
+
+        def command(self, name, args):
+            if name != "perturb":
+                return f"unknown controller command {name!r}"
+            self.calls.append((name, args))
+            return None
+
+    class NoCommandBackend:
+        label = "plain"
+
+    sess = FakeSession()
+    sess.backend = Backend() if backend_has_command else NoCommandBackend()
+    sess.backend_command = lambda name, args: Session.backend_command(sess, name, args)
+    loop = SimLoop(sess, fps_cap=60, substeps_per_frame=5, idle_pause_s=None)
+    with running(loop):
+        loop.submit({"t": "sim", "cmd": "play", "n": 1})
+        assert wait_until(lambda: sess.steps >= 10)
+        loop.submit({"t": "controller", "name": "nope", "args": {}})
+        assert wait_until(lambda: loop.error is not None)
+        assert loop.error["kind"] == "command" and loop.error["paused"] is False
+        expected = "unknown controller command 'nope'" if backend_has_command else "accepts no controller commands"
+        assert expected in loop.error["msg"]
+        assert loop.playing is True
+        steps, renders = sess.steps, sess.renders
+        assert wait_until(lambda: sess.steps > steps and sess.renders > renders)
+        if backend_has_command:
+            loop.submit({"t": "controller", "name": "perturb", "args": {"force": [1, 0, 0]}})
+            assert wait_until(lambda: sess.backend.calls == [("perturb", {"force": [1, 0, 0]})])
+        assert loop.is_alive()

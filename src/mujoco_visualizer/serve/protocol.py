@@ -22,6 +22,7 @@ COMMANDS = frozenset(
     {
         "ctrl",
         "ctrl_group",
+        "controller",
         "mode",
         "sim",
         "speed",
@@ -144,6 +145,15 @@ def parse_command(raw, user_settings_dir: Optional[str] = None) -> Dict:
         if not isinstance(group, str) or not group:
             raise CommandError("'ctrl_group' requires a 'group' string")
         return {"t": "ctrl_group", "group": group, "gain": _num(cmd, "gain", 1.0)}
+
+    if kind == "controller":
+        name = cmd.get("name")
+        args = cmd.get("args", {})
+        if not isinstance(name, str) or not name:
+            raise CommandError("controller: 'name' (non-empty string) is required")
+        if not isinstance(args, dict):
+            raise CommandError("controller: 'args' must be an object")
+        return {"t": "controller", "name": name, "args": args}
 
     if kind == "mode":
         mode = cmd.get("ctrl")
@@ -508,8 +518,8 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
 
     ``_LAST_WINS`` types keep only their final message. ``ctrl``, ``render`` and ``replay``
     commands merge key-by-key with later values winning. ``ctrl_group`` keeps the last gain
-    per group. ``sim`` messages are events (play/pause/step/reset) and are all preserved in
-    order.
+    per group; ``controller`` keeps the last message per ``name``. ``sim`` messages are events
+    (play/pause/step/reset) and are all preserved in order.
 
     ``lock`` commands merge with special handling: ``clear`` is an ordered event that resets the
     running set accumulator, and is preserved in output. When a message carries both ``set`` and
@@ -544,6 +554,7 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
     merged_render_set: Dict = {}
     render_index = None
     group_index: Dict[str, int] = {}
+    controller_index: Dict[str, int] = {}
     keep = [True] * len(cmds)
 
     for i, cmd in enumerate(cmds):
@@ -584,6 +595,11 @@ def coalesce(cmds: List[Dict]) -> List[Dict]:
             if group in group_index:
                 keep[group_index[group]] = False
             group_index[group] = i
+        elif kind == "controller":
+            name = cmd["name"]
+            if name in controller_index:
+                keep[controller_index[name]] = False
+            controller_index[name] = i
 
     out = []
     for i, cmd in enumerate(cmds):

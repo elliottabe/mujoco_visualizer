@@ -28,6 +28,9 @@ class PhysicsBackend(Protocol):
     ``set_state`` is its inverse and is what makes ``Session``'s divergence rollback real:
     without it, ``Session`` can only rewrite the host ``MjData``, leaving a device-resident
     backend still holding the diverged state and re-diverging on every subsequent step.
+
+    A backend may define ``command(name, args) -> Optional[str]`` (an error string or ``None``)
+    and ``readout() -> dict``; ``Session`` probes for them, so neither is part of the protocol.
     """
 
     label: str

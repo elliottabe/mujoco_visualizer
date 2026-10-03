@@ -275,6 +275,19 @@ class SimLoop(threading.Thread):
             cmds, self._queue = self._queue, []
         return coalesce(cmds)
 
+    def _apply_safely(self, cmd: Dict) -> None:
+        """Apply one command; any failure becomes a non-pausing ``kind: "command"`` error."""
+        try:
+            self._apply(cmd)
+        except Exception as exc:
+            # client-input problem, not a physics one: never pause the shared session
+            self._error = {
+                "t": "error",
+                "kind": "command",
+                "msg": str(exc),
+                "paused": False,
+            }
+
     def _apply(self, cmd: Dict) -> None:
         kind = cmd["t"]
         if kind == "ctrl":
@@ -355,6 +368,8 @@ class SimLoop(threading.Thread):
                 self._export_job.cancel()
         elif kind == "lock":
             self._apply_lock(cmd)
+        elif kind == "controller":
+            self._session.backend_command(cmd["name"], cmd["args"])
         elif kind == "sim":
             action = cmd["cmd"]
             if action == "play":
@@ -974,22 +989,7 @@ class SimLoop(threading.Thread):
                         }
 
                     for cmd in cmds:
-                        try:
-                            self._apply(cmd)
-                        except Exception as exc:
-                            # A bad command (unknown actuator/group/mode, etc.) is a
-                            # client-input problem, not evidence the physics state is
-                            # untrustworthy -- so unlike diverged/controller/render this
-                            # must NOT pause playback. Pausing here would let a single
-                            # malformed or version-skewed message from one client freeze
-                            # the shared session for every other viewer: a denial of
-                            # service via one bad message.
-                            self._error = {
-                                "t": "error",
-                                "kind": "command",
-                                "msg": str(exc),
-                                "paused": False,
-                            }
+                        self._apply_safely(cmd)
 
                     self._maybe_idle_pause()
 

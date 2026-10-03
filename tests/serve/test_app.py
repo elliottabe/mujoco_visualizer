@@ -438,3 +438,15 @@ def test_ctrl_and_clip_providers_are_independent():
     app2 = create_app(FakeLoop(), None, ctrl_info=FakeCtrlInfo())
     assert app2.test_client().get("/api/ctrl/legs").status_code == 200
     assert app2.test_client().get("/api/clips").status_code == 404
+
+
+def test_controller_panel_is_rendered_from_readout_descriptors(client):
+    """Pinned at the asset level: the panel exists and is driven only by readout.controls."""
+    page = client.get("/").data.decode()
+    js = client.get("/static/viewer.js").data.decode()
+    assert 'id="controller"' in page
+    assert 'getElementById("controller")' in js
+    assert "readout.controls" in js and "function renderController(" in js
+    assert 't: "controller"' in js
+    for kind in ("slider", "toggle", "button", "vector"):
+        assert '"{0}"'.format(kind) in js

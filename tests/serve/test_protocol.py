@@ -653,3 +653,18 @@ def test_settings_reset_cannot_be_combined_with_load_or_save(cmd):
     exactly how the old `if "save" in cmd: ... else: load` shape would have handled it."""
     with pytest.raises(CommandError, match="reset"):
         parse_command(cmd)
+
+
+def test_controller_command_parses_and_coalesces_per_name():
+    a = parse_command('{"t":"controller","name":"perturb","args":{"force":[1,0,0]}}')
+    assert a == {"t": "controller", "name": "perturb", "args": {"force": [1, 0, 0]}}
+    b = parse_command('{"t":"controller","name":"perturb","args":{"force":[0,1,0]}}')
+    c = parse_command('{"t":"controller","name":"set_gain","args":{"group":"claw","scale":2.0}}')
+    out = coalesce([a, c, b])
+    assert [x["name"] for x in out] == ["set_gain", "perturb"]
+    assert out[1]["args"]["force"] == [0, 1, 0]
+    assert parse_command({"t": "controller", "name": "reset_perturb"})["args"] == {}
+    with pytest.raises(CommandError):
+        parse_command('{"t":"controller","args":{}}')              # name required
+    with pytest.raises(CommandError):
+        parse_command('{"t":"controller","name":"x","args":[1]}')  # args must be an object

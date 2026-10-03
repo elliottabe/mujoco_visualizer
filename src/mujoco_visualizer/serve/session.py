@@ -27,6 +27,7 @@ from mujoco_visualizer.render_settings import PRESET_NAME_RE
 from mujoco_visualizer.serve.backends import CpuBackend, PhysicsBackend, UnknownKeyframe
 from mujoco_visualizer.serve.controls import actuator_group_map, build_control_tree
 from mujoco_visualizer.serve.locks import build_joint_qpos_map
+from mujoco_visualizer.serve.protocol import CommandError
 from mujoco_visualizer.visualizer import (
     _apply_forces_vis,
     actuator_names,
@@ -444,9 +445,23 @@ class Session:
             self._controller_out = np.asarray(out, dtype=np.float64)
 
     def readout(self) -> Dict:
-        if self._controller is None:
-            return {}
-        return dict(self._controller.readout())
+        """Backend ``readout()`` (if any) merged under the attached controller's readout."""
+        out: Dict = {}
+        b = getattr(self.backend, "readout", None)
+        if b is not None:
+            out.update(dict(b()))
+        if self._controller is not None:
+            out.update(dict(self._controller.readout()))
+        return out
+
+    def backend_command(self, name: str, args: Dict) -> None:
+        """Route a ``controller`` command to the backend; a backend without ``command`` or a returned error string raises."""
+        fn = getattr(self.backend, "command", None)
+        if fn is None:
+            raise CommandError(f"backend {self.backend.label!r} accepts no controller commands")
+        err = fn(name, dict(args))
+        if err:
+            raise CommandError(str(err))
 
     # -- control ---------------------------------------------------------------
 
